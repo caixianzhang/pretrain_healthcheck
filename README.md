@@ -312,7 +312,20 @@ avg_busbw           > BANDWIDTH_AVG_BUSBW
 
 ## 8. 多 collective 带宽基线
 
-`PROFILE=collective-bandwidth` 用于在 quick 功能测试之后，对关键 collective 做大包性能基线。它默认覆盖：
+`PROFILE=collective-bandwidth` 用于在 quick 功能测试之后，对关键 collective 做大包性能基线。当前筛查异常节点时，推荐把它作为“同批次多组横向对比”的采集项，而不是默认启用固定绝对阈值。
+
+典型使用方式：
+
+```text
+同一轮测试
+同一组参数
+多个分组并行运行
+比较各组 op / pattern / message size 下的 BusBW、latency、correctness
+明显偏离同批其他分组的 group 标记为可疑
+再通过换组、重配对或二分排查定位异常节点
+```
+
+它默认覆盖：
 
 ```text
 all_reduce
@@ -341,10 +354,12 @@ empty_expert
 | warmup | `5` |
 | iters | `30` |
 | EP size | `8` |
-| min gate | `0 GB/s` |
-| avg gate | `0 GB/s` |
+| min gate | `0 GB/s`，表示默认不启用固定绝对阈值 |
+| avg gate | `0 GB/s`，表示默认不启用固定绝对阈值 |
 
-说明：该 profile 默认使用 `1G`，不是 `8G`。对 `all_gather`，这里把 message size 解释为最终 gathered payload 的总大小，每 rank 输入约为 `message_size / collective_group_size`，避免规模扩大后输出按 group size 继续放大导致 OOM。正式标定时应按 op 分别选择 message size。
+说明：该 profile 默认使用 `1G`，不是 `8G`。对 `all_gather`，这里把 message size 解释为最终 gathered payload 的总大小，每 rank 输入约为 `message_size / collective_group_size`，避免规模扩大后输出按 group size 继续放大导致 OOM。
+
+`COLLECTIVE_BANDWIDTH_MIN_BUSBW` / `COLLECTIVE_BANDWIDTH_AVG_BUSBW` 保留为可选 absolute gate。当前千卡排查场景下，默认保持 `0/0`，由外层汇总多个 group 的 `collective_bandwidth_summary.jsonl` 后做横向对比。
 
 两节点冒烟建议：
 
@@ -390,9 +405,9 @@ bash run_vcctl_healthcheck.sh
 | --- | --- |
 | `collective_bandwidth_round_detail.jsonl` | rank 级每轮 latency / algbw / busbw |
 | `collective_bandwidth_round_summary.jsonl` | group 级每轮 latency / algbw / busbw |
-| `collective_bandwidth_summary.jsonl` | op / message size / payload pattern 级 gate 汇总 |
-| `collective_bandwidth_gate.json` | 本次 collective bandwidth gate 的机器可读总结果 |
-| `collective_bandwidth_report.md` | 本次 collective bandwidth gate 的 Markdown 报告 |
+| `collective_bandwidth_summary.jsonl` | op / message size / payload pattern 级汇总，包含本次 absolute gate 配置和实测值 |
+| `collective_bandwidth_gate.json` | 本次 collective bandwidth absolute gate 的机器可读总结果；默认 `0/0` 时主要作为采集结果 |
+| `collective_bandwidth_report.md` | 本次 collective bandwidth 的 Markdown 报告 |
 
 ## 9. 故障注入测试
 
@@ -672,6 +687,9 @@ multi-node:  2/2 PASS
 | 1G/4G/8G bandwidth 基线 | `results/vcctl/20260630_144024` | PASS，8GB 最稳定，avg_busbw 约 95.21 GB/s |
 | 通信路径探测 | `results/vcctl_comm_probe/comm_probe_20260630_145457` | PASS，MCCL 数据面走 `xscale_0..xscale_3 / RoCE / IB`，`eth0` 仅用于 bootstrap/OOB |
 | 8GB bandwidth 复测 | `results/vcctl/20260630_150653` | PASS，avg_busbw 约 93.73 GB/s，second_lowest 约 87.78 GB/s |
+| collective-bandwidth 冒烟 | `results/vcctl/20260630_173604` | PASS，1MB / 1 iter，覆盖 9 个 case |
+| 1GB collective-bandwidth 基线 | `results/vcctl/20260630_174255` | PASS，9 个 case / 30 iter，`all_to_all` 有两轮低谷 |
+| 1GB collective-bandwidth 复测 | `results/vcctl/20260630_174615` | PASS，9 个 case / 30 iter，`all_to_all` 低谷未复现 |
 
 完整测试结果总结见：
 
@@ -686,8 +704,8 @@ multi-node:  2/2 PASS
 - pod 内不执行 `dmesg`，宿主机内核日志筛查由运维侧提供。
 - static probe 中部分系统命令可能在 pod 内缺失，例如 `rdma`、`ip`、`numactl`；这类结果用于能力探测，不等价于训练不可用。
 - pod 内标准 `/sys/class/infiniband/.../counters` 当前未暴露有效 counter，通信路径探测只能从 MCCL debug 确认 `xscale_0..xscale_3` 被识别和启用，不能在 pod 内直接证明每条 rail 的实际流量占比。
-- 当前两节点 MetaX C550 + MCCL 的 8GB All-Reduce 基线约为 `avg_busbw 93-96 GB/s`、`second_lowest_busbw 88-92 GB/s`；正式 128 节点 gate 需要重新标定。
-- `PROFILE=collective-bandwidth` 默认使用 `1G`；其中 `all_gather` 的 message size 表示 gathered 后的总 payload，其余 op 表示本 rank 参与 collective 的输入 payload。大包阈值需要按 op 分别标定。
+- 当前两节点 MetaX C550 + MCCL 的 8GB All-Reduce 基线约为 `avg_busbw 93-96 GB/s`、`second_lowest_busbw 88-92 GB/s`；该数据只作为两节点参考基线。
+- `PROFILE=collective-bandwidth` 默认使用 `1G`；其中 `all_gather` 的 message size 表示 gathered 后的总 payload，其余 op 表示本 rank 参与 collective 的输入 payload。当前异常节点筛查推荐以同批次多组横向对比为主，固定 absolute gate 默认关闭。
 - 当前 NPU / HCCL 完整执行路径尚未作为主流程验证。
 
 ## 16. 建议使用顺序
@@ -699,8 +717,9 @@ multi-node:  2/2 PASS
 3. `MODE=multi-node PROFILE=bandwidth BANDWIDTH_MESSAGE_SIZES=8G BANDWIDTH_MIN_BUSBW=0 BANDWIDTH_AVG_BUSBW=0`：采集当前 8GB All-Reduce 基线。
 4. `MODE=multi-node PROFILE=collective-bandwidth COLLECTIVE_BANDWIDTH_MESSAGE_SIZES=1G COLLECTIVE_BANDWIDTH_MIN_BUSBW=0 COLLECTIVE_BANDWIDTH_AVG_BUSBW=0`：采集关键 collective 大包基线，包含 EP=8 all_to_allv。
 5. `DRY_RUN=0 bash run_vcctl_comm_probe.sh`：确认通信数据面是否走 `xscale/RoCE/IB`。
-6. 若需要启用 bandwidth gate，先基于当前硬件和规模标定 `BANDWIDTH_*` / `COLLECTIVE_BANDWIDTH_*` 阈值。
-7. 若工具变更后需要自测，依次运行 NaN、corrupt、timeout、backend failure 故障注入。
+6. 多组筛查时，汇总各组 `bandwidth_summary.jsonl` / `collective_bandwidth_summary.jsonl`，对同一 op、message size、payload pattern 做横向对比，明显偏离同批其他组的 group 标记为可疑。
+7. 若确实需要固定 absolute gate，再基于当前硬件和规模标定 `BANDWIDTH_*` / `COLLECTIVE_BANDWIDTH_*` 阈值；默认不依赖固定阈值筛节点。
+8. 若工具变更后需要自测，依次运行 NaN、corrupt、timeout、backend failure 故障注入。
 
 常用命令：
 
