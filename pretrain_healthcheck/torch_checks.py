@@ -375,6 +375,181 @@ def run_group(
     )
 
 
+def _write_bandwidth_report(output_dir: Path, summaries: list[dict[str, Any]]) -> None:
+    lines = [
+        "# All-Reduce Bandwidth Gate Report",
+        "",
+        f"- input_dir: `{output_dir}`",
+        f"- summary_count: {len(summaries)}",
+        "",
+        "| message_size | iters | min_gate GB/s | avg_gate GB/s | second_lowest_busbw GB/s | avg_busbw GB/s | pass |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for row in summaries:
+        lines.append(
+            f"| {row['message_size']} | {row['iters']} | "
+            f"{row['min_busbw_gate']:.3f} | {row['avg_busbw_gate']:.3f} | "
+            f"{row['second_lowest_busbw']:.3f} | {row['avg_busbw']:.3f} | "
+            f"{row['bandwidth_pass']} |"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "bandwidth_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_bandwidth_gate(
+    output_dir: Path,
+    dtype_name: str,
+    message_sizes: list[int],
+    warmup: int,
+    iters: int,
+    seed: int,
+    min_busbw: float,
+    avg_busbw: float,
+    test_round: str,
+    group_id: str,
+) -> None:
+    torch, dist, env = init_dist()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dtype = _dtype(torch, dtype_name)
+    job_id = os.environ.get("HEALTHCHECK_JOB_ID", str(uuid.uuid4()))
+    hostnames = sorted(set(_all_gather_object(dist, env.hostname, env.world_size)))
+    env.group_id = group_id or env.group_id or f"{test_round}-" + "-".join(hostnames)
+
+    all_summaries: list[dict[str, Any]] = []
+    element_size = torch.empty((), dtype=dtype).element_size()
+
+    for size in message_sizes:
+        numel = max(1, size // element_size)
+        tensor = torch.empty(numel, device=env.device, dtype=dtype)
+
+        for _ in range(max(0, warmup)):
+            dist.all_reduce(tensor)
+        torch.cuda.synchronize()
+        dist.barrier(device_ids=[env.local_rank])
+
+        local_rows: list[dict[str, Any]] = []
+        for idx in range(max(1, iters)):
+            _maybe_fault_sleep(env)
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            dist.all_reduce(tensor)
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - start
+            algbw = (size / max(elapsed, 1e-12)) / 1e9
+            busbw = algbw * 2 * max(0, env.world_size - 1) / max(1, env.world_size)
+            local_rows.append(
+                {
+                    "job_id": job_id,
+                    "test_round": test_round,
+                    "group_id": env.group_id,
+                    "hostnames": hostnames,
+                    "hostname": env.hostname,
+                    "rank": env.rank,
+                    "local_rank": env.local_rank,
+                    "gpu_id": env.local_rank,
+                    "dtype": dtype_name,
+                    "dist_backend_requested": env.dist_backend_requested,
+                    "dist_backend": env.dist_backend,
+                    "device_vendor": env.device_vendor,
+                    "comm_runtime": env.comm_runtime,
+                    "op_type": "all_reduce",
+                    "message_size": size_to_label(size),
+                    "message_bytes": size,
+                    "round": idx,
+                    "rank_latency": elapsed,
+                    "rank_algbw": algbw,
+                    "rank_busbw": busbw,
+                }
+            )
+
+        gathered = _all_gather_object(dist, local_rows, env.world_size)
+        if env.rank == 0:
+            flat = [row for rank_rows in gathered for row in rank_rows]
+            append_jsonl(output_dir / "bandwidth_round_detail.jsonl", flat)
+
+            round_busbw: list[float] = []
+            round_rows: list[dict[str, Any]] = []
+            for idx in range(max(1, iters)):
+                values = [row for row in flat if int(row["round"]) == idx]
+                elapsed = max(float(row["rank_latency"]) for row in values)
+                algbw = (size / max(elapsed, 1e-12)) / 1e9
+                busbw = algbw * 2 * max(0, env.world_size - 1) / max(1, env.world_size)
+                round_busbw.append(busbw)
+                round_rows.append(
+                    {
+                        "job_id": job_id,
+                        "test_round": test_round,
+                        "group_id": env.group_id,
+                        "hostnames": hostnames,
+                        "op_type": "all_reduce",
+                        "message_size": size_to_label(size),
+                        "message_bytes": size,
+                        "dtype": dtype_name,
+                        "round": idx,
+                        "latency": elapsed,
+                        "algbw": algbw,
+                        "busbw": busbw,
+                    }
+                )
+            append_jsonl(output_dir / "bandwidth_round_summary.jsonl", round_rows)
+
+            ordered = sorted(round_busbw)
+            second_lowest = ordered[1] if len(ordered) >= 2 else ordered[0]
+            avg_value = sum(round_busbw) / len(round_busbw)
+            passed = second_lowest > min_busbw and avg_value > avg_busbw
+            summary = {
+                "job_id": job_id,
+                "test_round": test_round,
+                "group_id": env.group_id,
+                "hostnames": hostnames,
+                "op_type": "all_reduce",
+                "message_size": size_to_label(size),
+                "message_bytes": size,
+                "dtype": dtype_name,
+                "iters": max(1, iters),
+                "warmup": max(0, warmup),
+                "latency_p50": percentile([row["latency"] for row in round_rows], 0.50),
+                "latency_p95": percentile([row["latency"] for row in round_rows], 0.95),
+                "latency_p99": percentile([row["latency"] for row in round_rows], 0.99),
+                "min_busbw_gate": min_busbw,
+                "avg_busbw_gate": avg_busbw,
+                "second_lowest_busbw": second_lowest,
+                "avg_busbw": avg_value,
+                "min_busbw": min(round_busbw),
+                "max_busbw": max(round_busbw),
+                "bandwidth_pass": passed,
+                "correctness_pass": True,
+                "performance_pass": passed,
+                "error_type": "" if passed else "BandwidthGateFailed",
+                "dist_backend_requested": env.dist_backend_requested,
+                "dist_backend": env.dist_backend,
+                "device_vendor": env.device_vendor,
+                "comm_runtime": env.comm_runtime,
+            }
+            all_summaries.append(summary)
+            append_jsonl(output_dir / "bandwidth_summary.jsonl", [summary])
+
+        dist.barrier(device_ids=[env.local_rank])
+
+    if env.rank == 0:
+        write_json(
+            output_dir / "bandwidth_gate.json",
+            {
+                "status": "PASS" if all(row["bandwidth_pass"] for row in all_summaries) else "FAIL",
+                "summaries": all_summaries,
+            },
+        )
+        _write_bandwidth_report(output_dir, all_summaries)
+        failed = [row for row in all_summaries if not row["bandwidth_pass"]]
+    else:
+        failed = []
+
+    dist.barrier(device_ids=[env.local_rank])
+    dist.destroy_process_group()
+    if failed:
+        raise RuntimeError("all-reduce bandwidth gate failed")
+
+
 def _run_distributed_checks(
     output_dir: Path,
     dtype_name: str,

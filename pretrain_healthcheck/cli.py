@@ -48,6 +48,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_ping.add_argument("--test-round", default="smoke")
     p_ping.add_argument("--group-id", default="")
 
+    p_bw = sub.add_parser("run-bandwidth", help="run all-reduce bandwidth gate")
+    p_bw.add_argument("--output-dir", type=Path, required=True)
+    p_bw.add_argument("--dtype", default="bf16", choices=["fp32", "bf16", "fp16"])
+    p_bw.add_argument("--message-sizes", default="1G,4G,8G,16G")
+    p_bw.add_argument("--warmup", type=int, default=5)
+    p_bw.add_argument("--iters", type=int, default=100)
+    p_bw.add_argument("--seed", type=int, default=20260623)
+    p_bw.add_argument("--min-busbw", type=float, default=270.0, help="second-lowest busbw gate in GB/s")
+    p_bw.add_argument("--avg-busbw", type=float, default=290.0, help="average busbw gate in GB/s")
+    p_bw.add_argument("--test-round", default="bandwidth")
+    p_bw.add_argument("--group-id", default="")
+
     p_analyze = sub.add_parser("analyze", help="analyze a result directory")
     p_analyze.add_argument("--input-dir", type=Path, required=True)
     p_analyze.add_argument("--output", type=Path, default=None)
@@ -105,6 +117,26 @@ def main() -> None:
 
         ping_group(
             output_dir=args.output_dir,
+            test_round=args.test_round,
+            group_id=args.group_id,
+        )
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"wrote {args.output_dir}")
+        return
+    if args.cmd == "run-bandwidth":
+        import os
+
+        from .torch_checks import run_bandwidth_gate
+
+        run_bandwidth_gate(
+            output_dir=args.output_dir,
+            dtype_name=args.dtype,
+            message_sizes=parse_size_list(args.message_sizes),
+            warmup=args.warmup,
+            iters=args.iters,
+            seed=args.seed,
+            min_busbw=args.min_busbw,
+            avg_busbw=args.avg_busbw,
             test_round=args.test_round,
             group_id=args.group_id,
         )

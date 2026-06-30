@@ -162,6 +162,7 @@ multi-node
 | `MODE=all` | 依次执行 pre-clean、static、single-node、multi-node |
 | `PROFILE=smoke` | 最短连通性测试，`nproc-per-node=1`，只做简单 `all_reduce` |
 | `PROFILE=quick` | 快速正式测试，默认每节点 8 rank，覆盖计算、显存拷贝和通信算子 |
+| `PROFILE=bandwidth` | All-Reduce 大包带宽 gate，默认 1G/4G/8G/16G、100 轮计时 |
 
 ## 6. quick 覆盖算子
 
@@ -188,11 +189,83 @@ random
 empty_expert
 ```
 
-## 7. 故障注入测试
+## 7. All-Reduce 带宽 gate
+
+`PROFILE=bandwidth` 用于对齐训练前集合通信带宽验收。该 profile 只执行 `all_reduce`，默认使用较大的 message size 连跑多轮，并按每轮 BusBW 的次低值和平均值做 gate。
+
+默认配置：
+
+| 项 | 默认值 |
+| --- | --- |
+| op | `all_reduce` |
+| message size | `1G,4G,8G,16G` |
+| warmup | `5` |
+| iters | `100` |
+| dtype | `bf16` |
+| min gate | `270 GB/s` |
+| avg gate | `290 GB/s` |
+
+正式执行：
+
+```bash
+DRY_RUN=0 \
+MODE=multi-node \
+PROFILE=bandwidth \
+bash run_vcctl_healthcheck.sh
+```
+
+如果第一次只想验证链路和脚本是否能跑通，可以先降低测试量，并临时关闭阈值：
+
+```bash
+DRY_RUN=0 \
+MODE=multi-node \
+PROFILE=bandwidth \
+BANDWIDTH_MESSAGE_SIZES=1G \
+BANDWIDTH_WARMUP=2 \
+BANDWIDTH_ITERS=10 \
+BANDWIDTH_MIN_BUSBW=0 \
+BANDWIDTH_AVG_BUSBW=0 \
+bash run_vcctl_healthcheck.sh
+```
+
+正式验收时使用 400Gbps RDMA 高速网络阈值：
+
+```bash
+DRY_RUN=0 \
+MODE=multi-node \
+PROFILE=bandwidth \
+BANDWIDTH_MESSAGE_SIZES=1G,4G,8G,16G \
+BANDWIDTH_WARMUP=5 \
+BANDWIDTH_ITERS=100 \
+BANDWIDTH_MIN_BUSBW=270 \
+BANDWIDTH_AVG_BUSBW=290 \
+bash run_vcctl_healthcheck.sh
+```
+
+判定逻辑：
+
+```text
+second_lowest_busbw > BANDWIDTH_MIN_BUSBW
+avg_busbw           > BANDWIDTH_AVG_BUSBW
+```
+
+这里的 `second_lowest_busbw` 是 100 轮 BusBW 排序后的次低值，用来避免单轮极端抖动直接决定失败；`avg_busbw` 是 100 轮平均值，用来判断整体带宽水平。
+
+该 profile 输出：
+
+| 文件 | 含义 |
+| --- | --- |
+| `bandwidth_round_detail.jsonl` | rank 级每轮 latency / algbw / busbw |
+| `bandwidth_round_summary.jsonl` | group 级每轮 latency / algbw / busbw |
+| `bandwidth_summary.jsonl` | 每个 message size 的次低值、平均值、min/max 和 gate 结果 |
+| `bandwidth_gate.json` | 本次 bandwidth gate 的机器可读总结果 |
+| `bandwidth_report.md` | 本次 bandwidth gate 的 Markdown 报告 |
+
+## 8. 故障注入测试
 
 故障注入用于验证健康检查工具自身是否能正确识别异常，并将异常传播到外层 `summary.md`。
 
-### 7.1 NaN 精度异常
+### 8.1 NaN 精度异常
 
 ```bash
 DRY_RUN=0 \
@@ -208,7 +281,7 @@ bash run_vcctl_healthcheck.sh
 - `rank_detail.jsonl` 中 rank3 出现 `rank_nan_count > 0`；
 - `report.md` 中 `failed summaries > 0`。
 
-### 7.2 显式 corrupt 数据异常
+### 8.2 显式 corrupt 数据异常
 
 ```bash
 DRY_RUN=0 \
@@ -224,7 +297,7 @@ bash run_vcctl_healthcheck.sh
 - `rank_detail.jsonl` 中 rank3 出现 `rank_error_type=FaultInjectedCorrupt`；
 - `report.md` 中 `failed summaries > 0`。
 
-### 7.3 hang / timeout
+### 8.3 hang / timeout
 
 ```bash
 DRY_RUN=0 \
@@ -243,7 +316,7 @@ bash run_vcctl_healthcheck.sh
 - `reason=timeout`；
 - stderr 中包含 `TIMEOUT after 120s`。
 
-### 7.4 后端初始化失败
+### 8.4 后端初始化失败
 
 ```bash
 DRY_RUN=0 \
@@ -259,9 +332,9 @@ bash run_vcctl_healthcheck.sh
 - stderr 中包含 `failed to initialize torch.distributed backend`；
 - 该场景发生在 `init_process_group`，因此通常不会生成 rank/group 级算子明细。
 
-## 8. 单节点测试
+## 9. 单节点测试
 
-### 8.1 MetaX C550 单节点 8 卡
+### 9.1 MetaX C550 单节点 8 卡
 
 ```bash
 cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck
@@ -284,7 +357,7 @@ ITERS=5 \
 bash scripts/metax/run_single_node_8c550.sh
 ```
 
-### 8.2 NVIDIA H200 单节点 6 卡
+### 9.2 NVIDIA H200 单节点 6 卡
 
 NVIDIA 脚本保留用于单节点开发验证：
 
@@ -297,9 +370,9 @@ bash scripts/nvidia/run_single_node_6h200.sh
 
 说明：当前 README 主流程以 MetaX + vcctl 为准；NVIDIA 脚本没有参与当前两节点 vcctl 验证基线。
 
-## 9. 静态环境探测
+## 10. 静态环境探测
 
-### 9.1 MetaX pod 能力探测
+### 10.1 MetaX pod 能力探测
 
 ```bash
 cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck
@@ -316,7 +389,7 @@ MetaX probe 会收集：
 - `xscale` / `net*` / `eth*` 网络接口信息；
 - NUMA、磁盘、`/proc`、`/sys` 可见性。
 
-### 9.2 dmesg 策略
+### 10.2 dmesg 策略
 
 当前运维提供的 pod 不支持读取 `dmesg`，因此 probe 脚本不在 pod 内执行 `dmesg`。summary 中记录为：
 
@@ -326,7 +399,7 @@ logs | dmesg | SKIP | pod environment does not support dmesg; kernel log screeni
 
 宿主机内核日志、PCIe AER、MCE、soft lockup、XID / NPU 历史错误筛查由运维侧提供结论。
 
-## 10. 输出目录与结果文件
+## 11. 输出目录与结果文件
 
 vcctl 编排结果默认写入：
 
@@ -363,8 +436,13 @@ MetaX 默认：
 | `group_summary.jsonl` | group 级 op / message size / payload pattern 汇总 |
 | `rank_detail.jsonl` | rank 级明细，用于定位慢 rank、NaN、Inf、错误 rank |
 | `ping_summary.json` | smoke 模式的最小 all_reduce 连通性结果 |
+| `bandwidth_round_detail.jsonl` | bandwidth 模式的 rank 级每轮带宽明细 |
+| `bandwidth_round_summary.jsonl` | bandwidth 模式的 group 级每轮带宽汇总 |
+| `bandwidth_summary.jsonl` | bandwidth 模式的 message size 级 gate 汇总 |
+| `bandwidth_gate.json` | bandwidth 模式的总 gate 结果 |
+| `bandwidth_report.md` | bandwidth 模式的 Markdown 报告 |
 
-## 11. 常用环境变量
+## 12. 常用环境变量
 
 | 环境变量 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -373,7 +451,7 @@ MetaX 默认：
 | `MODE` | `all` | `static`、`single-node`、`multi-node`、`all` |
 | `DEVICE_TYPE` | `metax` | 结果元信息，例如 `gpu`、`npu`、`metax` |
 | `PROJECT_REMOTE_DIR` | `/afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck` | pod 内项目路径 |
-| `PROFILE` | `quick` | `quick` 或 `smoke` |
+| `PROFILE` | `quick` | `quick`、`smoke` 或 `bandwidth` |
 | `PRE_CLEAN` | `1` | 每次测试前清理可能残留的健康检查进程 |
 | `GPUS_PER_NODE` | `8` | 每个 pod / 节点的 GPU 数 |
 | `DIST_BACKEND` | `nccl` | PyTorch distributed backend 名称 |
@@ -385,6 +463,11 @@ MetaX 默认：
 | `MOE_PATTERNS` | `uniform,skewed,hot_expert,random,empty_expert` | MoE token routing 模式 |
 | `WARMUP` | `2` | 每个测试项 warmup 次数 |
 | `ITERS` | `5` | 每个测试项计时迭代次数 |
+| `BANDWIDTH_MESSAGE_SIZES` | `1G,4G,8G,16G` | `PROFILE=bandwidth` 的 All-Reduce payload 大小列表 |
+| `BANDWIDTH_WARMUP` | `5` | `PROFILE=bandwidth` 的 warmup 轮数 |
+| `BANDWIDTH_ITERS` | `100` | `PROFILE=bandwidth` 的计时轮数 |
+| `BANDWIDTH_MIN_BUSBW` | `270` | `PROFILE=bandwidth` 的次低 BusBW gate，单位 GB/s |
+| `BANDWIDTH_AVG_BUSBW` | `290` | `PROFILE=bandwidth` 的平均 BusBW gate，单位 GB/s |
 | `SEED` | `20260623` | 随机种子 |
 | `RESULT_ROOT` | `/afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck/results/vcctl` | 共享结果根目录 |
 | `RUN_ID` | 当前时间戳 | 本次运行 ID |
@@ -404,7 +487,7 @@ MetaX 默认：
 | `FAULT_NAN_RANK=<rank>` | 指定全局 rank 注入 NaN |
 | `FAULT_CORRUPT_RANK=<rank>` | 指定全局 rank 修改 tensor，模拟结果污染 |
 
-## 12. 已验证结果
+## 13. 已验证结果
 
 当前最终基线：
 
@@ -438,7 +521,7 @@ multi-node:  2/2 PASS
 ../design_docs/pretrain_healthcheck_metax_test_summary.md
 ```
 
-## 13. 当前限制
+## 14. 当前限制
 
 - 当前 vcctl 多节点验证只在两节点 MetaX C550 环境完成闭环。
 - 更大规模的 8 / 64 / 128 节点测试需要结合实际资源申请和分组策略继续验证。
@@ -446,14 +529,15 @@ multi-node:  2/2 PASS
 - static probe 中部分系统命令可能在 pod 内缺失，例如 `rdma`、`ip`、`numactl`；这类结果用于能力探测，不等价于训练不可用。
 - 当前 NPU / HCCL 完整执行路径尚未作为主流程验证。
 
-## 14. 建议使用顺序
+## 15. 建议使用顺序
 
 训练前建议按以下顺序执行：
 
 1. `PROFILE=smoke MODE=multi-node`：快速确认 vcctl、torchrun、多 pod 连通性。
 2. `MODE=all PROFILE=quick MESSAGE_SIZES=1M WARMUP=1 ITERS=1`：完整快速验收。
-3. 若需要更充分压力，可增加 `MESSAGE_SIZES`、`WARMUP`、`ITERS`。
-4. 若工具变更后需要自测，依次运行 NaN、corrupt、timeout、backend failure 故障注入。
+3. `MODE=multi-node PROFILE=bandwidth`：执行 All-Reduce 大包带宽 gate。
+4. 若需要更充分压力，可增加 `MESSAGE_SIZES`、`WARMUP`、`ITERS`，或增加 `BANDWIDTH_MESSAGE_SIZES`、`BANDWIDTH_WARMUP`、`BANDWIDTH_ITERS`。
+5. 若工具变更后需要自测，依次运行 NaN、corrupt、timeout、backend failure 故障注入。
 
 常用命令：
 
@@ -463,4 +547,6 @@ cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck/scripts/metax
 DRY_RUN=0 MODE=multi-node PROFILE=smoke bash run_vcctl_healthcheck.sh
 
 DRY_RUN=0 MODE=all PROFILE=quick MESSAGE_SIZES=1M WARMUP=1 ITERS=1 bash run_vcctl_healthcheck.sh
+
+DRY_RUN=0 MODE=multi-node PROFILE=bandwidth bash run_vcctl_healthcheck.sh
 ```

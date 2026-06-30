@@ -23,6 +23,11 @@ MESSAGE_SIZES="${MESSAGE_SIZES:-1M,16M,64M}"
 MOE_PATTERNS="${MOE_PATTERNS:-uniform,skewed,hot_expert,random,empty_expert}"
 WARMUP="${WARMUP:-2}"
 ITERS="${ITERS:-5}"
+BANDWIDTH_MESSAGE_SIZES="${BANDWIDTH_MESSAGE_SIZES:-1G,4G,8G,16G}"
+BANDWIDTH_WARMUP="${BANDWIDTH_WARMUP:-5}"
+BANDWIDTH_ITERS="${BANDWIDTH_ITERS:-100}"
+BANDWIDTH_MIN_BUSBW="${BANDWIDTH_MIN_BUSBW:-270}"
+BANDWIDTH_AVG_BUSBW="${BANDWIDTH_AVG_BUSBW:-290}"
 SEED="${SEED:-20260623}"
 FAULT_BACKEND="${FAULT_BACKEND:-}"
 FAULT_SLEEP_RANK="${FAULT_SLEEP_RANK:-}"
@@ -36,6 +41,8 @@ SINGLE_NODE_CMD="${SINGLE_NODE_CMD:-cd ${PROJECT_REMOTE_DIR} && DIST_BACKEND=\"$
 if [[ -z "${MULTI_NODE_CMD:-}" ]]; then
   if [[ "${PROFILE}" == "smoke" ]]; then
     MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"1\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli ping-group --output-dir \"\$HC_POD_RESULT_DIR\" --test-round smoke --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\""
+  elif [[ "${PROFILE}" == "bandwidth" ]]; then
+    MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"${GPUS_PER_NODE}\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli run-bandwidth --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${BANDWIDTH_MESSAGE_SIZES}\" --warmup \"${BANDWIDTH_WARMUP}\" --iters \"${BANDWIDTH_ITERS}\" --seed \"${SEED}\" --min-busbw \"${BANDWIDTH_MIN_BUSBW}\" --avg-busbw \"${BANDWIDTH_AVG_BUSBW}\" --test-round bandwidth --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\"; rc=\$?; exit \$rc"
   else
     MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"${GPUS_PER_NODE}\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli run-group --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${MESSAGE_SIZES}\" --moe-patterns \"${MOE_PATTERNS}\" --warmup \"${WARMUP}\" --iters \"${ITERS}\" --seed \"${SEED}\" --test-round current_vcjob --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\"; rc=\$?; if [ \"\$RANK\" = \"0\" ]; then python3 -m pretrain_healthcheck.cli analyze --input-dir \"\$HC_POD_RESULT_DIR\" --output \"\$HC_POD_RESULT_DIR/report.md\"; fi; exit \$rc"
   fi
@@ -61,7 +68,7 @@ Common env:
   MODE                     static|single-node|multi-node|all. Default: all
   DEVICE_TYPE              Metadata only, for example gpu, npu, metax. Default: metax
   PROJECT_REMOTE_DIR       Project path inside target pods.
-  PROFILE                  quick|smoke. smoke only checks torchrun connectivity. Default: quick
+  PROFILE                  quick|smoke|bandwidth. smoke only checks torchrun connectivity. Default: quick
   PRE_CLEAN                1 runs cleanup before checks; 0 disables it. Default: 1
   PRE_CLEAN_CMD            Command used for cleanup. Default: pkill healthcheck torchrun/python.
   GPUS_PER_NODE            Local device count per pod. Default: 8
@@ -69,6 +76,11 @@ Common env:
   HEALTHCHECK_MASTER_PORT  auto or explicit rendezvous port. Default: auto
   DEVICE_VENDOR            Result metadata. Default: metax
   COMM_RUNTIME             Result metadata. Default: mccl
+  BANDWIDTH_MESSAGE_SIZES  Payload sizes for PROFILE=bandwidth. Default: 1G,4G,8G,16G
+  BANDWIDTH_WARMUP         Warmup rounds for PROFILE=bandwidth. Default: 5
+  BANDWIDTH_ITERS          Timed rounds for PROFILE=bandwidth. Default: 100
+  BANDWIDTH_MIN_BUSBW      Second-lowest BusBW gate in GB/s. Default: 270
+  BANDWIDTH_AVG_BUSBW      Average BusBW gate in GB/s. Default: 290
   FAULT_*                  Optional fault injection envs for backend/sleep/nan/corrupt tests.
   STATIC_CMD               Command executed in each pod for static checks. Default: MetaX static probe
   SINGLE_NODE_CMD          Command executed in each pod for single-node checks. Default: MetaX 8-card torchrun
