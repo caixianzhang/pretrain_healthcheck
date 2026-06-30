@@ -152,6 +152,40 @@ single-node
 multi-node
 ```
 
+### 4.4 通信路径探测
+
+用于确认通信库实际可见的 HCA / rail、端口状态、IB counter 是否在 All-Reduce 前后增长，并采集 `MCCL_DEBUG` / `NCCL_DEBUG` 日志。
+
+```bash
+cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck/scripts/metax
+
+DRY_RUN=0 bash run_vcctl_comm_probe.sh
+```
+
+默认会在当前 vcjob 的每个 pod 上执行：
+
+- 采集 `MCCL` / `NCCL` / `MACA` / `MASTER_*` / `RANK` / `WORLD_SIZE` 环境变量；
+- 采集 `/sys/class/infiniband` 设备、端口、rate、GID、netdev 映射；
+- 采集 `rdma link`、`rdma dev`、`ibv_devinfo`、`ip -br addr/link`；
+- 在 All-Reduce 前后采集 IB counter，并生成 `ib_counters_delta.tsv`；
+- 带 `MCCL_DEBUG=INFO`、`NCCL_DEBUG=INFO` 执行一次小规模 `run-bandwidth`。
+
+输出默认写入：
+
+```text
+/afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck/results/vcctl_comm_probe/<RUN_ID>/
+```
+
+主要看每个 pod 的：
+
+```text
+pod_results/<pod>/multi-node/summary.md
+pod_results/<pod>/multi-node/ib_sysfs_before.txt
+pod_results/<pod>/multi-node/ib_counters_delta.tsv
+pod_results/<pod>/multi-node/torch_debug.stderr
+pod_results/<pod>/multi-node/torch_bandwidth/bandwidth_gate.json
+```
+
 ## 5. MODE 与 PROFILE
 
 | 参数 | 含义 |
