@@ -197,6 +197,7 @@ pod_results/<pod>/multi-node/torch_bandwidth/bandwidth_gate.json
 | `PROFILE=smoke` | 最短连通性测试，`nproc-per-node=1`，只做简单 `all_reduce` |
 | `PROFILE=quick` | 快速正式测试，默认每节点 8 rank，覆盖计算、显存拷贝和通信算子 |
 | `PROFILE=bandwidth` | All-Reduce 大包带宽 gate，默认 1G/4G/8G/16G、100 轮计时 |
+| `PROFILE=collective-bandwidth` | 多 collective 大包带宽基线，覆盖 All-Reduce、Reduce-Scatter、All-Gather、All-to-All、EP=8 All-to-Allv |
 
 ## 6. quick 覆盖算子
 
@@ -309,11 +310,95 @@ avg_busbw           > BANDWIDTH_AVG_BUSBW
 | `bandwidth_gate.json` | 本次 bandwidth gate 的机器可读总结果 |
 | `bandwidth_report.md` | 本次 bandwidth gate 的 Markdown 报告 |
 
-## 8. 故障注入测试
+## 8. 多 collective 带宽基线
+
+`PROFILE=collective-bandwidth` 用于在 quick 功能测试之后，对关键 collective 做大包性能基线。它默认覆盖：
+
+```text
+all_reduce
+reduce_scatter
+all_gather
+all_to_all
+all_to_allv
+```
+
+其中 `all_to_allv` 按 `COLLECTIVE_BANDWIDTH_EP_SIZE=8` 创建 EP group，并使用 MoE payload patterns：
+
+```text
+uniform
+skewed
+hot_expert
+random
+empty_expert
+```
+
+默认配置：
+
+| 项 | 默认值 |
+| --- | --- |
+| ops | `all_reduce,reduce_scatter,all_gather,all_to_all,all_to_allv` |
+| message size | `1G` |
+| warmup | `5` |
+| iters | `30` |
+| EP size | `8` |
+| min gate | `0 GB/s` |
+| avg gate | `0 GB/s` |
+
+说明：该 profile 默认使用 `1G`，不是 `8G`。对 `all_gather`，这里把 message size 解释为最终 gathered payload 的总大小，每 rank 输入约为 `message_size / collective_group_size`，避免规模扩大后输出按 group size 继续放大导致 OOM。正式标定时应按 op 分别选择 message size。
+
+两节点冒烟建议：
+
+```bash
+DRY_RUN=0 \
+MODE=multi-node \
+PROFILE=collective-bandwidth \
+COLLECTIVE_BANDWIDTH_MESSAGE_SIZES=1M \
+COLLECTIVE_BANDWIDTH_WARMUP=1 \
+COLLECTIVE_BANDWIDTH_ITERS=1 \
+bash run_vcctl_healthcheck.sh
+```
+
+两节点基线建议：
+
+```bash
+DRY_RUN=0 \
+MODE=multi-node \
+PROFILE=collective-bandwidth \
+COLLECTIVE_BANDWIDTH_MESSAGE_SIZES=1G \
+COLLECTIVE_BANDWIDTH_WARMUP=5 \
+COLLECTIVE_BANDWIDTH_ITERS=30 \
+COLLECTIVE_BANDWIDTH_MIN_BUSBW=0 \
+COLLECTIVE_BANDWIDTH_AVG_BUSBW=0 \
+bash run_vcctl_healthcheck.sh
+```
+
+如果只想测 MoE / EP 相关通信：
+
+```bash
+DRY_RUN=0 \
+MODE=multi-node \
+PROFILE=collective-bandwidth \
+COLLECTIVE_BANDWIDTH_OPS=all_to_all,all_to_allv \
+COLLECTIVE_BANDWIDTH_EP_SIZE=8 \
+COLLECTIVE_BANDWIDTH_MESSAGE_SIZES=1G \
+bash run_vcctl_healthcheck.sh
+```
+
+该 profile 输出：
+
+| 文件 | 含义 |
+| --- | --- |
+| `collective_bandwidth_round_detail.jsonl` | rank 级每轮 latency / algbw / busbw |
+| `collective_bandwidth_round_summary.jsonl` | group 级每轮 latency / algbw / busbw |
+| `collective_bandwidth_summary.jsonl` | op / message size / payload pattern 级 gate 汇总 |
+| `collective_bandwidth_gate.json` | 本次 collective bandwidth gate 的机器可读总结果 |
+| `collective_bandwidth_report.md` | 本次 collective bandwidth gate 的 Markdown 报告 |
+
+## 9. 故障注入测试
 
 故障注入用于验证健康检查工具自身是否能正确识别异常，并将异常传播到外层 `summary.md`。
 
-### 8.1 NaN 精度异常
+### 9.1 NaN 精度异常
 
 ```bash
 DRY_RUN=0 \
@@ -329,7 +414,7 @@ bash run_vcctl_healthcheck.sh
 - `rank_detail.jsonl` 中 rank3 出现 `rank_nan_count > 0`；
 - `report.md` 中 `failed summaries > 0`。
 
-### 8.2 显式 corrupt 数据异常
+### 9.2 显式 corrupt 数据异常
 
 ```bash
 DRY_RUN=0 \
@@ -345,7 +430,7 @@ bash run_vcctl_healthcheck.sh
 - `rank_detail.jsonl` 中 rank3 出现 `rank_error_type=FaultInjectedCorrupt`；
 - `report.md` 中 `failed summaries > 0`。
 
-### 8.3 hang / timeout
+### 9.3 hang / timeout
 
 ```bash
 DRY_RUN=0 \
@@ -364,7 +449,7 @@ bash run_vcctl_healthcheck.sh
 - `reason=timeout`；
 - stderr 中包含 `TIMEOUT after 120s`。
 
-### 8.4 后端初始化失败
+### 9.4 后端初始化失败
 
 ```bash
 DRY_RUN=0 \
@@ -380,9 +465,9 @@ bash run_vcctl_healthcheck.sh
 - stderr 中包含 `failed to initialize torch.distributed backend`；
 - 该场景发生在 `init_process_group`，因此通常不会生成 rank/group 级算子明细。
 
-## 9. 单节点测试
+## 10. 单节点测试
 
-### 9.1 MetaX C550 单节点 8 卡
+### 10.1 MetaX C550 单节点 8 卡
 
 ```bash
 cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck
@@ -405,7 +490,7 @@ ITERS=5 \
 bash scripts/metax/run_single_node_8c550.sh
 ```
 
-### 9.2 NVIDIA H200 单节点 6 卡
+### 10.2 NVIDIA H200 单节点 6 卡
 
 NVIDIA 脚本保留用于单节点开发验证：
 
@@ -418,9 +503,9 @@ bash scripts/nvidia/run_single_node_6h200.sh
 
 说明：当前 README 主流程以 MetaX + vcctl 为准；NVIDIA 脚本没有参与当前两节点 vcctl 验证基线。
 
-## 10. 静态环境探测
+## 11. 静态环境探测
 
-### 10.1 MetaX pod 能力探测
+### 11.1 MetaX pod 能力探测
 
 ```bash
 cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck
@@ -437,7 +522,7 @@ MetaX probe 会收集：
 - `xscale` / `net*` / `eth*` 网络接口信息；
 - NUMA、磁盘、`/proc`、`/sys` 可见性。
 
-### 10.2 dmesg 策略
+### 11.2 dmesg 策略
 
 当前运维提供的 pod 不支持读取 `dmesg`，因此 probe 脚本不在 pod 内执行 `dmesg`。summary 中记录为：
 
@@ -447,7 +532,7 @@ logs | dmesg | SKIP | pod environment does not support dmesg; kernel log screeni
 
 宿主机内核日志、PCIe AER、MCE、soft lockup、XID / NPU 历史错误筛查由运维侧提供结论。
 
-## 11. 输出目录与结果文件
+## 12. 输出目录与结果文件
 
 vcctl 编排结果默认写入：
 
@@ -489,11 +574,16 @@ MetaX 默认：
 | `bandwidth_summary.jsonl` | bandwidth 模式的 message size 级 gate 汇总 |
 | `bandwidth_gate.json` | bandwidth 模式的总 gate 结果 |
 | `bandwidth_report.md` | bandwidth 模式的 Markdown 报告 |
+| `collective_bandwidth_round_detail.jsonl` | collective-bandwidth 模式的 rank 级每轮带宽明细 |
+| `collective_bandwidth_round_summary.jsonl` | collective-bandwidth 模式的 group 级每轮带宽汇总 |
+| `collective_bandwidth_summary.jsonl` | collective-bandwidth 模式的 op / pattern 级 gate 汇总 |
+| `collective_bandwidth_gate.json` | collective-bandwidth 模式的总 gate 结果 |
+| `collective_bandwidth_report.md` | collective-bandwidth 模式的 Markdown 报告 |
 | `ib_counters_delta.tsv` | comm probe 模式的 IB counter 增量；当前 pod 内标准 counter 未暴露时可能只有表头 |
 | `torch_debug.stderr` | comm probe 模式的 torch / MCCL debug stderr |
 | `torch_debug.stdout` | comm probe 模式的 MCCL debug stdout，可查看 `NET/IB`、`MCCL_IB_HCA`、`xscale_*` |
 
-## 12. 常用环境变量
+## 13. 常用环境变量
 
 | 环境变量 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -502,7 +592,7 @@ MetaX 默认：
 | `MODE` | `all` | `static`、`single-node`、`multi-node`、`all` |
 | `DEVICE_TYPE` | `metax` | 结果元信息，例如 `gpu`、`npu`、`metax` |
 | `PROJECT_REMOTE_DIR` | `/afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck` | pod 内项目路径 |
-| `PROFILE` | `quick` | `quick`、`smoke` 或 `bandwidth` |
+| `PROFILE` | `quick` | `quick`、`smoke`、`bandwidth` 或 `collective-bandwidth` |
 | `PRE_CLEAN` | `1` | 每次测试前清理可能残留的健康检查进程 |
 | `GPUS_PER_NODE` | `8` | 每个 pod / 节点的 GPU 数 |
 | `DIST_BACKEND` | `nccl` | PyTorch distributed backend 名称 |
@@ -519,6 +609,13 @@ MetaX 默认：
 | `BANDWIDTH_ITERS` | `100` | `PROFILE=bandwidth` 的计时轮数 |
 | `BANDWIDTH_MIN_BUSBW` | `270` | `PROFILE=bandwidth` 的次低 BusBW gate，单位 GB/s |
 | `BANDWIDTH_AVG_BUSBW` | `290` | `PROFILE=bandwidth` 的平均 BusBW gate，单位 GB/s |
+| `COLLECTIVE_BANDWIDTH_OPS` | `all_reduce,reduce_scatter,all_gather,all_to_all,all_to_allv` | `PROFILE=collective-bandwidth` 的 op 列表 |
+| `COLLECTIVE_BANDWIDTH_MESSAGE_SIZES` | `1G` | `PROFILE=collective-bandwidth` 的 payload 大小列表 |
+| `COLLECTIVE_BANDWIDTH_WARMUP` | `5` | `PROFILE=collective-bandwidth` 的 warmup 轮数 |
+| `COLLECTIVE_BANDWIDTH_ITERS` | `30` | `PROFILE=collective-bandwidth` 的计时轮数 |
+| `COLLECTIVE_BANDWIDTH_MIN_BUSBW` | `0` | `PROFILE=collective-bandwidth` 的次低 BusBW gate，单位 GB/s |
+| `COLLECTIVE_BANDWIDTH_AVG_BUSBW` | `0` | `PROFILE=collective-bandwidth` 的平均 BusBW gate，单位 GB/s |
+| `COLLECTIVE_BANDWIDTH_EP_SIZE` | `8` | `PROFILE=collective-bandwidth` 中 `all_to_allv` 的 EP group size |
 | `SEED` | `20260623` | 随机种子 |
 | `RESULT_ROOT` | `/afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck/results/vcctl` | 共享结果根目录 |
 | `RUN_ID` | 当前时间戳 | 本次运行 ID |
@@ -538,7 +635,7 @@ MetaX 默认：
 | `FAULT_NAN_RANK=<rank>` | 指定全局 rank 注入 NaN |
 | `FAULT_CORRUPT_RANK=<rank>` | 指定全局 rank 修改 tensor，模拟结果污染 |
 
-## 13. 已验证结果
+## 14. 已验证结果
 
 当前最终基线：
 
@@ -582,7 +679,7 @@ multi-node:  2/2 PASS
 ../design_docs/pretrain_healthcheck_metax_test_summary.md
 ```
 
-## 14. 当前限制
+## 15. 当前限制
 
 - 当前 vcctl 多节点验证只在两节点 MetaX C550 环境完成闭环。
 - 更大规模的 8 / 64 / 128 节点测试需要结合实际资源申请和分组策略继续验证。
@@ -590,18 +687,20 @@ multi-node:  2/2 PASS
 - static probe 中部分系统命令可能在 pod 内缺失，例如 `rdma`、`ip`、`numactl`；这类结果用于能力探测，不等价于训练不可用。
 - pod 内标准 `/sys/class/infiniband/.../counters` 当前未暴露有效 counter，通信路径探测只能从 MCCL debug 确认 `xscale_0..xscale_3` 被识别和启用，不能在 pod 内直接证明每条 rail 的实际流量占比。
 - 当前两节点 MetaX C550 + MCCL 的 8GB All-Reduce 基线约为 `avg_busbw 93-96 GB/s`、`second_lowest_busbw 88-92 GB/s`；正式 128 节点 gate 需要重新标定。
+- `PROFILE=collective-bandwidth` 默认使用 `1G`；其中 `all_gather` 的 message size 表示 gathered 后的总 payload，其余 op 表示本 rank 参与 collective 的输入 payload。大包阈值需要按 op 分别标定。
 - 当前 NPU / HCCL 完整执行路径尚未作为主流程验证。
 
-## 15. 建议使用顺序
+## 16. 建议使用顺序
 
 训练前建议按以下顺序执行：
 
 1. `PROFILE=smoke MODE=multi-node`：快速确认 vcctl、torchrun、多 pod 连通性。
 2. `MODE=all PROFILE=quick MESSAGE_SIZES=1M WARMUP=1 ITERS=1`：完整快速验收。
 3. `MODE=multi-node PROFILE=bandwidth BANDWIDTH_MESSAGE_SIZES=8G BANDWIDTH_MIN_BUSBW=0 BANDWIDTH_AVG_BUSBW=0`：采集当前 8GB All-Reduce 基线。
-4. `DRY_RUN=0 bash run_vcctl_comm_probe.sh`：确认通信数据面是否走 `xscale/RoCE/IB`。
-5. 若需要启用 bandwidth gate，先基于当前硬件和规模标定 `BANDWIDTH_MIN_BUSBW` / `BANDWIDTH_AVG_BUSBW`。
-6. 若工具变更后需要自测，依次运行 NaN、corrupt、timeout、backend failure 故障注入。
+4. `MODE=multi-node PROFILE=collective-bandwidth COLLECTIVE_BANDWIDTH_MESSAGE_SIZES=1G COLLECTIVE_BANDWIDTH_MIN_BUSBW=0 COLLECTIVE_BANDWIDTH_AVG_BUSBW=0`：采集关键 collective 大包基线，包含 EP=8 all_to_allv。
+5. `DRY_RUN=0 bash run_vcctl_comm_probe.sh`：确认通信数据面是否走 `xscale/RoCE/IB`。
+6. 若需要启用 bandwidth gate，先基于当前硬件和规模标定 `BANDWIDTH_*` / `COLLECTIVE_BANDWIDTH_*` 阈值。
+7. 若工具变更后需要自测，依次运行 NaN、corrupt、timeout、backend failure 故障注入。
 
 常用命令：
 
@@ -613,6 +712,8 @@ DRY_RUN=0 MODE=multi-node PROFILE=smoke bash run_vcctl_healthcheck.sh
 DRY_RUN=0 MODE=all PROFILE=quick MESSAGE_SIZES=1M WARMUP=1 ITERS=1 bash run_vcctl_healthcheck.sh
 
 DRY_RUN=0 MODE=multi-node PROFILE=bandwidth BANDWIDTH_MESSAGE_SIZES=8G BANDWIDTH_MIN_BUSBW=0 BANDWIDTH_AVG_BUSBW=0 bash run_vcctl_healthcheck.sh
+
+DRY_RUN=0 MODE=multi-node PROFILE=collective-bandwidth COLLECTIVE_BANDWIDTH_MESSAGE_SIZES=1G COLLECTIVE_BANDWIDTH_MIN_BUSBW=0 COLLECTIVE_BANDWIDTH_AVG_BUSBW=0 bash run_vcctl_healthcheck.sh
 
 DRY_RUN=0 bash run_vcctl_comm_probe.sh
 ```

@@ -550,6 +550,421 @@ def run_bandwidth_gate(
         raise RuntimeError("all-reduce bandwidth gate failed")
 
 
+def _busbw_factor(op_type: str, world_size: int) -> float:
+    if op_type == "all_reduce":
+        return 2 * max(0, world_size - 1) / max(1, world_size)
+    if op_type in {"reduce_scatter", "all_gather", "all_to_all", "all_to_allv"}:
+        return max(0, world_size - 1) / max(1, world_size)
+    return 1.0
+
+
+def _write_collective_bandwidth_report(output_dir: Path, summaries: list[dict[str, Any]]) -> None:
+    lines = [
+        "# Collective Bandwidth Gate Report",
+        "",
+        f"- input_dir: `{output_dir}`",
+        f"- summary_count: {len(summaries)}",
+        "",
+        "| op | pattern | group_size | message_size | iters | min_gate GB/s | avg_gate GB/s | second_lowest_busbw GB/s | avg_busbw GB/s | pass |",
+        "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for row in summaries:
+        lines.append(
+            f"| {row['op_type']} | {row.get('payload_pattern', 'none')} | {row['collective_group_size']} | "
+            f"{row['message_size']} | {row['iters']} | "
+            f"{row['min_busbw_gate']:.3f} | {row['avg_busbw_gate']:.3f} | "
+            f"{row['second_lowest_busbw']:.3f} | {row['avg_busbw']:.3f} | "
+            f"{row['bandwidth_pass']} |"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "collective_bandwidth_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _make_ep_group(dist: Any, env: DistEnv, ep_size: int) -> tuple[Any, int, int, list[int]]:
+    group_size = env.world_size if ep_size <= 0 else min(ep_size, env.world_size)
+    if env.world_size % group_size != 0:
+        raise RuntimeError(f"world_size={env.world_size} must be divisible by ep_size={group_size}")
+    selected_group = None
+    selected_ranks: list[int] = []
+    selected_group_rank = 0
+    for group_start in range(0, env.world_size, group_size):
+        ranks = list(range(group_start, group_start + group_size))
+        group = dist.new_group(ranks=ranks)
+        if env.rank in ranks:
+            selected_group = group
+            selected_ranks = ranks
+            selected_group_rank = env.rank - group_start
+    if selected_group is None:
+        raise RuntimeError(f"rank {env.rank} did not join any EP group")
+    return selected_group, selected_group_rank, group_size, selected_ranks
+
+
+def _collective_bandwidth_once(
+    torch: Any,
+    dist: Any,
+    env: DistEnv,
+    op: str,
+    tensor: Any,
+    group: Any | None = None,
+    group_rank: int | None = None,
+    group_size: int | None = None,
+    input_split_sizes: list[int] | None = None,
+    output_split_sizes: list[int] | None = None,
+) -> Any:
+    group_rank = env.rank if group_rank is None else group_rank
+    group_size = env.world_size if group_size is None else group_size
+    if op == "all_reduce":
+        out = tensor.clone()
+        dist.all_reduce(out, group=group)
+        return out
+    if op == "reduce_scatter":
+        padded_numel = ((tensor.numel() + group_size - 1) // group_size) * group_size
+        if padded_numel != tensor.numel():
+            inp = torch.empty(padded_numel, device=env.device, dtype=tensor.dtype)
+            inp[: tensor.numel()].copy_(tensor)
+        else:
+            inp = tensor
+        chunks = list(inp.chunk(group_size))
+        out = torch.empty_like(chunks[group_rank])
+        dist.reduce_scatter(out, chunks, group=group)
+        return out
+    if op == "all_gather":
+        out = [torch.empty_like(tensor) for _ in range(group_size)]
+        dist.all_gather(out, tensor, group=group)
+        return out[0]
+    if op == "all_to_all":
+        padded_numel = ((tensor.numel() + group_size - 1) // group_size) * group_size
+        if padded_numel != tensor.numel():
+            inp = torch.empty(padded_numel, device=env.device, dtype=tensor.dtype)
+            inp[: tensor.numel()].copy_(tensor)
+        else:
+            inp = tensor
+        out = torch.empty_like(inp)
+        split = inp.numel() // group_size
+        dist.all_to_all_single(
+            out,
+            inp,
+            output_split_sizes=[split for _ in range(group_size)],
+            input_split_sizes=[split for _ in range(group_size)],
+            group=group,
+        )
+        return out
+    if op == "all_to_allv":
+        if input_split_sizes is None or output_split_sizes is None:
+            raise RuntimeError("all_to_allv requires split sizes")
+        out = torch.empty(sum(output_split_sizes), device=env.device, dtype=tensor.dtype)
+        dist.all_to_all_single(
+            out,
+            tensor,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+        )
+        return out
+    raise ValueError(op)
+
+
+def _collective_bandwidth_case(
+    torch: Any,
+    dist: Any,
+    env: DistEnv,
+    output_dir: Path,
+    job_id: str,
+    test_round: str,
+    group_id: str,
+    hostnames: list[str],
+    dtype_name: str,
+    dtype: Any,
+    op: str,
+    message_size: int,
+    warmup: int,
+    iters: int,
+    seed: int,
+    min_busbw: float,
+    avg_busbw: float,
+    payload_pattern: str = "none",
+    collective_group: Any | None = None,
+    collective_group_rank: int | None = None,
+    collective_group_size: int | None = None,
+) -> dict[str, Any] | None:
+    collective_group_rank = env.rank if collective_group_rank is None else collective_group_rank
+    collective_group_size = env.world_size if collective_group_size is None else collective_group_size
+    element_size = torch.empty((), dtype=dtype).element_size()
+    numel = max(1, message_size // element_size)
+
+    input_split_sizes = None
+    output_split_sizes = None
+    effective_message_size = message_size
+    if op == "all_gather":
+        tensor_numel = max(1, numel // max(1, collective_group_size))
+        effective_message_size = tensor_numel * element_size * collective_group_size
+    elif op == "all_to_allv":
+        token_size = max(1, numel // max(1, collective_group_size))
+        input_split_sizes = _routing_counts(
+            payload_pattern,
+            collective_group_size,
+            token_size * collective_group_size,
+            collective_group_rank,
+            seed,
+        )
+        gathered_counts = [None for _ in range(collective_group_size)]
+        dist.all_gather_object(gathered_counts, input_split_sizes, group=collective_group)
+        output_split_sizes = [counts[collective_group_rank] for counts in gathered_counts]
+        tensor_numel = sum(input_split_sizes)
+        effective_message_size = tensor_numel * element_size
+    else:
+        tensor_numel = numel
+
+    tensor = torch.empty(tensor_numel, device=env.device, dtype=dtype)
+    for _ in range(max(0, warmup)):
+        _collective_bandwidth_once(
+            torch,
+            dist,
+            env,
+            op,
+            tensor,
+            group=collective_group,
+            group_rank=collective_group_rank,
+            group_size=collective_group_size,
+            input_split_sizes=input_split_sizes,
+            output_split_sizes=output_split_sizes,
+        )
+    torch.cuda.synchronize()
+    dist.barrier(device_ids=[env.local_rank])
+
+    local_rows: list[dict[str, Any]] = []
+    for idx in range(max(1, iters)):
+        _maybe_fault_sleep(env)
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        _collective_bandwidth_once(
+            torch,
+            dist,
+            env,
+            op,
+            tensor,
+            group=collective_group,
+            group_rank=collective_group_rank,
+            group_size=collective_group_size,
+            input_split_sizes=input_split_sizes,
+            output_split_sizes=output_split_sizes,
+        )
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        algbw = (effective_message_size / max(elapsed, 1e-12)) / 1e9
+        busbw = algbw * _busbw_factor(op, collective_group_size)
+        local_rows.append(
+            {
+                "job_id": job_id,
+                "test_round": test_round,
+                "group_id": group_id,
+                "hostnames": hostnames,
+                "hostname": env.hostname,
+                "rank": env.rank,
+                "local_rank": env.local_rank,
+                "gpu_id": env.local_rank,
+                "dtype": dtype_name,
+                "dist_backend_requested": env.dist_backend_requested,
+                "dist_backend": env.dist_backend,
+                "device_vendor": env.device_vendor,
+                "comm_runtime": env.comm_runtime,
+                "op_type": op,
+                "payload_pattern": payload_pattern,
+                "message_size": size_to_label(message_size),
+                "message_bytes": effective_message_size,
+                "requested_message_bytes": message_size,
+                "round": idx,
+                "collective_group_rank": collective_group_rank,
+                "collective_group_size": collective_group_size,
+                "rank_latency": elapsed,
+                "rank_algbw": algbw,
+                "rank_busbw": busbw,
+            }
+        )
+
+    gathered = _all_gather_object(dist, local_rows, env.world_size)
+    if env.rank != 0:
+        return None
+
+    flat = [row for rank_rows in gathered for row in rank_rows]
+    append_jsonl(output_dir / "collective_bandwidth_round_detail.jsonl", flat)
+
+    round_busbw: list[float] = []
+    round_rows: list[dict[str, Any]] = []
+    for idx in range(max(1, iters)):
+        values = [row for row in flat if int(row["round"]) == idx]
+        elapsed = max(float(row["rank_latency"]) for row in values)
+        algbw = (effective_message_size / max(elapsed, 1e-12)) / 1e9
+        busbw = algbw * _busbw_factor(op, collective_group_size)
+        round_busbw.append(busbw)
+        round_rows.append(
+            {
+                "job_id": job_id,
+                "test_round": test_round,
+                "group_id": group_id,
+                "hostnames": hostnames,
+                "op_type": op,
+                "payload_pattern": payload_pattern,
+                "message_size": size_to_label(message_size),
+                "message_bytes": effective_message_size,
+                "requested_message_bytes": message_size,
+                "dtype": dtype_name,
+                "round": idx,
+                "collective_group_size": collective_group_size,
+                "latency": elapsed,
+                "algbw": algbw,
+                "busbw": busbw,
+            }
+        )
+    append_jsonl(output_dir / "collective_bandwidth_round_summary.jsonl", round_rows)
+
+    ordered = sorted(round_busbw)
+    second_lowest = ordered[1] if len(ordered) >= 2 else ordered[0]
+    avg_value = sum(round_busbw) / len(round_busbw)
+    passed = second_lowest > min_busbw and avg_value > avg_busbw
+    summary = {
+        "job_id": job_id,
+        "test_round": test_round,
+        "group_id": group_id,
+        "hostnames": hostnames,
+        "op_type": op,
+        "payload_pattern": payload_pattern,
+        "message_size": size_to_label(message_size),
+        "message_bytes": effective_message_size,
+        "requested_message_bytes": message_size,
+        "dtype": dtype_name,
+        "iters": max(1, iters),
+        "warmup": max(0, warmup),
+        "collective_group_size": collective_group_size,
+        "latency_p50": percentile([row["latency"] for row in round_rows], 0.50),
+        "latency_p95": percentile([row["latency"] for row in round_rows], 0.95),
+        "latency_p99": percentile([row["latency"] for row in round_rows], 0.99),
+        "min_busbw_gate": min_busbw,
+        "avg_busbw_gate": avg_busbw,
+        "second_lowest_busbw": second_lowest,
+        "avg_busbw": avg_value,
+        "min_busbw": min(round_busbw),
+        "max_busbw": max(round_busbw),
+        "bandwidth_pass": passed,
+        "correctness_pass": True,
+        "performance_pass": passed,
+        "error_type": "" if passed else "CollectiveBandwidthGateFailed",
+        "dist_backend_requested": env.dist_backend_requested,
+        "dist_backend": env.dist_backend,
+        "device_vendor": env.device_vendor,
+        "comm_runtime": env.comm_runtime,
+    }
+    append_jsonl(output_dir / "collective_bandwidth_summary.jsonl", [summary])
+    return summary
+
+
+def run_collective_bandwidth_gate(
+    output_dir: Path,
+    dtype_name: str,
+    message_sizes: list[int],
+    ops: list[str],
+    moe_patterns: list[str],
+    ep_size: int,
+    warmup: int,
+    iters: int,
+    seed: int,
+    min_busbw: float,
+    avg_busbw: float,
+    test_round: str,
+    group_id: str,
+) -> None:
+    allowed = {"all_reduce", "reduce_scatter", "all_gather", "all_to_all", "all_to_allv"}
+    invalid = sorted(set(ops) - allowed)
+    if invalid:
+        raise ValueError(f"unsupported collective bandwidth ops: {invalid}")
+
+    torch, dist, env = init_dist()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dtype = _dtype(torch, dtype_name)
+    job_id = os.environ.get("HEALTHCHECK_JOB_ID", str(uuid.uuid4()))
+    hostnames = sorted(set(_all_gather_object(dist, env.hostname, env.world_size)))
+    env.group_id = group_id or env.group_id or f"{test_round}-" + "-".join(hostnames)
+    ep_group = None
+    ep_group_rank = env.rank
+    ep_group_size = env.world_size
+    if "all_to_allv" in ops:
+        ep_group, ep_group_rank, ep_group_size, _ = _make_ep_group(dist, env, ep_size)
+
+    all_summaries: list[dict[str, Any]] = []
+    try:
+        for size in message_sizes:
+            for op in ops:
+                if op == "all_to_allv":
+                    for pattern in moe_patterns:
+                        summary = _collective_bandwidth_case(
+                            torch,
+                            dist,
+                            env,
+                            output_dir,
+                            job_id,
+                            test_round,
+                            env.group_id,
+                            hostnames,
+                            dtype_name,
+                            dtype,
+                            op,
+                            size,
+                            warmup,
+                            iters,
+                            seed,
+                            min_busbw,
+                            avg_busbw,
+                            payload_pattern=pattern,
+                            collective_group=ep_group,
+                            collective_group_rank=ep_group_rank,
+                            collective_group_size=ep_group_size,
+                        )
+                        if summary is not None:
+                            all_summaries.append(summary)
+                        dist.barrier(device_ids=[env.local_rank])
+                else:
+                    summary = _collective_bandwidth_case(
+                        torch,
+                        dist,
+                        env,
+                        output_dir,
+                        job_id,
+                        test_round,
+                        env.group_id,
+                        hostnames,
+                        dtype_name,
+                        dtype,
+                        op,
+                        size,
+                        warmup,
+                        iters,
+                        seed,
+                        min_busbw,
+                        avg_busbw,
+                    )
+                    if summary is not None:
+                        all_summaries.append(summary)
+                    dist.barrier(device_ids=[env.local_rank])
+
+        if env.rank == 0:
+            write_json(
+                output_dir / "collective_bandwidth_gate.json",
+                {
+                    "status": "PASS" if all(row["bandwidth_pass"] for row in all_summaries) else "FAIL",
+                    "summaries": all_summaries,
+                },
+            )
+            _write_collective_bandwidth_report(output_dir, all_summaries)
+            failed = [row for row in all_summaries if not row["bandwidth_pass"]]
+        else:
+            failed = []
+    finally:
+        dist.barrier(device_ids=[env.local_rank])
+        dist.destroy_process_group()
+    if failed:
+        raise RuntimeError("collective bandwidth gate failed")
+
+
 def _run_distributed_checks(
     output_dir: Path,
     dtype_name: str,

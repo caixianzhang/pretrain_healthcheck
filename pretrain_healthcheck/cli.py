@@ -60,6 +60,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_bw.add_argument("--test-round", default="bandwidth")
     p_bw.add_argument("--group-id", default="")
 
+    p_cbw = sub.add_parser("run-collective-bandwidth", help="run multi-collective bandwidth baseline")
+    p_cbw.add_argument("--output-dir", type=Path, required=True)
+    p_cbw.add_argument("--dtype", default="bf16", choices=["fp32", "bf16", "fp16"])
+    p_cbw.add_argument("--message-sizes", default="1G")
+    p_cbw.add_argument(
+        "--ops",
+        default="all_reduce,reduce_scatter,all_gather,all_to_all,all_to_allv",
+        help="comma-separated ops: all_reduce,reduce_scatter,all_gather,all_to_all,all_to_allv",
+    )
+    p_cbw.add_argument(
+        "--moe-patterns",
+        default="uniform,skewed,hot_expert,random,empty_expert",
+        help="comma-separated MoE payload patterns for all_to_allv",
+    )
+    p_cbw.add_argument("--ep-size", type=int, default=8, help="EP group size for all_to_allv")
+    p_cbw.add_argument("--warmup", type=int, default=5)
+    p_cbw.add_argument("--iters", type=int, default=30)
+    p_cbw.add_argument("--seed", type=int, default=20260623)
+    p_cbw.add_argument("--min-busbw", type=float, default=0.0, help="second-lowest busbw gate in GB/s")
+    p_cbw.add_argument("--avg-busbw", type=float, default=0.0, help="average busbw gate in GB/s")
+    p_cbw.add_argument("--test-round", default="collective_bandwidth")
+    p_cbw.add_argument("--group-id", default="")
+
     p_analyze = sub.add_parser("analyze", help="analyze a result directory")
     p_analyze.add_argument("--input-dir", type=Path, required=True)
     p_analyze.add_argument("--output", type=Path, default=None)
@@ -132,6 +155,29 @@ def main() -> None:
             output_dir=args.output_dir,
             dtype_name=args.dtype,
             message_sizes=parse_size_list(args.message_sizes),
+            warmup=args.warmup,
+            iters=args.iters,
+            seed=args.seed,
+            min_busbw=args.min_busbw,
+            avg_busbw=args.avg_busbw,
+            test_round=args.test_round,
+            group_id=args.group_id,
+        )
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"wrote {args.output_dir}")
+        return
+    if args.cmd == "run-collective-bandwidth":
+        import os
+
+        from .torch_checks import run_collective_bandwidth_gate
+
+        run_collective_bandwidth_gate(
+            output_dir=args.output_dir,
+            dtype_name=args.dtype,
+            message_sizes=parse_size_list(args.message_sizes),
+            ops=[x.strip() for x in args.ops.split(",") if x.strip()],
+            moe_patterns=[x.strip() for x in args.moe_patterns.split(",") if x.strip()],
+            ep_size=args.ep_size,
             warmup=args.warmup,
             iters=args.iters,
             seed=args.seed,
