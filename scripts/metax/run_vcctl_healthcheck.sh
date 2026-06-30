@@ -61,6 +61,7 @@ EXEC_TIMEOUT_SECONDS="${EXEC_TIMEOUT_SECONDS:-3600}"
 VCCTL_TIMEOUT_SECONDS="${VCCTL_TIMEOUT_SECONDS:-120}"
 MAX_PARALLEL="${MAX_PARALLEL:-0}"
 RESULT_ROOT="${RESULT_ROOT:-/afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck/results/vcctl}"
+POD_RESULT_ROOT="${POD_RESULT_ROOT:-${RESULT_ROOT}}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN="${DRY_RUN:-1}"
 POD_JSON_FILE="${POD_JSON_FILE:-}"
@@ -109,6 +110,7 @@ Common env:
   SINGLE_NODE_CMD          Command executed in each pod for single-node checks. Default: MetaX 8-card torchrun
   MULTI_NODE_CMD           Command executed in every pod concurrently for multi-node checks. Default: MetaX current vcjob torchrun
   RESULT_ROOT              Shared result root. Default: /afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck/results/vcctl
+  POD_RESULT_ROOT          Result root visible inside target pods. Default: RESULT_ROOT
   RUN_ID                   Run id. Default: current timestamp
   EXEC_TIMEOUT_SECONDS     Per-pod exec timeout. Default: 3600
   MAX_PARALLEL             0 means all pods concurrently. Default: 0
@@ -177,6 +179,7 @@ echo "[vcctl-healthcheck] namespace   : ${NAMESPACE}"
 echo "[vcctl-healthcheck] mode        : ${MODE}"
 echo "[vcctl-healthcheck] device      : ${DEVICE_TYPE}"
 echo "[vcctl-healthcheck] result root : ${RESULT_ROOT}"
+echo "[vcctl-healthcheck] pod result  : ${POD_RESULT_ROOT}"
 echo "[vcctl-healthcheck] run id      : ${RUN_ID}"
 echo "[vcctl-healthcheck] output      : ${OUT_DIR}"
 echo "[vcctl-healthcheck] dry run     : ${DRY_RUN}"
@@ -188,6 +191,7 @@ args=(
   --mode "${MODE}"
   --device-type "${DEVICE_TYPE}"
   --result-root "${RESULT_ROOT}"
+  --pod-result-root "${POD_RESULT_ROOT}"
   --run-id "${RUN_ID}"
   --vcctl-bin "${VCCTL_BIN}"
   --healthcheck-master-port "${HEALTHCHECK_MASTER_PORT}"

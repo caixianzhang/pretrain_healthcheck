@@ -305,8 +305,9 @@ def run_exec_for_pod(pod: PodInfo, mode: str, command: str, args: argparse.Names
     started = iso_now()
     start_time = time.monotonic()
     logs_dir = Path(args.output_dir) / "logs"
-    pod_result_dir = Path(args.output_dir) / "pod_results" / pod.pod_name / mode
-    pod_result_dir.mkdir(parents=True, exist_ok=True)
+    pod_result_dir = Path(args.pod_output_dir) / "pod_results" / pod.pod_name / mode
+    if args.pod_output_dir == args.output_dir:
+        pod_result_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = logs_dir / f"{pod.pod_name}.{mode}.stdout"
     stderr_path = logs_dir / f"{pod.pod_name}.{mode}.stderr"
 
@@ -499,6 +500,7 @@ def write_commands_env(path: Path, args: argparse.Namespace) -> None:
         f"DEVICE_TYPE={args.device_type}",
         f"RUN_ID={args.run_id}",
         f"RESULT_ROOT={args.result_root}",
+        f"POD_RESULT_ROOT={args.pod_result_root or args.result_root}",
         f"OUTPUT_DIR={args.output_dir}",
         f"EXEC_TIMEOUT_SECONDS={args.exec_timeout_seconds}",
         f"MAX_PARALLEL={args.max_parallel}",
@@ -567,6 +569,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=["static", "single-node", "multi-node", "all"], default="all")
     parser.add_argument("--device-type", default="gpu")
     parser.add_argument("--result-root", required=True)
+    parser.add_argument("--pod-result-root", default="")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--vcctl-bin", default="vcctl")
     parser.add_argument("--container-name", default="")
@@ -589,6 +592,8 @@ def main() -> int:
     args = build_parser().parse_args()
     output_dir = Path(args.result_root) / args.run_id
     args.output_dir = str(output_dir)
+    pod_result_root = args.pod_result_root or args.result_root
+    args.pod_output_dir = str(Path(pod_result_root) / args.run_id)
     for subdir in ["logs", "pod_results"]:
         (output_dir / subdir).mkdir(parents=True, exist_ok=True)
 
