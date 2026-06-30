@@ -239,12 +239,24 @@ empty_expert
 | min gate | `270 GB/s` |
 | avg gate | `290 GB/s` |
 
-正式执行：
+说明：`270/290 GB/s` 是脚本默认 gate 示例，不是当前两节点 MetaX C550 + MCCL 的已标定阈值。当前两节点 8GB All-Reduce 基线约为：
+
+```text
+avg_busbw:           93-96 GB/s
+second_lowest_busbw: 88-92 GB/s
+```
+
+当前 MetaX 两节点环境建议先用 8GB 零阈值跑基线：
 
 ```bash
 DRY_RUN=0 \
 MODE=multi-node \
 PROFILE=bandwidth \
+BANDWIDTH_MESSAGE_SIZES=8G \
+BANDWIDTH_WARMUP=5 \
+BANDWIDTH_ITERS=100 \
+BANDWIDTH_MIN_BUSBW=0 \
+BANDWIDTH_AVG_BUSBW=0 \
 bash run_vcctl_healthcheck.sh
 ```
 
@@ -262,17 +274,17 @@ BANDWIDTH_AVG_BUSBW=0 \
 bash run_vcctl_healthcheck.sh
 ```
 
-正式验收时使用 400Gbps RDMA 高速网络阈值：
+如果需要启用 gate，应先按当前硬件、通信库和节点规模标定阈值。例如当前两节点 MetaX C550 + MCCL 可先用较保守的 8GB gate：
 
 ```bash
 DRY_RUN=0 \
 MODE=multi-node \
 PROFILE=bandwidth \
-BANDWIDTH_MESSAGE_SIZES=1G,4G,8G,16G \
+BANDWIDTH_MESSAGE_SIZES=8G \
 BANDWIDTH_WARMUP=5 \
 BANDWIDTH_ITERS=100 \
-BANDWIDTH_MIN_BUSBW=270 \
-BANDWIDTH_AVG_BUSBW=290 \
+BANDWIDTH_MIN_BUSBW=88 \
+BANDWIDTH_AVG_BUSBW=92 \
 bash run_vcctl_healthcheck.sh
 ```
 
@@ -284,6 +296,8 @@ avg_busbw           > BANDWIDTH_AVG_BUSBW
 ```
 
 这里的 `second_lowest_busbw` 是 100 轮 BusBW 排序后的次低值，用来避免单轮极端抖动直接决定失败；`avg_busbw` 是 100 轮平均值，用来判断整体带宽水平。
+
+当前不建议把 H200/NCCL 风格的 `270/290 GB/s` 阈值直接套用到 MetaX C550 + MCCL + 2 节点 16 rank 场景；该阈值已在 `results/vcctl/20260630_143416` 中验证为不匹配当前基线。
 
 该 profile 输出：
 
@@ -475,6 +489,9 @@ MetaX 默认：
 | `bandwidth_summary.jsonl` | bandwidth 模式的 message size 级 gate 汇总 |
 | `bandwidth_gate.json` | bandwidth 模式的总 gate 结果 |
 | `bandwidth_report.md` | bandwidth 模式的 Markdown 报告 |
+| `ib_counters_delta.tsv` | comm probe 模式的 IB counter 增量；当前 pod 内标准 counter 未暴露时可能只有表头 |
+| `torch_debug.stderr` | comm probe 模式的 torch / MCCL debug stderr |
+| `torch_debug.stdout` | comm probe 模式的 MCCL debug stdout，可查看 `NET/IB`、`MCCL_IB_HCA`、`xscale_*` |
 
 ## 12. 常用环境变量
 
@@ -549,6 +566,16 @@ multi-node:  2/2 PASS
 | timeout 注入 | `results/vcctl/20260630_105219` | 外层 FAIL，记录 timeout |
 | backend 初始化失败 | `results/vcctl/20260630_105957` | 外层 FAIL，stderr 记录 backend 初始化错误 |
 
+已验证 bandwidth / 通信路径：
+
+| 测试项 | 代表目录 | 结果 |
+| --- | --- | --- |
+| 1GB bandwidth 冒烟 | `results/vcctl/20260630_142910` | PASS，avg_busbw 约 89.05 GB/s |
+| 270/290 gate 验证 | `results/vcctl/20260630_143416` | FAIL，说明该阈值不匹配当前 MetaX 两节点基线 |
+| 1G/4G/8G bandwidth 基线 | `results/vcctl/20260630_144024` | PASS，8GB 最稳定，avg_busbw 约 95.21 GB/s |
+| 通信路径探测 | `results/vcctl_comm_probe/comm_probe_20260630_145457` | PASS，MCCL 数据面走 `xscale_0..xscale_3 / RoCE / IB`，`eth0` 仅用于 bootstrap/OOB |
+| 8GB bandwidth 复测 | `results/vcctl/20260630_150653` | PASS，avg_busbw 约 93.73 GB/s，second_lowest 约 87.78 GB/s |
+
 完整测试结果总结见：
 
 ```text
@@ -561,6 +588,8 @@ multi-node:  2/2 PASS
 - 更大规模的 8 / 64 / 128 节点测试需要结合实际资源申请和分组策略继续验证。
 - pod 内不执行 `dmesg`，宿主机内核日志筛查由运维侧提供。
 - static probe 中部分系统命令可能在 pod 内缺失，例如 `rdma`、`ip`、`numactl`；这类结果用于能力探测，不等价于训练不可用。
+- pod 内标准 `/sys/class/infiniband/.../counters` 当前未暴露有效 counter，通信路径探测只能从 MCCL debug 确认 `xscale_0..xscale_3` 被识别和启用，不能在 pod 内直接证明每条 rail 的实际流量占比。
+- 当前两节点 MetaX C550 + MCCL 的 8GB All-Reduce 基线约为 `avg_busbw 93-96 GB/s`、`second_lowest_busbw 88-92 GB/s`；正式 128 节点 gate 需要重新标定。
 - 当前 NPU / HCCL 完整执行路径尚未作为主流程验证。
 
 ## 15. 建议使用顺序
@@ -569,9 +598,10 @@ multi-node:  2/2 PASS
 
 1. `PROFILE=smoke MODE=multi-node`：快速确认 vcctl、torchrun、多 pod 连通性。
 2. `MODE=all PROFILE=quick MESSAGE_SIZES=1M WARMUP=1 ITERS=1`：完整快速验收。
-3. `MODE=multi-node PROFILE=bandwidth`：执行 All-Reduce 大包带宽 gate。
-4. 若需要更充分压力，可增加 `MESSAGE_SIZES`、`WARMUP`、`ITERS`，或增加 `BANDWIDTH_MESSAGE_SIZES`、`BANDWIDTH_WARMUP`、`BANDWIDTH_ITERS`。
-5. 若工具变更后需要自测，依次运行 NaN、corrupt、timeout、backend failure 故障注入。
+3. `MODE=multi-node PROFILE=bandwidth BANDWIDTH_MESSAGE_SIZES=8G BANDWIDTH_MIN_BUSBW=0 BANDWIDTH_AVG_BUSBW=0`：采集当前 8GB All-Reduce 基线。
+4. `DRY_RUN=0 bash run_vcctl_comm_probe.sh`：确认通信数据面是否走 `xscale/RoCE/IB`。
+5. 若需要启用 bandwidth gate，先基于当前硬件和规模标定 `BANDWIDTH_MIN_BUSBW` / `BANDWIDTH_AVG_BUSBW`。
+6. 若工具变更后需要自测，依次运行 NaN、corrupt、timeout、backend failure 故障注入。
 
 常用命令：
 
@@ -582,5 +612,7 @@ DRY_RUN=0 MODE=multi-node PROFILE=smoke bash run_vcctl_healthcheck.sh
 
 DRY_RUN=0 MODE=all PROFILE=quick MESSAGE_SIZES=1M WARMUP=1 ITERS=1 bash run_vcctl_healthcheck.sh
 
-DRY_RUN=0 MODE=multi-node PROFILE=bandwidth bash run_vcctl_healthcheck.sh
+DRY_RUN=0 MODE=multi-node PROFILE=bandwidth BANDWIDTH_MESSAGE_SIZES=8G BANDWIDTH_MIN_BUSBW=0 BANDWIDTH_AVG_BUSBW=0 bash run_vcctl_healthcheck.sh
+
+DRY_RUN=0 bash run_vcctl_comm_probe.sh
 ```
