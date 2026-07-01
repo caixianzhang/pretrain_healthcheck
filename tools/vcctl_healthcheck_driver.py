@@ -51,6 +51,20 @@ class ExecResult:
     elapsed_seconds: float
 
 
+@dataclass
+class RunningExec:
+    pod: PodInfo
+    mode: str
+    command: str
+    process: subprocess.Popen[str]
+    stdout_file: Any
+    stderr_file: Any
+    stdout_path: Path
+    stderr_path: Path
+    started_at: str
+    start_time: float
+
+
 def iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
@@ -156,6 +170,27 @@ def pod_to_info(pod: dict[str, Any], forced_container: str) -> PodInfo:
 
 def run_capture(cmd: list[str], timeout: int | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+
+
+def run_capture_to_files(
+    cmd: list[str],
+    stdout_path: Path,
+    stderr_path: Path,
+) -> tuple[subprocess.Popen[str], Any, Any]:
+    stdout_file = stdout_path.open("w", encoding="utf-8")
+    stderr_file = stderr_path.open("w", encoding="utf-8")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            text=True,
+        )
+    except Exception:
+        stdout_file.close()
+        stderr_file.close()
+        raise
+    return proc, stdout_file, stderr_file
 
 
 def timeout_output_to_text(value: str | bytes | None) -> str:
@@ -417,6 +452,297 @@ def run_exec_for_pod(pod: PodInfo, mode: str, command: str, args: argparse.Names
     )
 
 
+def build_exec_command(pod: PodInfo, mode: str, command: str, args: argparse.Namespace, pod_result_dir: Path) -> list[str]:
+    inner_cmd = command_with_exports(command, pod, args, pod_result_dir, mode)
+    return [
+        args.vcctl_bin,
+        "pod",
+        "exec",
+        pod.pod_name,
+        "-n",
+        pod.namespace,
+        "-c",
+        pod.container_name,
+        "--",
+        "bash",
+        "-lc",
+        inner_cmd,
+    ]
+
+
+def exec_result_from_completed(
+    pod: PodInfo,
+    mode: str,
+    command: str,
+    returncode: int | None,
+    timeout: bool,
+    reason: str,
+    stdout_path: Path,
+    stderr_path: Path,
+    started_at: str,
+    start_time: float,
+) -> ExecResult:
+    if reason:
+        status = "SUSPECT" if timeout else "FAIL"
+    elif returncode == 0:
+        status = "PASS"
+    else:
+        status = "FAIL"
+        reason = f"returncode={returncode}"
+    return ExecResult(
+        pod_name=pod.pod_name,
+        container_name=pod.container_name,
+        mode=mode,
+        node_name=pod.node_name,
+        pod_ip=pod.pod_ip,
+        command=command,
+        returncode=returncode,
+        timeout=timeout,
+        status=status,
+        reason=reason,
+        stdout_path=str(stdout_path),
+        stderr_path=str(stderr_path),
+        started_at=started_at,
+        finished_at=iso_now(),
+        elapsed_seconds=round(time.monotonic() - start_time, 3),
+    )
+
+
+def run_pod_aux_command(
+    pod: PodInfo,
+    args: argparse.Namespace,
+    command: str,
+    stdout_path: Path,
+    stderr_path: Path,
+    timeout: int | None = None,
+) -> int | None:
+    cmd = [
+        args.vcctl_bin,
+        "pod",
+        "exec",
+        pod.pod_name,
+        "-n",
+        pod.namespace,
+        "-c",
+        pod.container_name,
+        "--",
+        "bash",
+        "-lc",
+        command,
+    ]
+    try:
+        proc = run_capture(cmd, timeout=timeout or args.vcctl_timeout_seconds)
+        stdout_path.write_text(proc.stdout, encoding="utf-8")
+        stderr_path.write_text(proc.stderr, encoding="utf-8")
+        return proc.returncode
+    except subprocess.TimeoutExpired as exc:
+        stdout_path.write_text(timeout_output_to_text(exc.stdout), encoding="utf-8")
+        stderr_path.write_text(
+            timeout_output_to_text(exc.stderr) + f"\nAUX_TIMEOUT after {timeout or args.vcctl_timeout_seconds}s\n",
+            encoding="utf-8",
+        )
+        return None
+
+
+def collect_hang_diagnostics(pods: list[PodInfo], mode: str, args: argparse.Namespace) -> None:
+    logs_dir = Path(args.output_dir) / "logs"
+    ps_cmd = (
+        "date; hostname; "
+        "ps -eo pid,ppid,stat,etime,cmd | "
+        "grep -E '[t]orchrun|[p]retrain_healthcheck|[p]ython.*pretrain_healthcheck' || true"
+    )
+    for pod in pods:
+        prefix = logs_dir / f"{pod.pod_name}.{mode}.hang"
+        run_pod_aux_command(
+            pod,
+            args,
+            ps_cmd,
+            prefix.with_suffix(".ps.stdout"),
+            prefix.with_suffix(".ps.stderr"),
+            timeout=args.vcctl_timeout_seconds,
+        )
+
+
+def cleanup_hung_pods(pods: list[PodInfo], mode: str, args: argparse.Namespace) -> None:
+    logs_dir = Path(args.output_dir) / "logs"
+    cleanup_cmd = args.hang_cleanup_cmd or args.pre_clean_cmd
+    if not cleanup_cmd:
+        return
+    for pod in pods:
+        prefix = logs_dir / f"{pod.pod_name}.{mode}.hang-cleanup"
+        run_pod_aux_command(
+            pod,
+            args,
+            cleanup_cmd,
+            prefix.with_suffix(".stdout"),
+            prefix.with_suffix(".stderr"),
+            timeout=args.vcctl_timeout_seconds,
+        )
+
+
+def run_mode_with_hang_timeout(
+    pods: list[PodInfo],
+    mode: str,
+    command: str,
+    args: argparse.Namespace,
+) -> list[ExecResult]:
+    logs_dir = Path(args.output_dir) / "logs"
+    running: list[RunningExec] = []
+    results: list[ExecResult] = []
+    started = time.monotonic()
+    deadline = started + args.hang_timeout_seconds
+
+    for pod in pods:
+        pod_result_dir = Path(args.pod_output_dir) / "pod_results" / pod.pod_name / mode
+        if args.pod_output_dir == args.output_dir:
+            pod_result_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = logs_dir / f"{pod.pod_name}.{mode}.stdout"
+        stderr_path = logs_dir / f"{pod.pod_name}.{mode}.stderr"
+
+        valid, reason = validate_pod_for_mode(pod, mode)
+        started_at = iso_now()
+        start_time = time.monotonic()
+        if not valid:
+            stdout_path.write_text("", encoding="utf-8")
+            stderr_path.write_text(reason + "\n", encoding="utf-8")
+            results.append(
+                ExecResult(
+                    pod_name=pod.pod_name,
+                    container_name=pod.container_name,
+                    mode=mode,
+                    node_name=pod.node_name,
+                    pod_ip=pod.pod_ip,
+                    command=command,
+                    returncode=None,
+                    timeout=False,
+                    status="SUSPECT",
+                    reason=reason,
+                    stdout_path=str(stdout_path),
+                    stderr_path=str(stderr_path),
+                    started_at=started_at,
+                    finished_at=iso_now(),
+                    elapsed_seconds=round(time.monotonic() - start_time, 3),
+                )
+            )
+            continue
+
+        exec_cmd = build_exec_command(pod, mode, command, args, pod_result_dir)
+        if args.dry_run:
+            stdout_path.write_text("DRY_RUN: " + " ".join(exec_cmd) + "\n", encoding="utf-8")
+            stderr_path.write_text("", encoding="utf-8")
+            results.append(
+                ExecResult(
+                    pod_name=pod.pod_name,
+                    container_name=pod.container_name,
+                    mode=mode,
+                    node_name=pod.node_name,
+                    pod_ip=pod.pod_ip,
+                    command=command,
+                    returncode=0,
+                    timeout=False,
+                    status="DRY_RUN",
+                    reason="dry run",
+                    stdout_path=str(stdout_path),
+                    stderr_path=str(stderr_path),
+                    started_at=started_at,
+                    finished_at=iso_now(),
+                    elapsed_seconds=round(time.monotonic() - start_time, 3),
+                )
+            )
+            continue
+
+        proc, stdout_file, stderr_file = run_capture_to_files(exec_cmd, stdout_path, stderr_path)
+        running.append(
+            RunningExec(
+                pod=pod,
+                mode=mode,
+                command=command,
+                process=proc,
+                stdout_file=stdout_file,
+                stderr_file=stderr_file,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                started_at=started_at,
+                start_time=start_time,
+            )
+        )
+
+    hanging = False
+    while running:
+        remaining: list[RunningExec] = []
+        for item in running:
+            returncode = item.process.poll()
+            if returncode is None:
+                remaining.append(item)
+                continue
+            item.stdout_file.close()
+            item.stderr_file.close()
+            results.append(
+                exec_result_from_completed(
+                    item.pod,
+                    item.mode,
+                    item.command,
+                    returncode,
+                    timeout=False,
+                    reason="",
+                    stdout_path=item.stdout_path,
+                    stderr_path=item.stderr_path,
+                    started_at=item.started_at,
+                    start_time=item.start_time,
+                )
+            )
+        running = remaining
+        if not running:
+            break
+        if time.monotonic() >= deadline:
+            hanging = True
+            break
+        time.sleep(min(1.0, max(0.1, deadline - time.monotonic())))
+
+    if hanging:
+        hung_pods = [item.pod for item in running]
+        print(
+            "[vcctl-healthcheck] hang timeout reached: "
+            f"mode={mode} timeout={args.hang_timeout_seconds}s "
+            "pods=" + ",".join(pod.pod_name for pod in hung_pods),
+            file=sys.stderr,
+        )
+        collect_hang_diagnostics(hung_pods, mode, args)
+        cleanup_hung_pods(hung_pods, mode, args)
+        for item in running:
+            item.process.terminate()
+        wait_deadline = time.monotonic() + max(1, args.hang_kill_grace_seconds)
+        for item in running:
+            while item.process.poll() is None and time.monotonic() < wait_deadline:
+                time.sleep(0.2)
+            if item.process.poll() is None:
+                item.process.kill()
+            returncode = item.process.wait(timeout=5)
+            item.stdout_file.close()
+            item.stderr_file.close()
+            with item.stderr_path.open("a", encoding="utf-8") as f:
+                f.write(
+                    f"\nHANG_TIMEOUT after {args.hang_timeout_seconds}s; "
+                    "diagnostics collected and cleanup issued\n"
+                )
+            results.append(
+                exec_result_from_completed(
+                    item.pod,
+                    item.mode,
+                    item.command,
+                    returncode,
+                    timeout=True,
+                    reason=f"hang_timeout={args.hang_timeout_seconds}s",
+                    stdout_path=item.stdout_path,
+                    stderr_path=item.stderr_path,
+                    started_at=item.started_at,
+                    start_time=item.start_time,
+                )
+            )
+
+    return results
+
+
 def run_mode(pods: list[PodInfo], mode: str, command: str, args: argparse.Namespace) -> list[ExecResult]:
     if not command:
         return [
@@ -439,6 +765,8 @@ def run_mode(pods: list[PodInfo], mode: str, command: str, args: argparse.Namesp
             )
             for pod in pods
         ]
+    if mode == "multi-node" and args.hang_timeout_seconds > 0:
+        return run_mode_with_hang_timeout(pods, mode, command, args)
     workers = len(pods) if args.max_parallel <= 0 else min(args.max_parallel, len(pods))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         future_to_pod = {executor.submit(run_exec_for_pod, pod, mode, command, args): pod for pod in pods}
@@ -503,10 +831,13 @@ def write_commands_env(path: Path, args: argparse.Namespace) -> None:
         f"POD_RESULT_ROOT={args.pod_result_root or args.result_root}",
         f"OUTPUT_DIR={args.output_dir}",
         f"EXEC_TIMEOUT_SECONDS={args.exec_timeout_seconds}",
+        f"HANG_TIMEOUT_SECONDS={args.hang_timeout_seconds}",
+        f"HANG_KILL_GRACE_SECONDS={args.hang_kill_grace_seconds}",
         f"MAX_PARALLEL={args.max_parallel}",
         f"HEALTHCHECK_MASTER_PORT={args.healthcheck_master_port}",
         f"RESOLVED_HEALTHCHECK_MASTER_PORT={getattr(args, 'resolved_healthcheck_master_port', '')}",
         "PRE_CLEAN_CMD=" + args.pre_clean_cmd,
+        "HANG_CLEANUP_CMD=" + args.hang_cleanup_cmd,
         "STATIC_CMD=" + args.static_cmd,
         "SINGLE_NODE_CMD=" + args.single_node_cmd,
         "MULTI_NODE_CMD=" + args.multi_node_cmd,
@@ -581,6 +912,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--healthcheck-port-start", type=int, default=29500)
     parser.add_argument("--healthcheck-port-end", type=int, default=29999)
     parser.add_argument("--exec-timeout-seconds", type=int, default=3600)
+    parser.add_argument("--hang-timeout-seconds", type=int, default=0)
+    parser.add_argument("--hang-kill-grace-seconds", type=int, default=10)
+    parser.add_argument("--hang-cleanup-cmd", default="")
     parser.add_argument("--vcctl-timeout-seconds", type=int, default=120)
     parser.add_argument("--max-parallel", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")

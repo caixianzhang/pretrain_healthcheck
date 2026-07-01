@@ -12,6 +12,8 @@ VCCTL_BIN="${VCCTL_BIN:-vcctl}"
 CONTAINER_NAME="${CONTAINER_NAME:-}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN="${DRY_RUN:-1}"
+HANG_TIMEOUT_SECONDS="${HANG_TIMEOUT_SECONDS:-60}"
+HANG_KILL_GRACE_SECONDS="${HANG_KILL_GRACE_SECONDS:-10}"
 
 REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-/afs-grj/pretrain_healthcheck}"
 REMOTE_PROJECT_PARENT="$(dirname "${REMOTE_PROJECT_DIR}")"
@@ -21,7 +23,8 @@ LOCAL_RESULT_ROOT="${LOCAL_RESULT_ROOT:-${LOCAL_PROJECT_DIR}/results/vcctl}"
 
 SYNC_PROJECT="${SYNC_PROJECT:-1}"
 SYNC_RESULTS_BACK="${SYNC_RESULTS_BACK:-1}"
-REMOTE_CLEAN_PROJECT="${REMOTE_CLEAN_PROJECT:-1}"
+REMOTE_CLEAN_PROJECT="${REMOTE_CLEAN_PROJECT:-0}"
+SYNC_VALIDATE_IMPORT="${SYNC_VALIDATE_IMPORT:-1}"
 POD_JSON_FILE="${POD_JSON_FILE:-}"
 
 usage() {
@@ -43,7 +46,11 @@ Common env:
   RUN_ID               Run id. Default: current timestamp
   SYNC_PROJECT         1 syncs project before running. Default: 1
   SYNC_RESULTS_BACK    1 copies remote results back after running. Default: 1
-  REMOTE_CLEAN_PROJECT 1 removes REMOTE_PROJECT_DIR before syncing. Default: 1
+  REMOTE_CLEAN_PROJECT 1 removes REMOTE_PROJECT_DIR before syncing. Default: 0
+  SYNC_VALIDATE_IMPORT 1 validates Python import in every pod after sync. Default: 1
+  HANG_TIMEOUT_SECONDS Multi-node wall-clock hang timeout. Default: 60
+  HANG_KILL_GRACE_SECONDS
+                       Seconds to wait after cleanup before local vcctl exec kill. Default: 10
   DRY_RUN              Passed to run_vcctl_healthcheck.sh. Default: 1
 
 All healthcheck envs such as MODE, PROFILE, MESSAGE_SIZES, WARMUP, ITERS,
@@ -152,6 +159,73 @@ print(selected["metadata"]["name"] + "\t" + choose_container(selected))
 PY
 )"
 
+pod_infos="$(
+  python3 - "${PODS_JSON}" "${CONTAINER_NAME}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+forced_container = sys.argv[2]
+text = open(path, encoding="utf-8").read()
+decoder = json.JSONDecoder()
+idx = 0
+pods = []
+while idx < len(text):
+    while idx < len(text) and text[idx].isspace():
+        idx += 1
+    if idx >= len(text):
+        break
+    obj, idx = decoder.raw_decode(text, idx)
+    if isinstance(obj, dict) and isinstance(obj.get("items"), list):
+        pods.extend(x for x in obj["items"] if isinstance(x, dict))
+    elif isinstance(obj, dict):
+        pods.append(obj)
+
+def labels(pod):
+    return pod.get("metadata", {}).get("labels", {}) or {}
+
+def containers(pod):
+    return pod.get("spec", {}).get("containers", []) or []
+
+def env_value(container, name):
+    for item in container.get("env", []) or []:
+        if item.get("name") == name:
+            return str(item.get("value", ""))
+    return ""
+
+def choose_container(pod):
+    cs = containers(pod)
+    if not cs:
+        return ""
+    if forced_container:
+        for c in cs:
+            if c.get("name") == forced_container:
+                return forced_container
+    task = labels(pod).get("volcano.sh/task-spec", "")
+    for c in cs:
+        if c.get("name") == task:
+            return str(c.get("name", ""))
+    return str(cs[0].get("name", ""))
+
+def rank(pod):
+    cname = choose_container(pod)
+    for c in containers(pod):
+        if c.get("name") == cname:
+            value = env_value(c, "RANK")
+            if value != "":
+                try:
+                    return int(value)
+                except ValueError:
+                    return 999999
+    return 999999
+
+pods = [p for p in pods if p.get("metadata", {}).get("name")]
+pods.sort(key=lambda p: (rank(p), p["metadata"]["name"]))
+for pod in pods:
+    print(pod["metadata"]["name"] + "\t" + choose_container(pod))
+PY
+)"
+
 MASTER_POD="${master_info%%$'\t'*}"
 MASTER_CONTAINER="${master_info#*$'\t'}"
 
@@ -165,25 +239,44 @@ echo "[vcctl-sync] local result root   : ${LOCAL_RESULT_ROOT}"
 echo "[vcctl-sync] remote result root  : ${REMOTE_RESULT_ROOT}"
 echo "[vcctl-sync] run id              : ${RUN_ID}"
 echo "[vcctl-sync] dry run             : ${DRY_RUN}"
+echo "[vcctl-sync] hang timeout        : ${HANG_TIMEOUT_SECONDS}s"
 
 if [[ "${SYNC_PROJECT}" == "1" || "${SYNC_PROJECT}" == "true" ]]; then
   if [[ "${DRY_RUN}" == "1" || "${DRY_RUN}" == "true" ]]; then
     echo "[vcctl-sync] DRY_RUN=1, skip project sync"
   else
-    echo "[vcctl-sync] syncing project to ${MASTER_POD}:${REMOTE_PROJECT_DIR}"
-    remote_prepare="mkdir -p ${REMOTE_PROJECT_PARENT}"
+    echo "[vcctl-sync] syncing project to each pod:${REMOTE_PROJECT_DIR}"
+    remote_prepare="mkdir -p ${REMOTE_PROJECT_PARENT} ${REMOTE_RESULT_ROOT}/${RUN_ID}"
     if [[ "${REMOTE_CLEAN_PROJECT}" == "1" || "${REMOTE_CLEAN_PROJECT}" == "true" ]]; then
-      remote_prepare="rm -rf ${REMOTE_PROJECT_DIR} && ${remote_prepare}"
+      remote_prepare="if [ -e ${REMOTE_PROJECT_DIR} ] && [ ! -d ${REMOTE_PROJECT_DIR} ]; then rm -f ${REMOTE_PROJECT_DIR}; fi && ${remote_prepare}"
     fi
-    tar \
-      --exclude="${LOCAL_PROJECT_NAME}/.git" \
-      --exclude="${LOCAL_PROJECT_NAME}/results" \
-      --exclude="${LOCAL_PROJECT_NAME}/__pycache__" \
-      --exclude="${LOCAL_PROJECT_NAME}/.pytest_cache" \
-      -C "${LOCAL_PROJECT_PARENT}" \
-      -czf - "${LOCAL_PROJECT_NAME}" \
-      | "${VCCTL_BIN}" pod exec "${MASTER_POD}" -n "${NAMESPACE}" -c "${MASTER_CONTAINER}" -i -- \
-          bash -lc "${remote_prepare} && tar -xzf - -C ${REMOTE_PROJECT_PARENT} && if [ '${LOCAL_PROJECT_NAME}' != '${REMOTE_PROJECT_NAME}' ]; then rm -rf ${REMOTE_PROJECT_DIR} && mv ${REMOTE_PROJECT_PARENT}/${LOCAL_PROJECT_NAME} ${REMOTE_PROJECT_DIR}; fi"
+    while IFS=$'\t' read -r pod_name pod_container; do
+      [[ -n "${pod_name}" ]] || continue
+      echo "[vcctl-sync] syncing project to ${pod_name}:${REMOTE_PROJECT_DIR}"
+      tar \
+        --exclude="${LOCAL_PROJECT_NAME}/.git" \
+        --exclude="${LOCAL_PROJECT_NAME}/results" \
+        --exclude="${LOCAL_PROJECT_NAME}/__pycache__" \
+        --exclude="${LOCAL_PROJECT_NAME}/.pytest_cache" \
+        -C "${LOCAL_PROJECT_PARENT}" \
+        -czf - "${LOCAL_PROJECT_NAME}" \
+        | "${VCCTL_BIN}" pod exec "${pod_name}" -n "${NAMESPACE}" -c "${pod_container}" -i -- \
+            bash -lc "${remote_prepare} && tar -xzf - -C ${REMOTE_PROJECT_PARENT} && if [ '${LOCAL_PROJECT_NAME}' != '${REMOTE_PROJECT_NAME}' ]; then rm -rf ${REMOTE_PROJECT_DIR} && mv ${REMOTE_PROJECT_PARENT}/${LOCAL_PROJECT_NAME} ${REMOTE_PROJECT_DIR}; fi && mkdir -p ${REMOTE_RESULT_ROOT}/${RUN_ID}"
+    done <<< "${pod_infos}"
+  fi
+fi
+
+if [[ "${SYNC_VALIDATE_IMPORT}" == "1" || "${SYNC_VALIDATE_IMPORT}" == "true" ]]; then
+  if [[ "${DRY_RUN}" == "1" || "${DRY_RUN}" == "true" ]]; then
+    echo "[vcctl-sync] DRY_RUN=1, skip import validation"
+  else
+    echo "[vcctl-sync] validating import on each pod"
+    while IFS=$'\t' read -r pod_name pod_container; do
+      [[ -n "${pod_name}" ]] || continue
+      echo "[vcctl-sync] validating import on ${pod_name}"
+      "${VCCTL_BIN}" pod exec "${pod_name}" -n "${NAMESPACE}" -c "${pod_container}" -- \
+        bash -lc "cd ${REMOTE_PROJECT_DIR} && export PYTHONPATH=${REMOTE_PROJECT_DIR}:\${PYTHONPATH:-} && python3 -c 'import pretrain_healthcheck.cli; print(\"IMPORT_OK\")'"
+    done <<< "${pod_infos}"
   fi
 fi
 
@@ -197,6 +290,8 @@ VCCTL_BIN="${VCCTL_BIN}" \
 NAMESPACE="${NAMESPACE}" \
 JOB_NAME="${JOB_NAME}" \
 CONTAINER_NAME="${CONTAINER_NAME}" \
+HANG_TIMEOUT_SECONDS="${HANG_TIMEOUT_SECONDS}" \
+HANG_KILL_GRACE_SECONDS="${HANG_KILL_GRACE_SECONDS}" \
 bash "${SCRIPT_DIR}/run_vcctl_healthcheck.sh"
 healthcheck_rc=$?
 set -e
@@ -208,18 +303,23 @@ if [[ "${SYNC_RESULTS_BACK}" == "1" || "${SYNC_RESULTS_BACK}" == "true" ]]; then
   else
     echo "[vcctl-sync] syncing results back to ${LOCAL_RESULT_ROOT}/${RUN_ID}"
     mkdir -p "${LOCAL_RESULT_ROOT}"
-    remote_tar="${TMP_DIR}/${RUN_ID}.remote_results.tgz"
-    set +e
-    "${VCCTL_BIN}" pod exec "${MASTER_POD}" -n "${NAMESPACE}" -c "${MASTER_CONTAINER}" -- \
-      bash -lc "cd ${REMOTE_RESULT_ROOT} && tar -czf - ${RUN_ID}" > "${remote_tar}"
-    sync_rc=$?
-    set -e
-    if [[ "${sync_rc}" == "0" ]]; then
-      tar -xzf "${remote_tar}" -C "${LOCAL_RESULT_ROOT}"
-      echo "[vcctl-sync] synced results: ${LOCAL_RESULT_ROOT}/${RUN_ID}"
-    else
-      echo "[vcctl-sync] result sync-back failed with rc=${sync_rc}" >&2
-    fi
+    while IFS=$'\t' read -r pod_name pod_container; do
+      [[ -n "${pod_name}" ]] || continue
+      remote_tar="${TMP_DIR}/${RUN_ID}.${pod_name}.remote_results.tgz"
+      set +e
+      "${VCCTL_BIN}" pod exec "${pod_name}" -n "${NAMESPACE}" -c "${pod_container}" -- \
+        bash -lc "if [ -d ${REMOTE_RESULT_ROOT}/${RUN_ID} ]; then cd ${REMOTE_RESULT_ROOT} && tar -czf - ${RUN_ID}; else tar -czf - --files-from /dev/null; fi" > "${remote_tar}"
+      pod_sync_rc=$?
+      set -e
+      if [[ "${pod_sync_rc}" == "0" ]]; then
+        tar -xzf "${remote_tar}" -C "${LOCAL_RESULT_ROOT}"
+        echo "[vcctl-sync] synced pod results from ${pod_name}"
+      else
+        sync_rc="${pod_sync_rc}"
+        echo "[vcctl-sync] result sync-back failed from ${pod_name} rc=${pod_sync_rc}" >&2
+      fi
+    done <<< "${pod_infos}"
+    echo "[vcctl-sync] synced results: ${LOCAL_RESULT_ROOT}/${RUN_ID}"
   fi
 fi
 

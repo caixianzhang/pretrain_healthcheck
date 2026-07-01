@@ -43,21 +43,24 @@ FAULT_SLEEP_SECONDS="${FAULT_SLEEP_SECONDS:-30}"
 FAULT_NAN_RANK="${FAULT_NAN_RANK:-}"
 FAULT_CORRUPT_RANK="${FAULT_CORRUPT_RANK:-}"
 PRE_CLEAN_CMD="${PRE_CLEAN_CMD:-ps -eo pid=,args= | awk '/[p]retrain_healthcheck.cli|[t]orchrun/ {print \$1}' | xargs -r kill -TERM || true}"
-STATIC_CMD="${STATIC_CMD:-cd ${PROJECT_REMOTE_DIR} && OUT_DIR=\"\$HC_POD_RESULT_DIR\" bash scripts/metax/probe_pod_capabilities.sh}"
+STATIC_CMD="${STATIC_CMD:-cd ${PROJECT_REMOTE_DIR} && export PYTHONPATH=\"${PROJECT_REMOTE_DIR}\" && OUT_DIR=\"\$HC_POD_RESULT_DIR\" bash scripts/metax/probe_pod_capabilities.sh}"
 FAULT_ENV="FAULT_BACKEND=\"${FAULT_BACKEND}\" FAULT_SLEEP_RANK=\"${FAULT_SLEEP_RANK}\" FAULT_SLEEP_SECONDS=\"${FAULT_SLEEP_SECONDS}\" FAULT_NAN_RANK=\"${FAULT_NAN_RANK}\" FAULT_CORRUPT_RANK=\"${FAULT_CORRUPT_RANK}\""
-SINGLE_NODE_CMD="${SINGLE_NODE_CMD:-cd ${PROJECT_REMOTE_DIR} && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} torchrun --standalone --nproc-per-node=\"${GPUS_PER_NODE}\" -m pretrain_healthcheck.cli run-single-node --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${MESSAGE_SIZES}\" --moe-patterns \"${MOE_PATTERNS}\" --warmup \"${WARMUP}\" --iters \"${ITERS}\" --seed \"${SEED}\"; rc=\$?; python3 -m pretrain_healthcheck.cli analyze --input-dir \"\$HC_POD_RESULT_DIR\" --output \"\$HC_POD_RESULT_DIR/report.md\"; exit \$rc}"
+SINGLE_NODE_CMD="${SINGLE_NODE_CMD:-cd ${PROJECT_REMOTE_DIR} && export PYTHONPATH=\"${PROJECT_REMOTE_DIR}\" && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} torchrun --standalone --nproc-per-node=\"${GPUS_PER_NODE}\" -m pretrain_healthcheck.cli run-single-node --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${MESSAGE_SIZES}\" --moe-patterns \"${MOE_PATTERNS}\" --warmup \"${WARMUP}\" --iters \"${ITERS}\" --seed \"${SEED}\"; rc=\$?; python3 -m pretrain_healthcheck.cli analyze --input-dir \"\$HC_POD_RESULT_DIR\" --output \"\$HC_POD_RESULT_DIR/report.md\"; exit \$rc}"
 if [[ -z "${MULTI_NODE_CMD:-}" ]]; then
   if [[ "${PROFILE}" == "smoke" ]]; then
-    MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"1\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli ping-group --output-dir \"\$HC_POD_RESULT_DIR\" --test-round smoke --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\""
+    MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && export PYTHONPATH=\"${PROJECT_REMOTE_DIR}\" && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"1\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli ping-group --output-dir \"\$HC_POD_RESULT_DIR\" --test-round smoke --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\""
   elif [[ "${PROFILE}" == "bandwidth" ]]; then
-    MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"${GPUS_PER_NODE}\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli run-bandwidth --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${BANDWIDTH_MESSAGE_SIZES}\" --warmup \"${BANDWIDTH_WARMUP}\" --iters \"${BANDWIDTH_ITERS}\" --seed \"${SEED}\" --min-busbw \"${BANDWIDTH_MIN_BUSBW}\" --avg-busbw \"${BANDWIDTH_AVG_BUSBW}\" --test-round bandwidth --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\"; rc=\$?; exit \$rc"
+    MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && export PYTHONPATH=\"${PROJECT_REMOTE_DIR}\" && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"${GPUS_PER_NODE}\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli run-bandwidth --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${BANDWIDTH_MESSAGE_SIZES}\" --warmup \"${BANDWIDTH_WARMUP}\" --iters \"${BANDWIDTH_ITERS}\" --seed \"${SEED}\" --min-busbw \"${BANDWIDTH_MIN_BUSBW}\" --avg-busbw \"${BANDWIDTH_AVG_BUSBW}\" --test-round bandwidth --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\"; rc=\$?; exit \$rc"
   elif [[ "${PROFILE}" == "collective-bandwidth" ]]; then
-    MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"${GPUS_PER_NODE}\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli run-collective-bandwidth --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${COLLECTIVE_BANDWIDTH_MESSAGE_SIZES}\" --ops \"${COLLECTIVE_BANDWIDTH_OPS}\" --moe-patterns \"${COLLECTIVE_BANDWIDTH_MOE_PATTERNS}\" --ep-size \"${COLLECTIVE_BANDWIDTH_EP_SIZE}\" --warmup \"${COLLECTIVE_BANDWIDTH_WARMUP}\" --iters \"${COLLECTIVE_BANDWIDTH_ITERS}\" --seed \"${SEED}\" --min-busbw \"${COLLECTIVE_BANDWIDTH_MIN_BUSBW}\" --avg-busbw \"${COLLECTIVE_BANDWIDTH_AVG_BUSBW}\" --test-round collective_bandwidth --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\"; rc=\$?; exit \$rc"
+    MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && export PYTHONPATH=\"${PROJECT_REMOTE_DIR}\" && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"${GPUS_PER_NODE}\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli run-collective-bandwidth --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${COLLECTIVE_BANDWIDTH_MESSAGE_SIZES}\" --ops \"${COLLECTIVE_BANDWIDTH_OPS}\" --moe-patterns \"${COLLECTIVE_BANDWIDTH_MOE_PATTERNS}\" --ep-size \"${COLLECTIVE_BANDWIDTH_EP_SIZE}\" --warmup \"${COLLECTIVE_BANDWIDTH_WARMUP}\" --iters \"${COLLECTIVE_BANDWIDTH_ITERS}\" --seed \"${SEED}\" --min-busbw \"${COLLECTIVE_BANDWIDTH_MIN_BUSBW}\" --avg-busbw \"${COLLECTIVE_BANDWIDTH_AVG_BUSBW}\" --test-round collective_bandwidth --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\"; rc=\$?; exit \$rc"
   else
-    MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"${GPUS_PER_NODE}\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli run-group --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${MESSAGE_SIZES}\" --moe-patterns \"${MOE_PATTERNS}\" --warmup \"${WARMUP}\" --iters \"${ITERS}\" --seed \"${SEED}\" --test-round current_vcjob --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\"; rc=\$?; if [ \"\$RANK\" = \"0\" ]; then python3 -m pretrain_healthcheck.cli analyze --input-dir \"\$HC_POD_RESULT_DIR\" --output \"\$HC_POD_RESULT_DIR/report.md\"; fi; exit \$rc"
+    MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && export PYTHONPATH=\"${PROJECT_REMOTE_DIR}\" && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"${GPUS_PER_NODE}\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli run-group --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${MESSAGE_SIZES}\" --moe-patterns \"${MOE_PATTERNS}\" --warmup \"${WARMUP}\" --iters \"${ITERS}\" --seed \"${SEED}\" --test-round current_vcjob --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\"; rc=\$?; if [ \"\$RANK\" = \"0\" ]; then python3 -m pretrain_healthcheck.cli analyze --input-dir \"\$HC_POD_RESULT_DIR\" --output \"\$HC_POD_RESULT_DIR/report.md\"; fi; exit \$rc"
   fi
 fi
 EXEC_TIMEOUT_SECONDS="${EXEC_TIMEOUT_SECONDS:-3600}"
+HANG_TIMEOUT_SECONDS="${HANG_TIMEOUT_SECONDS:-0}"
+HANG_KILL_GRACE_SECONDS="${HANG_KILL_GRACE_SECONDS:-10}"
+HANG_CLEANUP_CMD="${HANG_CLEANUP_CMD:-${PRE_CLEAN_CMD}}"
 VCCTL_TIMEOUT_SECONDS="${VCCTL_TIMEOUT_SECONDS:-120}"
 MAX_PARALLEL="${MAX_PARALLEL:-0}"
 RESULT_ROOT="${RESULT_ROOT:-/afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck/results/vcctl}"
@@ -113,6 +116,9 @@ Common env:
   POD_RESULT_ROOT          Result root visible inside target pods. Default: RESULT_ROOT
   RUN_ID                   Run id. Default: current timestamp
   EXEC_TIMEOUT_SECONDS     Per-pod exec timeout. Default: 3600
+  HANG_TIMEOUT_SECONDS     Multi-node wall-clock hang timeout. 0 disables it. Default: 0
+  HANG_KILL_GRACE_SECONDS  Seconds to wait after cleanup before local vcctl exec kill. Default: 10
+  HANG_CLEANUP_CMD         Command executed in pods after hang diagnostics. Default: PRE_CLEAN_CMD
   MAX_PARALLEL             0 means all pods concurrently. Default: 0
   DRY_RUN                  1 prints generated vcctl exec commands without executing them. Default: 1
   POD_JSON_FILE            Optional fixture file instead of calling vcctl pod get.
@@ -183,6 +189,9 @@ echo "[vcctl-healthcheck] pod result  : ${POD_RESULT_ROOT}"
 echo "[vcctl-healthcheck] run id      : ${RUN_ID}"
 echo "[vcctl-healthcheck] output      : ${OUT_DIR}"
 echo "[vcctl-healthcheck] dry run     : ${DRY_RUN}"
+if [[ "${HANG_TIMEOUT_SECONDS}" != "0" ]]; then
+  echo "[vcctl-healthcheck] hang timeout: ${HANG_TIMEOUT_SECONDS}s"
+fi
 
 args=(
   "${PROJECT_DIR}/tools/vcctl_healthcheck_driver.py"
@@ -200,6 +209,9 @@ args=(
   --single-node-cmd "${SINGLE_NODE_CMD}"
   --multi-node-cmd "${MULTI_NODE_CMD}"
   --exec-timeout-seconds "${EXEC_TIMEOUT_SECONDS}"
+  --hang-timeout-seconds "${HANG_TIMEOUT_SECONDS}"
+  --hang-kill-grace-seconds "${HANG_KILL_GRACE_SECONDS}"
+  --hang-cleanup-cmd "${HANG_CLEANUP_CMD}"
   --vcctl-timeout-seconds "${VCCTL_TIMEOUT_SECONDS}"
   --max-parallel "${MAX_PARALLEL}"
 )
