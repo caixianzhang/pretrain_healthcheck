@@ -3,9 +3,22 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-OUT_DIR="${OUT_DIR:-${PROJECT_DIR}/results/metax_pod_capabilities_$(date +%Y%m%d_%H%M%S)}"
+SHARED_OUT_DIR="${OUT_DIR:-${PROJECT_DIR}/results/metax_pod_capabilities_$(date +%Y%m%d_%H%M%S)}"
+STATIC_OUTPUT_MODE="${STATIC_OUTPUT_MODE:-compact}"
+STATIC_TMP_ROOT="${STATIC_TMP_ROOT:-${TMPDIR:-/tmp}}"
+STATIC_KEEP_LOCAL_TMP="${STATIC_KEEP_LOCAL_TMP:-1}"
+STATIC_COPY_RAW_OUTPUT="${STATIC_COPY_RAW_OUTPUT:-0}"
+STATIC_STDOUT_MAX_BYTES="${STATIC_STDOUT_MAX_BYTES:-1048576}"
 
-mkdir -p "${OUT_DIR}"
+safe_pod_name="$(printf "%s" "${HC_POD_NAME:-pod}" | tr -c 'A-Za-z0-9_.-' '_')"
+safe_run_id="$(printf "%s" "${HC_RUN_ID:-$(date +%Y%m%d_%H%M%S)}" | tr -c 'A-Za-z0-9_.-' '_')"
+safe_run_stage="$(printf "%s" "${HC_RUN_STAGE:-static}" | tr -c 'A-Za-z0-9_.-' '_')"
+STATIC_WORK_ROOT="${STATIC_WORK_ROOT:-${STATIC_TMP_ROOT%/}/pretrain_healthcheck_${safe_run_id}_${safe_pod_name}_$$}"
+STATIC_WORK_DIR="${STATIC_WORK_DIR:-${STATIC_WORK_ROOT}/${safe_run_stage}}"
+
+mkdir -p "${STATIC_WORK_DIR}"
+
+OUT_DIR="${STATIC_WORK_DIR}"
 
 SUMMARY="${OUT_DIR}/summary.tsv"
 DETAIL="${OUT_DIR}/details.log"
@@ -132,7 +145,9 @@ collect_infiniband_sysfs() {
   fi
 }
 
-echo "[metax-probe] output: ${OUT_DIR}"
+echo "[metax-probe] output: ${SHARED_OUT_DIR}" >&2
+echo "[metax-probe] workroot: ${STATIC_WORK_ROOT}" >&2
+echo "[metax-probe] workdir: ${OUT_DIR}" >&2
 
 run_check basic uname uname -a
 run_check basic date date -Is
@@ -198,5 +213,222 @@ with open(md, 'w', encoding='utf-8') as f:
         f.write(f"| {r['category']} | {r['item']} | {r['status']} | {r['detail'].replace('|','/')} |\n")
 PY
 
-echo "[metax-probe] summary: ${OUT_DIR}/summary.md"
-echo "[metax-probe] details: ${DETAIL}"
+python3 - <<'PY' "${OUT_DIR}"
+import json
+import os
+import re
+import socket
+import sys
+from collections import Counter
+from pathlib import Path
+
+out_dir = Path(sys.argv[1])
+
+
+def read_text(name: str) -> str:
+    path = out_dir / name
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def read_jsonl(name: str) -> list[dict]:
+    rows = []
+    path = out_dir / name
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def normalize_ws(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip())
+
+
+def first_match(text: str, pattern: str) -> str:
+    match = re.search(pattern, text, flags=re.MULTILINE)
+    return normalize_ws(match.group(1)) if match else ""
+
+
+def parse_mx_smi(text: str) -> dict:
+    facts = {
+        "mx_smi_version": first_match(text, r"mx-smi\s+version:\s*([^\n]+)"),
+        "attached_gpus": first_match(text, r"Attached GPUs\s*:\s*(\d+)"),
+        "driver_version": first_match(text, r"Kernel Mode Driver Version:\s*([^\s|]+)"),
+        "maca_version": first_match(text, r"MACA Version:\s*([^\s|]+)"),
+        "bios_version": first_match(text, r"BIOS Version:\s*([^\s|]+)"),
+    }
+    model_counts = Counter()
+    for match in re.finditer(r"\|\s*\d+\s+([^|]+?)\s+\|\s*\d+\s+", text):
+        model_counts[normalize_ws(match.group(1))] += 1
+    if model_counts:
+        facts["gpu_model_counts"] = dict(sorted(model_counts.items()))
+    facts["gpu_available_count"] = len(re.findall(r"\bAvailable\b", text))
+    facts["gpu_state_unavailable_count"] = len(re.findall(r"\bUnavailable\b", text))
+    return {k: v for k, v in facts.items() if v is not None and v != ""}
+
+
+def parse_python_torch(text: str) -> dict:
+    fields = {
+        "version": first_match(text, r"^torch\s+(.+)$"),
+        "cuda_available": first_match(text, r"^cuda_available\s+(.+)$"),
+        "device_count": first_match(text, r"^device_count\s+(.+)$"),
+    }
+    return {k: v for k, v in fields.items() if v}
+
+
+def parse_uname(text: str) -> dict:
+    parts = normalize_ws(text).split()
+    return {"raw": normalize_ws(text), "kernel": parts[2] if len(parts) >= 3 else ""}
+
+
+def parse_infiniband_sysfs(text: str) -> dict:
+    ports = []
+    by_port: dict[str, dict[str, str]] = {}
+    for line in text.splitlines():
+        match = re.match(r"/sys/class/infiniband/([^/]+)/ports/([^/]+)/([^ ]+)\s+(.+)$", line.strip())
+        if not match:
+            continue
+        device, port, name, value = match.groups()
+        key = f"{device}:{port}"
+        by_port.setdefault(key, {"device": device, "port": port})[name] = normalize_ws(value)
+    for key in sorted(by_port):
+        ports.append(by_port[key])
+    xscale_ports = [p for p in ports if str(p.get("device", "")).startswith("xscale_")]
+    return {
+        "port_count": len(ports),
+        "xscale_port_count": len(xscale_ports),
+        "ports": ports,
+    }
+
+
+def parse_ibv_devinfo(text: str) -> dict:
+    hca_ids = sorted(set(re.findall(r"^\s*hca_id:\s*(\S+)", text, flags=re.MULTILINE)))
+    return {"hca_ids": hca_ids, "hca_count": len(hca_ids)}
+
+
+def parse_df(text: str) -> list[dict]:
+    rows = []
+    for line in text.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 6:
+            rows.append(
+                {
+                    "filesystem": parts[0],
+                    "size": parts[1],
+                    "used": parts[2],
+                    "avail": parts[3],
+                    "use_percent": parts[4],
+                    "mount": parts[5],
+                }
+            )
+    return rows
+
+
+checks = read_jsonl("checks.jsonl")
+status_by_check = {
+    f"{row.get('category', '')}/{row.get('item', '')}": {
+        "status": row.get("status", ""),
+        "detail": row.get("detail", ""),
+    }
+    for row in checks
+}
+
+facts = {
+    "schema_version": 1,
+    "static_workdir": str(out_dir),
+    "pod": {
+        "name": os.environ.get("HC_POD_NAME", socket.gethostname()),
+        "node_name": os.environ.get("HC_NODE_NAME", ""),
+        "pod_ip": os.environ.get("HC_POD_IP", ""),
+        "host_ip": os.environ.get("HC_HOST_IP", ""),
+        "job_name": os.environ.get("HC_JOB_NAME", ""),
+        "run_id": os.environ.get("HC_RUN_ID", ""),
+        "mode": os.environ.get("HC_MODE", ""),
+        "device_type": os.environ.get("HC_DEVICE_TYPE", ""),
+    },
+    "basic": {
+        "uname": parse_uname(read_text("basic_uname.log")),
+        "date": normalize_ws(read_text("basic_date.log")),
+    },
+    "container": {
+        "env_keys": sorted(
+            key
+            for key in os.environ
+            if key.startswith(("MACA", "MCCL", "CUDA", "NCCL", "PYTORCH", "RANK", "WORLD_SIZE", "MASTER_", "LOCAL_", "HC_"))
+        ),
+    },
+    "gpu": {
+        "metax": parse_mx_smi(read_text("metax_mx_smi.log")),
+        "torch": parse_python_torch(read_text("metax_python_torch.log")),
+    },
+    "hca": {
+        "ibv_devinfo": parse_ibv_devinfo(read_text("hca_ibv_devinfo.log")),
+        "sysfs": parse_infiniband_sysfs(read_text("infiniband_sysfs.txt")),
+    },
+    "storage": {
+        "df": parse_df(read_text("basic_df.log")),
+        "inode": parse_df(read_text("basic_inode.log")),
+    },
+    "capability": {
+        "dmesg": "skipped_in_pod",
+        "checks": status_by_check,
+    },
+    "checks": checks,
+}
+
+statuses = [str(row.get("status", "")) for row in checks]
+facts["status"] = {
+    "check_count": len(checks),
+    "fail_count": sum(1 for status in statuses if status == "FAIL"),
+    "missing_count": sum(1 for status in statuses if status == "MISSING"),
+    "warn_count": sum(1 for status in statuses if status in {"MISSING", "NO_READ", "EMPTY", "SKIP"}),
+}
+facts["status"]["overall"] = "FAIL" if facts["status"]["fail_count"] else "PASS"
+
+(out_dir / "compact_facts.json").write_text(
+    json.dumps(facts, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+
+if [[ "${STATIC_OUTPUT_MODE}" != "compact" || "${STATIC_COPY_RAW_OUTPUT}" == "1" || "${STATIC_COPY_RAW_OUTPUT}" == "true" ]]; then
+  mkdir -p "${SHARED_OUT_DIR}"
+  cp -a "${OUT_DIR}/." "${SHARED_OUT_DIR}/"
+fi
+
+if ! python3 - <<'PY' "${OUT_DIR}/compact_facts.json" "${STATIC_STDOUT_MAX_BYTES}"
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+max_bytes = int(sys.argv[2])
+payload = json.dumps(json.loads(path.read_text(encoding="utf-8")), ensure_ascii=False, sort_keys=True)
+payload_bytes = len(payload.encode("utf-8"))
+if payload_bytes > max_bytes:
+    print(
+        f"[metax-probe] compact payload too large: {payload_bytes} > {max_bytes}",
+        file=sys.stderr,
+    )
+    raise SystemExit(3)
+print("__HC_STATIC_RESULT_JSON__ " + payload)
+PY
+then
+  echo "[metax-probe] failed to emit static result frame" >&2
+  exit 3
+fi
+
+echo "[metax-probe] summary: ${OUT_DIR}/summary.md" >&2
+echo "[metax-probe] compact: ${OUT_DIR}/compact_facts.json" >&2
+if [[ "${STATIC_OUTPUT_MODE}" != "compact" ]]; then
+  echo "[metax-probe] details: ${OUT_DIR}/details.log" >&2
+fi
+
+if [[ "${STATIC_KEEP_LOCAL_TMP}" != "1" && "${STATIC_KEEP_LOCAL_TMP}" != "true" ]]; then
+  rm -rf "${OUT_DIR}"
+fi

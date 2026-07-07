@@ -11,14 +11,14 @@ NAMESPACE="${NAMESPACE:-default}"
 VCCTL_BIN="${VCCTL_BIN:-vcctl}"
 CONTAINER_NAME="${CONTAINER_NAME:-}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+RUN_STAGE="${RUN_STAGE:-}"
 DRY_RUN="${DRY_RUN:-1}"
-HANG_TIMEOUT_SECONDS="${HANG_TIMEOUT_SECONDS:-60}"
-HANG_KILL_GRACE_SECONDS="${HANG_KILL_GRACE_SECONDS:-10}"
 
 REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-/afs-grj/pretrain_healthcheck}"
 REMOTE_PROJECT_PARENT="$(dirname "${REMOTE_PROJECT_DIR}")"
 REMOTE_PROJECT_NAME="$(basename "${REMOTE_PROJECT_DIR}")"
 REMOTE_RESULT_ROOT="${REMOTE_RESULT_ROOT:-${REMOTE_PROJECT_DIR}/results/vcctl}"
+REMOTE_POD_RESULT_ROOT="${REMOTE_POD_RESULT_ROOT:-/tmp/pretrain_healthcheck_driver_${RUN_ID}}"
 LOCAL_RESULT_ROOT="${LOCAL_RESULT_ROOT:-${LOCAL_PROJECT_DIR}/results/vcctl}"
 
 SYNC_PROJECT="${SYNC_PROJECT:-1}"
@@ -43,14 +43,14 @@ Common env:
   REMOTE_PROJECT_DIR   Pod-visible project path. Default: /afs-grj/pretrain_healthcheck
   LOCAL_RESULT_ROOT    Local result root. Default: LOCAL_PROJECT_DIR/results/vcctl
   REMOTE_RESULT_ROOT   Pod-visible result root. Default: REMOTE_PROJECT_DIR/results/vcctl
+  REMOTE_POD_RESULT_ROOT
+                       Pod/driver temporary result root. Default: /tmp/pretrain_healthcheck_driver_<RUN_ID>
   RUN_ID               Run id. Default: current timestamp
+  RUN_STAGE            Stage directory override passed to run_vcctl_healthcheck.sh
   SYNC_PROJECT         1 syncs project before running. Default: 1
   SYNC_RESULTS_BACK    1 copies remote results back after running. Default: 1
   REMOTE_CLEAN_PROJECT 1 removes REMOTE_PROJECT_DIR before syncing. Default: 0
   SYNC_VALIDATE_IMPORT 1 validates Python import in every pod after sync. Default: 1
-  HANG_TIMEOUT_SECONDS Multi-node wall-clock hang timeout. Default: 60
-  HANG_KILL_GRACE_SECONDS
-                       Seconds to wait after cleanup before local vcctl exec kill. Default: 10
   DRY_RUN              Passed to run_vcctl_healthcheck.sh. Default: 1
 
 All healthcheck envs such as MODE, PROFILE, MESSAGE_SIZES, WARMUP, ITERS,
@@ -237,9 +237,9 @@ echo "[vcctl-sync] local project       : ${LOCAL_PROJECT_DIR}"
 echo "[vcctl-sync] remote project      : ${REMOTE_PROJECT_DIR}"
 echo "[vcctl-sync] local result root   : ${LOCAL_RESULT_ROOT}"
 echo "[vcctl-sync] remote result root  : ${REMOTE_RESULT_ROOT}"
+echo "[vcctl-sync] remote pod result   : ${REMOTE_POD_RESULT_ROOT}"
 echo "[vcctl-sync] run id              : ${RUN_ID}"
 echo "[vcctl-sync] dry run             : ${DRY_RUN}"
-echo "[vcctl-sync] hang timeout        : ${HANG_TIMEOUT_SECONDS}s"
 
 if [[ "${SYNC_PROJECT}" == "1" || "${SYNC_PROJECT}" == "true" ]]; then
   if [[ "${DRY_RUN}" == "1" || "${DRY_RUN}" == "true" ]]; then
@@ -283,20 +283,20 @@ fi
 set +e
 PROJECT_REMOTE_DIR="${REMOTE_PROJECT_DIR}" \
 RESULT_ROOT="${LOCAL_RESULT_ROOT}" \
-POD_RESULT_ROOT="${REMOTE_RESULT_ROOT}" \
+POD_RESULT_ROOT="${REMOTE_POD_RESULT_ROOT}" \
 RUN_ID="${RUN_ID}" \
+RUN_STAGE="${RUN_STAGE}" \
 POD_JSON_FILE="${PODS_JSON}" \
 VCCTL_BIN="${VCCTL_BIN}" \
 NAMESPACE="${NAMESPACE}" \
 JOB_NAME="${JOB_NAME}" \
 CONTAINER_NAME="${CONTAINER_NAME}" \
-HANG_TIMEOUT_SECONDS="${HANG_TIMEOUT_SECONDS}" \
-HANG_KILL_GRACE_SECONDS="${HANG_KILL_GRACE_SECONDS}" \
 bash "${SCRIPT_DIR}/run_vcctl_healthcheck.sh"
 healthcheck_rc=$?
 set -e
 
 sync_rc=0
+post_sync_compare_rc=0
 if [[ "${SYNC_RESULTS_BACK}" == "1" || "${SYNC_RESULTS_BACK}" == "true" ]]; then
   if [[ "${DRY_RUN}" == "1" || "${DRY_RUN}" == "true" ]]; then
     echo "[vcctl-sync] DRY_RUN=1, skip result sync-back"
@@ -320,6 +320,43 @@ if [[ "${SYNC_RESULTS_BACK}" == "1" || "${SYNC_RESULTS_BACK}" == "true" ]]; then
       fi
     done <<< "${pod_infos}"
     echo "[vcctl-sync] synced results: ${LOCAL_RESULT_ROOT}/${RUN_ID}"
+
+    mode_value="${MODE:-all}"
+    static_compare_value="${STATIC_COMPARE:-1}"
+    if [[ "${static_compare_value}" != "0" && "${static_compare_value}" != "false" ]] \
+      && [[ "${mode_value}" == "static" || "${mode_value}" == "all" ]]; then
+      echo "[vcctl-sync] rerunning static compare after result sync-back"
+      static_result_dir="${LOCAL_RESULT_ROOT}/${RUN_ID}/static"
+      set +e
+      python3 "${LOCAL_PROJECT_DIR}/tools/static_compare.py" \
+        --result-dir "${static_result_dir}" \
+        --workers "${STATIC_COMPARE_WORKERS:-0}"
+      post_sync_compare_rc=$?
+      set -e
+      if [[ -f "${static_result_dir}/summary.json" ]]; then
+        final_status="$(
+          python3 - "${static_result_dir}/summary.json" <<'PY'
+import json
+import sys
+
+summary = json.load(open(sys.argv[1], encoding="utf-8"))
+print(summary.get("overall_status", "SUSPECT"))
+PY
+        )"
+        echo "[vcctl-sync] static overall_status after sync-back compare: ${final_status}"
+        if [[ "${mode_value}" == "static" ]]; then
+          if [[ "${final_status}" == "PASS" || "${final_status}" == "DRY_RUN" ]]; then
+            healthcheck_rc=0
+          else
+            healthcheck_rc=1
+          fi
+        elif [[ "${final_status}" != "PASS" && "${final_status}" != "DRY_RUN" ]]; then
+          healthcheck_rc=1
+        fi
+      elif [[ "${post_sync_compare_rc}" != "0" ]]; then
+        healthcheck_rc="${post_sync_compare_rc}"
+      fi
+    fi
   fi
 fi
 

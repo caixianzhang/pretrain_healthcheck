@@ -617,6 +617,13 @@ def _collective_bandwidth_once(
         out = tensor.clone()
         dist.all_reduce(out, group=group)
         return out
+    if op == "broadcast":
+        out = tensor.clone()
+        src = 0 if group is None else group_rank
+        if group is not None:
+            src = 0
+        dist.broadcast(out, src=src, group=group)
+        return out
     if op == "reduce_scatter":
         padded_numel = ((tensor.numel() + group_size - 1) // group_size) * group_size
         if padded_numel != tensor.numel():
@@ -873,7 +880,7 @@ def run_collective_bandwidth_gate(
     test_round: str,
     group_id: str,
 ) -> None:
-    allowed = {"all_reduce", "reduce_scatter", "all_gather", "all_to_all", "all_to_allv"}
+    allowed = {"all_reduce", "reduce_scatter", "all_gather", "broadcast", "all_to_all", "all_to_allv"}
     invalid = sorted(set(ops) - allowed)
     if invalid:
         raise ValueError(f"unsupported collective bandwidth ops: {invalid}")
@@ -963,6 +970,91 @@ def run_collective_bandwidth_gate(
         dist.destroy_process_group()
     if failed:
         raise RuntimeError("collective bandwidth gate failed")
+
+
+def run_dynamic_suite(
+    output_dir: Path,
+    dtype_name: str,
+    message_sizes: list[int],
+    moe_patterns: list[str],
+    warmup: int,
+    iters: int,
+    seed: int,
+    bandwidth_message_sizes: list[int],
+    bandwidth_warmup: int,
+    bandwidth_iters: int,
+    bandwidth_min_busbw: float,
+    bandwidth_avg_busbw: float,
+    collective_bandwidth_message_sizes: list[int],
+    collective_bandwidth_ops: list[str],
+    collective_bandwidth_moe_patterns: list[str],
+    collective_bandwidth_ep_size: int,
+    collective_bandwidth_warmup: int,
+    collective_bandwidth_iters: int,
+    collective_bandwidth_min_busbw: float,
+    collective_bandwidth_avg_busbw: float,
+    test_round: str,
+    group_id: str,
+) -> None:
+    torch, dist, env = init_dist()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    env.group_id = group_id or env.group_id or f"{test_round}-{env.hostname}"
+
+    real_destroy = dist.destroy_process_group
+
+    def deferred_destroy(*_args, **_kwargs) -> None:
+        return None
+
+    dist.destroy_process_group = deferred_destroy
+    try:
+        ping_group(output_dir / "smoke", test_round=f"{test_round}_smoke", group_id=env.group_id)
+        run_single_node(
+            output_dir=output_dir / "quick",
+            dtype_name=dtype_name,
+            message_sizes=message_sizes,
+            moe_patterns=moe_patterns,
+            warmup=warmup,
+            iters=iters,
+            seed=seed,
+        )
+        if env.rank == 0:
+            try:
+                from .analyze import analyze_results
+
+                analyze_results(output_dir / "quick", output_dir / "quick" / "report.md")
+            except Exception:
+                pass
+        run_bandwidth_gate(
+            output_dir=output_dir / "bandwidth",
+            dtype_name=dtype_name,
+            message_sizes=bandwidth_message_sizes,
+            warmup=bandwidth_warmup,
+            iters=bandwidth_iters,
+            seed=seed,
+            min_busbw=bandwidth_min_busbw,
+            avg_busbw=bandwidth_avg_busbw,
+            test_round=f"{test_round}_bandwidth",
+            group_id=env.group_id,
+        )
+        run_collective_bandwidth_gate(
+            output_dir=output_dir / "collective_bandwidth",
+            dtype_name=dtype_name,
+            message_sizes=collective_bandwidth_message_sizes,
+            ops=collective_bandwidth_ops,
+            moe_patterns=collective_bandwidth_moe_patterns,
+            ep_size=collective_bandwidth_ep_size,
+            warmup=collective_bandwidth_warmup,
+            iters=collective_bandwidth_iters,
+            seed=seed,
+            min_busbw=collective_bandwidth_min_busbw,
+            avg_busbw=collective_bandwidth_avg_busbw,
+            test_round=f"{test_round}_collective_bandwidth",
+            group_id=env.group_id,
+        )
+    finally:
+        dist.destroy_process_group = real_destroy
+        if dist.is_initialized():
+            real_destroy()
 
 
 def _run_distributed_checks(

@@ -8,6 +8,13 @@ from .common import parse_size_list
 from .static_checks import collect_static_checks
 
 
+COLLECTIVE_ACCEPTANCE_MESSAGE_SIZES = (
+    "1K,2K,4K,8K,16K,32K,64K,128K,256K,512K,"
+    "1M,2M,4M,8M,16M,32M,64M,128M,256M,512M,1G,2G"
+)
+COLLECTIVE_ACCEPTANCE_OPS = "all_reduce,reduce_scatter,all_gather,broadcast,all_to_all,all_to_allv"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pretrain-healthcheck")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -63,11 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_cbw = sub.add_parser("run-collective-bandwidth", help="run multi-collective bandwidth baseline")
     p_cbw.add_argument("--output-dir", type=Path, required=True)
     p_cbw.add_argument("--dtype", default="bf16", choices=["fp32", "bf16", "fp16"])
-    p_cbw.add_argument("--message-sizes", default="1G")
+    p_cbw.add_argument("--message-sizes", default=COLLECTIVE_ACCEPTANCE_MESSAGE_SIZES)
     p_cbw.add_argument(
         "--ops",
-        default="all_reduce,reduce_scatter,all_gather,all_to_all,all_to_allv",
-        help="comma-separated ops: all_reduce,reduce_scatter,all_gather,all_to_all,all_to_allv",
+        default=COLLECTIVE_ACCEPTANCE_OPS,
+        help="comma-separated ops: all_reduce,reduce_scatter,all_gather,broadcast,all_to_all,all_to_allv",
     )
     p_cbw.add_argument(
         "--moe-patterns",
@@ -82,6 +89,40 @@ def build_parser() -> argparse.ArgumentParser:
     p_cbw.add_argument("--avg-busbw", type=float, default=0.0, help="average busbw gate in GB/s")
     p_cbw.add_argument("--test-round", default="collective_bandwidth")
     p_cbw.add_argument("--group-id", default="")
+
+    p_suite = sub.add_parser("run-dynamic-suite", help="run smoke/quick/bandwidth/collective-bandwidth in one process group")
+    p_suite.add_argument("--output-dir", type=Path, required=True)
+    p_suite.add_argument("--dtype", default="bf16", choices=["fp32", "bf16", "fp16"])
+    p_suite.add_argument("--message-sizes", default="1M")
+    p_suite.add_argument(
+        "--moe-patterns",
+        default="uniform,skewed,hot_expert,random,empty_expert",
+        help="comma-separated MoE payload patterns",
+    )
+    p_suite.add_argument("--warmup", type=int, default=1)
+    p_suite.add_argument("--iters", type=int, default=1)
+    p_suite.add_argument("--bandwidth-message-sizes", default="1G")
+    p_suite.add_argument("--bandwidth-warmup", type=int, default=1)
+    p_suite.add_argument("--bandwidth-iters", type=int, default=3)
+    p_suite.add_argument("--bandwidth-min-busbw", type=float, default=0.0)
+    p_suite.add_argument("--bandwidth-avg-busbw", type=float, default=0.0)
+    p_suite.add_argument("--collective-bandwidth-message-sizes", default=COLLECTIVE_ACCEPTANCE_MESSAGE_SIZES)
+    p_suite.add_argument(
+        "--collective-bandwidth-ops",
+        default=COLLECTIVE_ACCEPTANCE_OPS,
+    )
+    p_suite.add_argument(
+        "--collective-bandwidth-moe-patterns",
+        default="uniform,skewed,hot_expert,random,empty_expert",
+    )
+    p_suite.add_argument("--collective-bandwidth-ep-size", type=int, default=8)
+    p_suite.add_argument("--collective-bandwidth-warmup", type=int, default=1)
+    p_suite.add_argument("--collective-bandwidth-iters", type=int, default=3)
+    p_suite.add_argument("--collective-bandwidth-min-busbw", type=float, default=0.0)
+    p_suite.add_argument("--collective-bandwidth-avg-busbw", type=float, default=0.0)
+    p_suite.add_argument("--seed", type=int, default=20260623)
+    p_suite.add_argument("--test-round", default="dynamic_suite")
+    p_suite.add_argument("--group-id", default="")
 
     p_analyze = sub.add_parser("analyze", help="analyze a result directory")
     p_analyze.add_argument("--input-dir", type=Path, required=True)
@@ -183,6 +224,40 @@ def main() -> None:
             seed=args.seed,
             min_busbw=args.min_busbw,
             avg_busbw=args.avg_busbw,
+            test_round=args.test_round,
+            group_id=args.group_id,
+        )
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"wrote {args.output_dir}")
+        return
+    if args.cmd == "run-dynamic-suite":
+        import os
+
+        from .torch_checks import run_dynamic_suite
+
+        run_dynamic_suite(
+            output_dir=args.output_dir,
+            dtype_name=args.dtype,
+            message_sizes=parse_size_list(args.message_sizes),
+            moe_patterns=[x.strip() for x in args.moe_patterns.split(",") if x.strip()],
+            warmup=args.warmup,
+            iters=args.iters,
+            seed=args.seed,
+            bandwidth_message_sizes=parse_size_list(args.bandwidth_message_sizes),
+            bandwidth_warmup=args.bandwidth_warmup,
+            bandwidth_iters=args.bandwidth_iters,
+            bandwidth_min_busbw=args.bandwidth_min_busbw,
+            bandwidth_avg_busbw=args.bandwidth_avg_busbw,
+            collective_bandwidth_message_sizes=parse_size_list(args.collective_bandwidth_message_sizes),
+            collective_bandwidth_ops=[x.strip() for x in args.collective_bandwidth_ops.split(",") if x.strip()],
+            collective_bandwidth_moe_patterns=[
+                x.strip() for x in args.collective_bandwidth_moe_patterns.split(",") if x.strip()
+            ],
+            collective_bandwidth_ep_size=args.collective_bandwidth_ep_size,
+            collective_bandwidth_warmup=args.collective_bandwidth_warmup,
+            collective_bandwidth_iters=args.collective_bandwidth_iters,
+            collective_bandwidth_min_busbw=args.collective_bandwidth_min_busbw,
+            collective_bandwidth_avg_busbw=args.collective_bandwidth_avg_busbw,
             test_round=args.test_round,
             group_id=args.group_id,
         )

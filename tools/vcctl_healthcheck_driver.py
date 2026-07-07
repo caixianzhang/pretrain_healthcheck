@@ -6,12 +6,21 @@ import concurrent.futures
 import json
 import os
 import random
+import re
+import shutil
 import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+from dynamic_compare import compare_dynamic_results, write_report as write_dynamic_compare_report
+from static_compare import compare_static_results, render_node_environment_sample_section, write_static_compare_outputs
+
+
+STATIC_RESULT_PREFIX = "__HC_STATIC_RESULT_JSON__ "
+DYNAMIC_RESULT_PREFIX = "__HC_DYNAMIC_RESULT_JSON__ "
 
 
 @dataclass
@@ -49,20 +58,6 @@ class ExecResult:
     started_at: str
     finished_at: str
     elapsed_seconds: float
-
-
-@dataclass
-class RunningExec:
-    pod: PodInfo
-    mode: str
-    command: str
-    process: subprocess.Popen[str]
-    stdout_file: Any
-    stderr_file: Any
-    stdout_path: Path
-    stderr_path: Path
-    started_at: str
-    start_time: float
 
 
 def iso_now() -> str:
@@ -169,28 +164,9 @@ def pod_to_info(pod: dict[str, Any], forced_container: str) -> PodInfo:
 
 
 def run_capture(cmd: list[str], timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+    if timeout is not None and timeout <= 0:
+        timeout = None
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
-
-
-def run_capture_to_files(
-    cmd: list[str],
-    stdout_path: Path,
-    stderr_path: Path,
-) -> tuple[subprocess.Popen[str], Any, Any]:
-    stdout_file = stdout_path.open("w", encoding="utf-8")
-    stderr_file = stderr_path.open("w", encoding="utf-8")
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            text=True,
-        )
-    except Exception:
-        stdout_file.close()
-        stderr_file.close()
-        raise
-    return proc, stdout_file, stderr_file
 
 
 def timeout_output_to_text(value: str | bytes | None) -> str:
@@ -324,6 +300,7 @@ def command_with_exports(command: str, pod: PodInfo, args: argparse.Namespace, p
     exports = {
         "HC_JOB_NAME": args.job_name,
         "HC_RUN_ID": args.run_id,
+        "HC_RUN_STAGE": args.run_stage,
         "HC_MODE": mode,
         "HC_DEVICE_TYPE": args.device_type,
         "HC_POD_NAME": pod.pod_name,
@@ -331,6 +308,10 @@ def command_with_exports(command: str, pod: PodInfo, args: argparse.Namespace, p
         "HC_POD_IP": pod.pod_ip,
         "HC_HOST_IP": pod.host_ip,
         "HC_POD_RESULT_DIR": str(pod_result_dir),
+        "RANK": pod.rank,
+        "WORLD_SIZE": pod.world_size,
+        "MASTER_ADDR": pod.master_addr,
+        "MASTER_PORT": pod.master_port,
     }
     export_text = " ".join(f"{key}={json.dumps(value)}" for key, value in exports.items())
     return f"export {export_text}; {command}"
@@ -339,9 +320,14 @@ def command_with_exports(command: str, pod: PodInfo, args: argparse.Namespace, p
 def run_exec_for_pod(pod: PodInfo, mode: str, command: str, args: argparse.Namespace) -> ExecResult:
     started = iso_now()
     start_time = time.monotonic()
-    logs_dir = Path(args.output_dir) / "logs"
+    if mode == "static":
+        logs_dir = Path(args.static_driver_tmp_root) / f"pretrain_healthcheck_driver_{args.run_id}"
+    else:
+        logs_dir = Path(args.output_dir) / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
     pod_result_dir = Path(args.pod_output_dir) / "pod_results" / pod.pod_name / mode
-    if args.pod_output_dir == args.output_dir:
+    dynamic_compact_mode = args.dynamic_compare and mode in {"single-node", "multi-node"}
+    if args.pod_output_dir == args.output_dir and mode != "static" and not dynamic_compact_mode:
         pod_result_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = logs_dir / f"{pod.pod_name}.{mode}.stdout"
     stderr_path = logs_dir / f"{pod.pod_name}.{mode}.stderr"
@@ -409,7 +395,9 @@ def run_exec_for_pod(pod: PodInfo, mode: str, command: str, args: argparse.Names
     timeout = False
     returncode: int | None
     try:
-        proc = run_capture(exec_cmd, timeout=args.exec_timeout_seconds)
+        timeout_seconds = args.static_exec_timeout_seconds if mode == "static" else args.exec_timeout_seconds
+        exec_timeout = timeout_seconds if timeout_seconds > 0 else None
+        proc = run_capture(exec_cmd, timeout=exec_timeout)
         returncode = proc.returncode
         stdout_path.write_text(proc.stdout, encoding="utf-8")
         stderr_path.write_text(proc.stderr, encoding="utf-8")
@@ -418,7 +406,7 @@ def run_exec_for_pod(pod: PodInfo, mode: str, command: str, args: argparse.Names
         returncode = None
         stdout_path.write_text(timeout_output_to_text(exc.stdout), encoding="utf-8")
         stderr_path.write_text(
-            timeout_output_to_text(exc.stderr) + f"\nTIMEOUT after {args.exec_timeout_seconds}s\n",
+            timeout_output_to_text(exc.stderr) + f"\nTIMEOUT after {timeout_seconds}s\n",
             encoding="utf-8",
         )
 
@@ -508,241 +496,6 @@ def exec_result_from_completed(
     )
 
 
-def run_pod_aux_command(
-    pod: PodInfo,
-    args: argparse.Namespace,
-    command: str,
-    stdout_path: Path,
-    stderr_path: Path,
-    timeout: int | None = None,
-) -> int | None:
-    cmd = [
-        args.vcctl_bin,
-        "pod",
-        "exec",
-        pod.pod_name,
-        "-n",
-        pod.namespace,
-        "-c",
-        pod.container_name,
-        "--",
-        "bash",
-        "-lc",
-        command,
-    ]
-    try:
-        proc = run_capture(cmd, timeout=timeout or args.vcctl_timeout_seconds)
-        stdout_path.write_text(proc.stdout, encoding="utf-8")
-        stderr_path.write_text(proc.stderr, encoding="utf-8")
-        return proc.returncode
-    except subprocess.TimeoutExpired as exc:
-        stdout_path.write_text(timeout_output_to_text(exc.stdout), encoding="utf-8")
-        stderr_path.write_text(
-            timeout_output_to_text(exc.stderr) + f"\nAUX_TIMEOUT after {timeout or args.vcctl_timeout_seconds}s\n",
-            encoding="utf-8",
-        )
-        return None
-
-
-def collect_hang_diagnostics(pods: list[PodInfo], mode: str, args: argparse.Namespace) -> None:
-    logs_dir = Path(args.output_dir) / "logs"
-    ps_cmd = (
-        "date; hostname; "
-        "ps -eo pid,ppid,stat,etime,cmd | "
-        "grep -E '[t]orchrun|[p]retrain_healthcheck|[p]ython.*pretrain_healthcheck' || true"
-    )
-    for pod in pods:
-        prefix = logs_dir / f"{pod.pod_name}.{mode}.hang"
-        run_pod_aux_command(
-            pod,
-            args,
-            ps_cmd,
-            prefix.with_suffix(".ps.stdout"),
-            prefix.with_suffix(".ps.stderr"),
-            timeout=args.vcctl_timeout_seconds,
-        )
-
-
-def cleanup_hung_pods(pods: list[PodInfo], mode: str, args: argparse.Namespace) -> None:
-    logs_dir = Path(args.output_dir) / "logs"
-    cleanup_cmd = args.hang_cleanup_cmd or args.pre_clean_cmd
-    if not cleanup_cmd:
-        return
-    for pod in pods:
-        prefix = logs_dir / f"{pod.pod_name}.{mode}.hang-cleanup"
-        run_pod_aux_command(
-            pod,
-            args,
-            cleanup_cmd,
-            prefix.with_suffix(".stdout"),
-            prefix.with_suffix(".stderr"),
-            timeout=args.vcctl_timeout_seconds,
-        )
-
-
-def run_mode_with_hang_timeout(
-    pods: list[PodInfo],
-    mode: str,
-    command: str,
-    args: argparse.Namespace,
-) -> list[ExecResult]:
-    logs_dir = Path(args.output_dir) / "logs"
-    running: list[RunningExec] = []
-    results: list[ExecResult] = []
-    started = time.monotonic()
-    deadline = started + args.hang_timeout_seconds
-
-    for pod in pods:
-        pod_result_dir = Path(args.pod_output_dir) / "pod_results" / pod.pod_name / mode
-        if args.pod_output_dir == args.output_dir:
-            pod_result_dir.mkdir(parents=True, exist_ok=True)
-        stdout_path = logs_dir / f"{pod.pod_name}.{mode}.stdout"
-        stderr_path = logs_dir / f"{pod.pod_name}.{mode}.stderr"
-
-        valid, reason = validate_pod_for_mode(pod, mode)
-        started_at = iso_now()
-        start_time = time.monotonic()
-        if not valid:
-            stdout_path.write_text("", encoding="utf-8")
-            stderr_path.write_text(reason + "\n", encoding="utf-8")
-            results.append(
-                ExecResult(
-                    pod_name=pod.pod_name,
-                    container_name=pod.container_name,
-                    mode=mode,
-                    node_name=pod.node_name,
-                    pod_ip=pod.pod_ip,
-                    command=command,
-                    returncode=None,
-                    timeout=False,
-                    status="SUSPECT",
-                    reason=reason,
-                    stdout_path=str(stdout_path),
-                    stderr_path=str(stderr_path),
-                    started_at=started_at,
-                    finished_at=iso_now(),
-                    elapsed_seconds=round(time.monotonic() - start_time, 3),
-                )
-            )
-            continue
-
-        exec_cmd = build_exec_command(pod, mode, command, args, pod_result_dir)
-        if args.dry_run:
-            stdout_path.write_text("DRY_RUN: " + " ".join(exec_cmd) + "\n", encoding="utf-8")
-            stderr_path.write_text("", encoding="utf-8")
-            results.append(
-                ExecResult(
-                    pod_name=pod.pod_name,
-                    container_name=pod.container_name,
-                    mode=mode,
-                    node_name=pod.node_name,
-                    pod_ip=pod.pod_ip,
-                    command=command,
-                    returncode=0,
-                    timeout=False,
-                    status="DRY_RUN",
-                    reason="dry run",
-                    stdout_path=str(stdout_path),
-                    stderr_path=str(stderr_path),
-                    started_at=started_at,
-                    finished_at=iso_now(),
-                    elapsed_seconds=round(time.monotonic() - start_time, 3),
-                )
-            )
-            continue
-
-        proc, stdout_file, stderr_file = run_capture_to_files(exec_cmd, stdout_path, stderr_path)
-        running.append(
-            RunningExec(
-                pod=pod,
-                mode=mode,
-                command=command,
-                process=proc,
-                stdout_file=stdout_file,
-                stderr_file=stderr_file,
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-                started_at=started_at,
-                start_time=start_time,
-            )
-        )
-
-    hanging = False
-    while running:
-        remaining: list[RunningExec] = []
-        for item in running:
-            returncode = item.process.poll()
-            if returncode is None:
-                remaining.append(item)
-                continue
-            item.stdout_file.close()
-            item.stderr_file.close()
-            results.append(
-                exec_result_from_completed(
-                    item.pod,
-                    item.mode,
-                    item.command,
-                    returncode,
-                    timeout=False,
-                    reason="",
-                    stdout_path=item.stdout_path,
-                    stderr_path=item.stderr_path,
-                    started_at=item.started_at,
-                    start_time=item.start_time,
-                )
-            )
-        running = remaining
-        if not running:
-            break
-        if time.monotonic() >= deadline:
-            hanging = True
-            break
-        time.sleep(min(1.0, max(0.1, deadline - time.monotonic())))
-
-    if hanging:
-        hung_pods = [item.pod for item in running]
-        print(
-            "[vcctl-healthcheck] hang timeout reached: "
-            f"mode={mode} timeout={args.hang_timeout_seconds}s "
-            "pods=" + ",".join(pod.pod_name for pod in hung_pods),
-            file=sys.stderr,
-        )
-        collect_hang_diagnostics(hung_pods, mode, args)
-        cleanup_hung_pods(hung_pods, mode, args)
-        for item in running:
-            item.process.terminate()
-        wait_deadline = time.monotonic() + max(1, args.hang_kill_grace_seconds)
-        for item in running:
-            while item.process.poll() is None and time.monotonic() < wait_deadline:
-                time.sleep(0.2)
-            if item.process.poll() is None:
-                item.process.kill()
-            returncode = item.process.wait(timeout=5)
-            item.stdout_file.close()
-            item.stderr_file.close()
-            with item.stderr_path.open("a", encoding="utf-8") as f:
-                f.write(
-                    f"\nHANG_TIMEOUT after {args.hang_timeout_seconds}s; "
-                    "diagnostics collected and cleanup issued\n"
-                )
-            results.append(
-                exec_result_from_completed(
-                    item.pod,
-                    item.mode,
-                    item.command,
-                    returncode,
-                    timeout=True,
-                    reason=f"hang_timeout={args.hang_timeout_seconds}s",
-                    stdout_path=item.stdout_path,
-                    stderr_path=item.stderr_path,
-                    started_at=item.started_at,
-                    start_time=item.start_time,
-                )
-            )
-
-    return results
-
-
 def run_mode(pods: list[PodInfo], mode: str, command: str, args: argparse.Namespace) -> list[ExecResult]:
     if not command:
         return [
@@ -765,8 +518,6 @@ def run_mode(pods: list[PodInfo], mode: str, command: str, args: argparse.Namesp
             )
             for pod in pods
         ]
-    if mode == "multi-node" and args.hang_timeout_seconds > 0:
-        return run_mode_with_hang_timeout(pods, mode, command, args)
     workers = len(pods) if args.max_parallel <= 0 else min(args.max_parallel, len(pods))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         future_to_pod = {executor.submit(run_exec_for_pod, pod, mode, command, args): pod for pod in pods}
@@ -811,15 +562,6 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def write_pods_tsv(path: Path, pods: list[PodInfo]) -> None:
-    fields = list(PodInfo.__dataclass_fields__)
-    with path.open("w", encoding="utf-8") as f:
-        f.write("\t".join(fields) + "\n")
-        for pod in pods:
-            row = asdict(pod)
-            f.write("\t".join(str(row[field]) for field in fields) + "\n")
-
-
 def write_commands_env(path: Path, args: argparse.Namespace) -> None:
     lines = [
         f"JOB_NAME={args.job_name}",
@@ -827,17 +569,29 @@ def write_commands_env(path: Path, args: argparse.Namespace) -> None:
         f"MODE={args.mode}",
         f"DEVICE_TYPE={args.device_type}",
         f"RUN_ID={args.run_id}",
+        f"RUN_STAGE={args.run_stage}",
         f"RESULT_ROOT={args.result_root}",
-        f"POD_RESULT_ROOT={args.pod_result_root or args.result_root}",
+        f"POD_RESULT_ROOT={args.pod_result_root or '/tmp/pretrain_healthcheck_driver_' + args.run_id}",
         f"OUTPUT_DIR={args.output_dir}",
         f"EXEC_TIMEOUT_SECONDS={args.exec_timeout_seconds}",
-        f"HANG_TIMEOUT_SECONDS={args.hang_timeout_seconds}",
-        f"HANG_KILL_GRACE_SECONDS={args.hang_kill_grace_seconds}",
+        f"STATIC_EXEC_TIMEOUT_SECONDS={args.static_exec_timeout_seconds}",
+        f"STATIC_STDOUT_MAX_BYTES={args.static_stdout_max_bytes}",
+        f"STATIC_DRIVER_TMP_ROOT={args.static_driver_tmp_root}",
         f"MAX_PARALLEL={args.max_parallel}",
+        f"STATIC_COMPARE={args.static_compare}",
+        f"STATIC_COMPARE_WORKERS={args.static_compare_workers}",
+        f"STATIC_COMPARE_STRICT={args.static_compare_strict}",
+        f"STATIC_EXPECTED_GPUS={args.static_expected_gpus}",
+        f"STATIC_EXPECTED_XSCALE_PORTS={args.static_expected_xscale_ports}",
+        f"STATIC_KEEP_POD_FILES={args.static_keep_pod_files}",
+        f"STATIC_KEEP_EXEC_LOGS={args.static_keep_exec_logs}",
+        f"DYNAMIC_COMPARE={args.dynamic_compare}",
+        f"DYNAMIC_COMPARE_STRICT={args.dynamic_compare_strict}",
+        f"DYNAMIC_COMPARE_RATIO_THRESHOLD={args.dynamic_compare_ratio_threshold}",
+        f"DYNAMIC_KEEP_EXEC_LOGS={args.dynamic_keep_exec_logs}",
         f"HEALTHCHECK_MASTER_PORT={args.healthcheck_master_port}",
         f"RESOLVED_HEALTHCHECK_MASTER_PORT={getattr(args, 'resolved_healthcheck_master_port', '')}",
         "PRE_CLEAN_CMD=" + args.pre_clean_cmd,
-        "HANG_CLEANUP_CMD=" + args.hang_cleanup_cmd,
         "STATIC_CMD=" + args.static_cmd,
         "SINGLE_NODE_CMD=" + args.single_node_cmd,
         "MULTI_NODE_CMD=" + args.multi_node_cmd,
@@ -858,7 +612,409 @@ def summarize(results: list[ExecResult]) -> str:
     return "PASS"
 
 
-def write_summary_md(path: Path, pods: list[PodInfo], results: list[ExecResult], overall: str) -> None:
+def merge_static_compare_status(overall: str, static_compare_report: dict[str, Any] | None, strict: bool) -> str:
+    if not static_compare_report or not strict:
+        return overall
+    static_status = static_compare_report.get("static_compare_status")
+    if static_status == "FAIL":
+        return "FAIL"
+    if static_status == "SUSPECT" and overall == "PASS":
+        return "SUSPECT"
+    return overall
+
+
+def merge_dynamic_compare_status(overall: str, dynamic_compare_report: dict[str, Any] | None, strict: bool) -> str:
+    if not dynamic_compare_report or not strict:
+        return overall
+    dynamic_status = dynamic_compare_report.get("dynamic_compare_status")
+    if dynamic_status == "FAIL":
+        return "FAIL"
+    return overall
+
+
+def read_file_if_exists(path_text: str) -> str:
+    if not path_text:
+        return ""
+    path = Path(path_text)
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def failed_static_row(result: ExecResult, error_type: str, reason: str) -> dict[str, Any]:
+    stderr = read_file_if_exists(result.stderr_path)
+    match = re.search(r"^\[metax-probe\] workdir:\s*(\S+)", stderr, flags=re.MULTILINE)
+    return {
+        "pod_name": result.pod_name,
+        "node_name": result.node_name,
+        "pod_ip": result.pod_ip,
+        "mode": result.mode,
+        "status": "FAIL",
+        "error_type": error_type,
+        "reason": reason,
+        "returncode": result.returncode,
+        "timeout": result.timeout,
+        "stdout_path": result.stdout_path,
+        "stderr_path": result.stderr_path,
+        "static_workdir": match.group(1) if match else "",
+        "started_at": result.started_at,
+        "finished_at": result.finished_at,
+        "elapsed_seconds": result.elapsed_seconds,
+    }
+
+
+def retain_static_exec_logs(result: ExecResult, args: argparse.Namespace) -> None:
+    shared_logs_dir = Path(args.output_dir) / "logs"
+    shared_logs_dir.mkdir(parents=True, exist_ok=True)
+    for attr, suffix in [("stdout_path", "stdout"), ("stderr_path", "stderr")]:
+        old_path = Path(getattr(result, attr))
+        new_path = shared_logs_dir / f"{result.pod_name}.static.{suffix}"
+        if old_path.exists() and old_path.resolve() != new_path.resolve():
+            shutil.copyfile(old_path, new_path)
+            try:
+                old_path.unlink()
+            except OSError:
+                pass
+        setattr(result, attr, str(new_path))
+
+
+def cleanup_static_tmp_exec_logs(results: list[ExecResult], args: argparse.Namespace) -> int:
+    tmp_root = Path(args.static_driver_tmp_root) / f"pretrain_healthcheck_driver_{args.run_id}"
+    removed = 0
+    for result in results:
+        for path_text in [result.stdout_path, result.stderr_path]:
+            if not path_text:
+                continue
+            path = Path(path_text)
+            try:
+                if path.exists() and path.is_file() and path.is_relative_to(tmp_root):
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    try:
+        tmp_root.rmdir()
+    except OSError:
+        pass
+    return removed
+
+
+def cleanup_empty_dirs(root: Path) -> int:
+    if not root.exists() or not root.is_dir():
+        return 0
+    removed = 0
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if not path.is_dir():
+            continue
+        try:
+            path.rmdir()
+            removed += 1
+        except OSError:
+            pass
+    try:
+        root.rmdir()
+        removed += 1
+    except OSError:
+        pass
+    return removed
+
+
+def cleanup_driver_tmp_dirs(args: argparse.Namespace) -> int:
+    removed = 0
+    run_tmp_root = Path(args.static_driver_tmp_root) / f"pretrain_healthcheck_driver_{args.run_id}"
+    removed += cleanup_empty_dirs(run_tmp_root)
+
+    pod_result_root = Path(args.pod_result_root or f"/tmp/pretrain_healthcheck_driver_{args.run_id}")
+    if pod_result_root.name == f"pretrain_healthcheck_driver_{args.run_id}" and str(pod_result_root).startswith("/tmp/"):
+        removed += cleanup_empty_dirs(pod_result_root)
+    return removed
+
+
+def checks_from_static_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    checks = payload.get("checks")
+    if isinstance(checks, list):
+        return [row for row in checks if isinstance(row, dict)]
+    capability = payload.get("capability", {}) if isinstance(payload.get("capability"), dict) else {}
+    checks_map = capability.get("checks", {}) if isinstance(capability.get("checks"), dict) else {}
+    rows: list[dict[str, Any]] = []
+    for key, value in checks_map.items():
+        category, _, item = str(key).partition("/")
+        row = {
+            "category": category,
+            "item": item,
+            "status": value.get("status", "") if isinstance(value, dict) else "",
+            "detail": value.get("detail", "") if isinstance(value, dict) else "",
+        }
+        rows.append(row)
+    return rows
+
+
+def collect_static_stdout_results(results: list[ExecResult], args: argparse.Namespace) -> dict[str, Any]:
+    facts_rows: list[dict[str, Any]] = []
+    check_rows: list[dict[str, Any]] = []
+    failed_rows: list[dict[str, Any]] = []
+
+    for result in results:
+        stdout = read_file_if_exists(result.stdout_path)
+        frames = [line[len(STATIC_RESULT_PREFIX) :] for line in stdout.splitlines() if line.startswith(STATIC_RESULT_PREFIX)]
+
+        if result.timeout:
+            result.status = "FAIL"
+            result.reason = "STATIC_TIMEOUT"
+            retain_static_exec_logs(result, args)
+            failed_rows.append(failed_static_row(result, "STATIC_TIMEOUT", "static probe timed out"))
+            continue
+        if result.returncode != 0:
+            result.status = "FAIL"
+            result.reason = f"EXEC_FAIL returncode={result.returncode}"
+            retain_static_exec_logs(result, args)
+            failed_rows.append(failed_static_row(result, "EXEC_FAIL", result.reason))
+            continue
+        if len(frames) == 0:
+            result.status = "FAIL"
+            result.reason = "FRAME_MISSING"
+            retain_static_exec_logs(result, args)
+            failed_rows.append(failed_static_row(result, "FRAME_MISSING", "missing static result stdout frame"))
+            continue
+        if len(frames) > 1:
+            result.status = "FAIL"
+            result.reason = "FRAME_PROTOCOL_ERROR"
+            retain_static_exec_logs(result, args)
+            failed_rows.append(failed_static_row(result, "FRAME_PROTOCOL_ERROR", "multiple static result stdout frames"))
+            continue
+
+        frame = frames[0]
+        frame_bytes = len(frame.encode("utf-8"))
+        if frame_bytes > args.static_stdout_max_bytes:
+            result.status = "FAIL"
+            result.reason = "FRAME_TOO_LARGE"
+            retain_static_exec_logs(result, args)
+            failed_rows.append(
+                failed_static_row(
+                    result,
+                    "FRAME_TOO_LARGE",
+                    f"static result frame bytes {frame_bytes} exceed {args.static_stdout_max_bytes}",
+                )
+            )
+            continue
+        try:
+            payload = json.loads(frame)
+        except json.JSONDecodeError as exc:
+            result.status = "FAIL"
+            result.reason = "FRAME_PARSE_FAIL"
+            retain_static_exec_logs(result, args)
+            failed_rows.append(failed_static_row(result, "FRAME_PARSE_FAIL", f"{exc.__class__.__name__}: {exc}"))
+            continue
+        if not isinstance(payload, dict):
+            result.status = "FAIL"
+            result.reason = "FRAME_PROTOCOL_ERROR"
+            retain_static_exec_logs(result, args)
+            failed_rows.append(failed_static_row(result, "FRAME_PROTOCOL_ERROR", "static frame payload is not an object"))
+            continue
+
+        pod_meta = payload.setdefault("pod", {})
+        if not isinstance(pod_meta, dict):
+            result.status = "FAIL"
+            result.reason = "FRAME_PROTOCOL_ERROR"
+            retain_static_exec_logs(result, args)
+            failed_rows.append(failed_static_row(result, "FRAME_PROTOCOL_ERROR", "static frame pod metadata is invalid"))
+            continue
+        if str(pod_meta.get("name", "")) != result.pod_name:
+            result.status = "FAIL"
+            result.reason = "FRAME_ID_MISMATCH"
+            retain_static_exec_logs(result, args)
+            failed_rows.append(
+                failed_static_row(
+                    result,
+                    "FRAME_ID_MISMATCH",
+                    f"pod_name mismatch: frame={pod_meta.get('name', '')} expected={result.pod_name}",
+                )
+            )
+            continue
+        if str(pod_meta.get("run_id", "")) != args.run_id:
+            result.status = "FAIL"
+            result.reason = "FRAME_ID_MISMATCH"
+            retain_static_exec_logs(result, args)
+            failed_rows.append(
+                failed_static_row(
+                    result,
+                    "FRAME_ID_MISMATCH",
+                    f"run_id mismatch: frame={pod_meta.get('run_id', '')} expected={args.run_id}",
+                )
+            )
+            continue
+
+        pod_meta.setdefault("node_name", result.node_name)
+        pod_meta.setdefault("pod_ip", result.pod_ip)
+        facts_rows.append(payload)
+
+        for row in checks_from_static_payload(payload):
+            enriched = dict(row)
+            enriched.setdefault("pod_name", result.pod_name)
+            enriched.setdefault("node_name", result.node_name)
+            enriched.setdefault("pod_ip", result.pod_ip)
+            check_rows.append(enriched)
+
+    output_dir = Path(args.output_dir)
+    write_jsonl(output_dir / "static_facts.jsonl", facts_rows)
+    write_jsonl(output_dir / "static_checks.jsonl", check_rows)
+    write_jsonl(output_dir / "static_failed_pods.jsonl", failed_rows)
+    cleanup_static_tmp_exec_logs(results, args)
+    return {
+        "fact_count": len(facts_rows),
+        "check_count": len(check_rows),
+        "failed_count": len(failed_rows),
+    }
+
+
+def cleanup_static_exec_logs(output_dir: Path, results: list[ExecResult]) -> int:
+    removed = 0
+    for result in results:
+        if result.mode not in {"pre-clean", "static"}:
+            continue
+        if result.status != "PASS":
+            continue
+        for path_text in [result.stdout_path, result.stderr_path]:
+            if not path_text:
+                continue
+            path = Path(path_text)
+            try:
+                if path.exists() and path.is_file() and path.is_relative_to(output_dir):
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    try:
+        logs_dir = output_dir / "logs"
+        logs_dir.rmdir()
+    except OSError:
+        pass
+    cleanup_empty_dirs(output_dir / "pod_results")
+    return removed
+
+
+def cleanup_dynamic_exec_logs(output_dir: Path, results: list[ExecResult]) -> int:
+    removed = 0
+    for result in results:
+        if result.mode not in {"pre-clean", "single-node", "multi-node"}:
+            continue
+        if result.status != "PASS":
+            continue
+        for path_text in [result.stdout_path, result.stderr_path]:
+            if not path_text:
+                continue
+            path = Path(path_text)
+            try:
+                if path.exists() and path.is_file() and path.is_relative_to(output_dir):
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    try:
+        logs_dir = output_dir / "logs"
+        logs_dir.rmdir()
+    except OSError:
+        pass
+    cleanup_empty_dirs(output_dir / "pod_results")
+    return removed
+
+
+def failed_dynamic_row(result: ExecResult, error_type: str, reason: str) -> dict[str, Any]:
+    stderr = read_file_if_exists(result.stderr_path)
+    match = re.search(r"^\[dynamic-stage\] workdir:\s*(\S+)", stderr, flags=re.MULTILINE)
+    return {
+        "pod_name": result.pod_name,
+        "node_name": result.node_name,
+        "pod_ip": result.pod_ip,
+        "mode": result.mode,
+        "status": "FAIL",
+        "error_type": error_type,
+        "reason": reason,
+        "returncode": result.returncode,
+        "timeout": result.timeout,
+        "stdout_path": result.stdout_path,
+        "stderr_path": result.stderr_path,
+        "local_workdir": match.group(1) if match else "",
+        "started_at": result.started_at,
+        "finished_at": result.finished_at,
+        "elapsed_seconds": result.elapsed_seconds,
+    }
+
+
+def collect_dynamic_stdout_results(results: list[ExecResult], args: argparse.Namespace) -> dict[str, Any]:
+    facts_rows: list[dict[str, Any]] = []
+    failed_rows: list[dict[str, Any]] = []
+
+    for result in results:
+        if result.mode not in {"single-node", "multi-node"}:
+            continue
+        stdout = read_file_if_exists(result.stdout_path)
+        frames = [line[len(DYNAMIC_RESULT_PREFIX) :] for line in stdout.splitlines() if line.startswith(DYNAMIC_RESULT_PREFIX)]
+
+        if result.timeout:
+            result.status = "FAIL"
+            result.reason = "DYNAMIC_TIMEOUT"
+            failed_rows.append(failed_dynamic_row(result, "DYNAMIC_TIMEOUT", "dynamic probe timed out"))
+            continue
+        if len(frames) == 0:
+            if result.returncode == 0:
+                result.status = "FAIL"
+                result.reason = "DYNAMIC_FRAME_MISSING"
+            failed_rows.append(failed_dynamic_row(result, "FRAME_MISSING", result.reason or "missing dynamic frame"))
+            continue
+        if len(frames) > 1:
+            result.status = "FAIL"
+            result.reason = "DYNAMIC_FRAME_PROTOCOL_ERROR"
+            failed_rows.append(failed_dynamic_row(result, "FRAME_PROTOCOL_ERROR", "multiple dynamic frames"))
+            continue
+        try:
+            payload = json.loads(frames[0])
+        except json.JSONDecodeError as exc:
+            result.status = "FAIL"
+            result.reason = "DYNAMIC_FRAME_PARSE_FAIL"
+            failed_rows.append(failed_dynamic_row(result, "FRAME_PARSE_FAIL", f"{exc.__class__.__name__}: {exc}"))
+            continue
+        if not isinstance(payload, dict):
+            result.status = "FAIL"
+            result.reason = "DYNAMIC_FRAME_PROTOCOL_ERROR"
+            failed_rows.append(failed_dynamic_row(result, "FRAME_PROTOCOL_ERROR", "dynamic frame payload is not an object"))
+            continue
+        pod_meta = payload.get("pod", {})
+        if not isinstance(pod_meta, dict) or str(pod_meta.get("name", "")) != result.pod_name:
+            result.status = "FAIL"
+            result.reason = "DYNAMIC_FRAME_ID_MISMATCH"
+            failed_rows.append(failed_dynamic_row(result, "FRAME_ID_MISMATCH", "pod_name mismatch"))
+            continue
+        pod_meta.setdefault("node_name", result.node_name)
+        pod_meta.setdefault("pod_ip", result.pod_ip)
+        payload.setdefault("driver_result", asdict(result))
+        facts_rows.append(payload)
+        summary = payload.get("summary", {})
+        if result.returncode != 0 or not isinstance(summary, dict) or not summary.get("correctness_pass", False):
+            result.status = "FAIL"
+            result.reason = str(summary.get("error_type", "")) if isinstance(summary, dict) else f"returncode={result.returncode}"
+            failed_rows.append(
+                failed_dynamic_row(
+                    result,
+                    "DYNAMIC_CHECK_FAILED",
+                    result.reason or f"returncode={result.returncode}",
+                )
+            )
+
+    output_dir = Path(args.output_dir)
+    write_jsonl(output_dir / "dynamic_facts.jsonl", facts_rows)
+    write_jsonl(output_dir / "dynamic_failed_pods.jsonl", failed_rows)
+    return {"fact_count": len(facts_rows), "failed_count": len(failed_rows)}
+
+
+def write_summary_md(
+    path: Path,
+    pods: list[PodInfo],
+    results: list[ExecResult],
+    overall: str,
+    static_compare_report: dict[str, Any] | None = None,
+    dynamic_compare_report: dict[str, Any] | None = None,
+) -> None:
     lines = [
         "# vcctl Healthcheck Summary",
         "",
@@ -890,6 +1046,33 @@ def write_summary_md(path: Path, pods: list[PodInfo], results: list[ExecResult],
             f"| {result.mode} | {result.pod_name} | {result.status} | {result.returncode} | "
             f"{result.timeout} | {result.reason} | {result.elapsed_seconds} |"
         )
+    if static_compare_report:
+        lines.extend(
+            [
+                "",
+                "## Static Compare",
+                "",
+                f"- static_compare_status: `{static_compare_report.get('static_compare_status')}`",
+                f"- issue_count: `{static_compare_report.get('issue_count', 0)}`",
+                f"- warning_count: `{static_compare_report.get('warning_count', 0)}`",
+                "- report: `static_compare.md`",
+            ]
+        )
+        node_sample_section = render_node_environment_sample_section(path.parent, static_compare_report)
+        if node_sample_section:
+            lines.extend(["", node_sample_section.rstrip()])
+    if dynamic_compare_report:
+        lines.extend(
+            [
+                "",
+                "## Dynamic Compare",
+                "",
+                f"- dynamic_compare_status: `{dynamic_compare_report.get('dynamic_compare_status')}`",
+                f"- issue_count: `{dynamic_compare_report.get('issue_count', 0)}`",
+                f"- outlier_count: `{dynamic_compare_report.get('outlier_count', 0)}`",
+                "- report: `dynamic_compare.md`",
+            ]
+        )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -902,6 +1085,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--result-root", required=True)
     parser.add_argument("--pod-result-root", default="")
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--run-stage", default="")
     parser.add_argument("--vcctl-bin", default="vcctl")
     parser.add_argument("--container-name", default="")
     parser.add_argument("--pre-clean-cmd", default="")
@@ -912,11 +1096,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--healthcheck-port-start", type=int, default=29500)
     parser.add_argument("--healthcheck-port-end", type=int, default=29999)
     parser.add_argument("--exec-timeout-seconds", type=int, default=3600)
-    parser.add_argument("--hang-timeout-seconds", type=int, default=0)
-    parser.add_argument("--hang-kill-grace-seconds", type=int, default=10)
-    parser.add_argument("--hang-cleanup-cmd", default="")
+    parser.add_argument("--static-exec-timeout-seconds", type=int, default=120)
+    parser.add_argument("--static-stdout-max-bytes", type=int, default=1048576)
+    parser.add_argument("--static-driver-tmp-root", default="/tmp")
     parser.add_argument("--vcctl-timeout-seconds", type=int, default=120)
     parser.add_argument("--max-parallel", type=int, default=0)
+    parser.add_argument("--static-compare", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--static-compare-workers", type=int, default=0)
+    parser.add_argument("--static-compare-strict", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--static-expected-gpus", type=int, default=0)
+    parser.add_argument("--static-expected-xscale-ports", type=int, default=0)
+    parser.add_argument("--static-keep-pod-files", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--static-keep-exec-logs", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--dynamic-compare", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--dynamic-compare-strict", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dynamic-compare-ratio-threshold", type=float, default=0.7)
+    parser.add_argument("--dynamic-keep-exec-logs", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--pod-json-file", default="")
     return parser
@@ -924,22 +1119,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    output_dir = Path(args.result_root) / args.run_id
+    if not args.run_stage:
+        args.run_stage = args.mode.replace("-", "_")
+    output_dir = Path(args.result_root) / args.run_id / args.run_stage
     args.output_dir = str(output_dir)
-    pod_result_root = args.pod_result_root or args.result_root
-    args.pod_output_dir = str(Path(pod_result_root) / args.run_id)
-    for subdir in ["logs", "pod_results"]:
-        (output_dir / subdir).mkdir(parents=True, exist_ok=True)
+    pod_result_root = args.pod_result_root or f"/tmp/pretrain_healthcheck_driver_{args.run_id}"
+    args.pod_output_dir = str(Path(pod_result_root) / args.run_id / args.run_stage)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        raw, pods = load_pods(args)
+        _raw, pods = load_pods(args)
     except Exception as exc:
         print(f"[vcctl-healthcheck] failed to load pods: {exc}", file=sys.stderr)
         return 2
 
-    (output_dir / "vcctl_pods.raw.json").write_text(raw, encoding="utf-8")
     write_jsonl(output_dir / "pods.jsonl", [asdict(pod) for pod in pods])
-    write_pods_tsv(output_dir / "pods.tsv", pods)
     write_commands_env(output_dir / "commands.env", args)
 
     if not pods:
@@ -970,18 +1164,47 @@ def main() -> int:
         )
 
     results: list[ExecResult] = []
+    static_compare_report: dict[str, Any] | None = None
+    dynamic_compare_report: dict[str, Any] | None = None
     if args.pre_clean_cmd:
         results.extend(run_mode(pods, "pre-clean", args.pre_clean_cmd, args))
     if args.mode in {"static", "all"}:
-        results.extend(run_mode(pods, "static", args.static_cmd, args))
+        static_results = run_mode(pods, "static", args.static_cmd, args)
+        results.extend(static_results)
+        if args.static_compare and not args.dry_run:
+            collect_static_stdout_results(static_results, args)
+            static_compare_report = compare_static_results(
+                output_dir,
+                workers=args.static_compare_workers,
+                expected_gpus=args.static_expected_gpus,
+                expected_xscale_ports=args.static_expected_xscale_ports,
+            )
+            write_static_compare_outputs(output_dir, static_compare_report)
+        if not args.static_keep_exec_logs and not args.dry_run:
+            removed_static_logs = cleanup_static_exec_logs(output_dir, results)
+            if removed_static_logs:
+                print(f"[vcctl-healthcheck] removed static exec logs: {removed_static_logs}")
     if args.mode in {"single-node", "all"}:
-        results.extend(run_mode(pods, "single-node", args.single_node_cmd, args))
+        single_node_results = run_mode(pods, "single-node", args.single_node_cmd, args)
+        results.extend(single_node_results)
+        if args.dynamic_compare and not args.dry_run:
+            collect_dynamic_stdout_results(single_node_results, args)
+            dynamic_compare_report = compare_dynamic_results(
+                output_dir,
+                ratio_threshold=args.dynamic_compare_ratio_threshold,
+            )
+            write_dynamic_compare_report(output_dir, dynamic_compare_report)
+            if not args.dynamic_keep_exec_logs:
+                removed_dynamic_logs = cleanup_dynamic_exec_logs(output_dir, results)
+                if removed_dynamic_logs:
+                    print(f"[vcctl-healthcheck] removed dynamic exec logs: {removed_dynamic_logs}")
     if args.mode in {"multi-node", "all"}:
         results.extend(run_mode(pods, "multi-node", args.multi_node_cmd, args))
 
     result_rows = [asdict(result) for result in results]
     write_jsonl(output_dir / "results.jsonl", result_rows)
-    overall = summarize(results)
+    overall = merge_static_compare_status(summarize(results), static_compare_report, args.static_compare_strict)
+    overall = merge_dynamic_compare_status(overall, dynamic_compare_report, args.dynamic_compare_strict)
     summary = {
         "overall_status": overall,
         "job_name": args.job_name,
@@ -993,9 +1216,14 @@ def main() -> int:
         "result_count": len(results),
         "pods": [asdict(pod) for pod in pods],
         "results": result_rows,
+        "static_compare": static_compare_report,
+        "dynamic_compare": dynamic_compare_report,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_summary_md(output_dir / "summary.md", pods, results, overall)
+    write_summary_md(output_dir / "summary.md", pods, results, overall, static_compare_report, dynamic_compare_report)
+    removed_tmp_dirs = cleanup_driver_tmp_dirs(args)
+    if removed_tmp_dirs:
+        print(f"[vcctl-healthcheck] removed empty driver tmp dirs: {removed_tmp_dirs}")
     print(f"[vcctl-healthcheck] overall_status={overall}")
     print(f"[vcctl-healthcheck] output={output_dir}")
     return 0 if overall in {"PASS", "DRY_RUN"} else 1
