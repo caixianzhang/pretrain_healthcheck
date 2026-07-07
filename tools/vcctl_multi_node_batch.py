@@ -493,6 +493,8 @@ def run_group(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection
             "RESULT_ROOT": args.result_root,
         }
     )
+    if args.pod_project_dir:
+        env["PROJECT_REMOTE_DIR"] = args.pod_project_dir
 
     started = time.monotonic()
     print(
@@ -966,6 +968,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pre-clean", default="1")
     parser.add_argument("--dynamic-compare", default="1")
     parser.add_argument("--keep-group-outputs", default="0")
+    parser.add_argument("--pod-project-dir", default="")
     parser.add_argument("--resume", action="store_true")
     return parser
 

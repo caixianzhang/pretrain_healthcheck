@@ -20,6 +20,7 @@ DRY_RUN="${DRY_RUN:-1}"
 PRE_CLEAN="${PRE_CLEAN:-1}"
 DYNAMIC_COMPARE="${DYNAMIC_COMPARE:-1}"
 KEEP_GROUP_OUTPUTS="${KEEP_GROUP_OUTPUTS:-0}"
+POD_PROJECT_DIR="${POD_PROJECT_DIR:-}"
 
 usage() {
   cat <<'EOF'
@@ -45,6 +46,7 @@ Common env:
   PRE_CLEAN                  1 cleans residual healthcheck processes before each group. Default: 1
   DYNAMIC_COMPARE            1 runs dynamic compact compare per group. Default: 1
   KEEP_GROUP_OUTPUTS         1 keeps normal per-group shared outputs. Default: 0
+  POD_PROJECT_DIR            Project path inside target pods. Use /afs-grj/pretrain_healthcheck for with_sync jobs.
 
 Examples:
   JOB_NAME=muxi-1024node DRY_RUN=0 TARGET_SCALE=128 bash scripts/metax/run_vcctl_multi_node_batch_healthcheck.sh
@@ -80,4 +82,5 @@ exec python3 "${PROJECT_DIR}/tools/vcctl_multi_node_batch.py" "$@" \
   --dry-run "${DRY_RUN}" \
   --pre-clean "${PRE_CLEAN}" \
   --dynamic-compare "${DYNAMIC_COMPARE}" \
-  --keep-group-outputs "${KEEP_GROUP_OUTPUTS}"
+  --keep-group-outputs "${KEEP_GROUP_OUTPUTS}" \
+  --pod-project-dir "${POD_PROJECT_DIR}"
