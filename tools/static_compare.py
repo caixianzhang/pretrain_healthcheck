@@ -18,8 +18,16 @@ SKIP_STATUS_ITEMS = {
 
 CRITICAL_STATUS_ITEMS = {
     "metax/mx_smi",
+    "metax/mx_ecc_state",
+    "metax/mx_ras_count",
+    "metax/mx_events",
     "metax/python_torch",
     "metax/maca_env",
+    "ascend/npu_smi",
+    "ascend/npu_ecc",
+    "ascend/python_torch",
+    "ascend/ascend_env",
+    "net/ip_link",
     "hca/ibv_devinfo",
     "sys/sys_infiniband",
     "sys/infiniband_sysfs",
@@ -32,8 +40,26 @@ HARD_FACT_KEYS = {
     "metax.bios_version",
     "metax.gpu_model_counts",
     "metax.gpu_available_count",
+    "metax.ecc.gpu_count",
+    "metax.ecc.topology_signature",
+    "ascend.chip_count",
+    "ascend.version",
+    "ascend.health_counts",
+    "ascend.ecc.npu_count",
+    "ascend.ecc.chip_count",
+    "ascend.ecc.topology_signature",
+    "ascend.visible_devices",
+    "ascend.hccn_tool_available",
+    "ascend.rdma_dev_infiniband_exists",
+    "ascend.rdma_hca_ids",
+    "ascend.rdma_sysfs_port_count",
+    "ascend.rdma_sysfs_state_rates",
+    "ascend.net_interface_count",
+    "ascend.net_interfaces",
     "torch.version",
     "torch.device_count",
+    "torch_npu.version",
+    "torch_npu.available",
     "hca.ibv_hca_ids",
     "hca.sysfs_xscale_count",
     "hca.sysfs_xscale_state_rates",
@@ -43,6 +69,39 @@ SOFT_FACT_KEYS = {
     "basic.uname_kernel",
     "hca.sysfs_all_device_count",
     "hca.sysfs_all_state_rates",
+}
+
+ECC_SINGLE_BIT_KEYS = {
+    "ascend.ecc.hbm_single_bit_error_count",
+    "ascend.ecc.hbm_single_bit_aggregate_total_err_count",
+}
+
+ECC_CRITICAL_KEYS = {
+    "ascend.ecc.hbm_double_bit_error_count",
+    "ascend.ecc.hbm_double_bit_aggregate_total_err_count",
+    "ascend.ecc.hbm_single_bit_isolated_pages_count",
+    "ascend.ecc.hbm_double_bit_isolated_pages_count",
+    "ascend.ecc.hbm_single_bit_next_isolated_pages_count",
+    "ascend.ecc.hbm_double_bit_next_isolated_pages_count",
+}
+
+ECC_RULE_ONLY_FACT_KEYS = {"ascend.ecc.query_status", *ECC_SINGLE_BIT_KEYS, *ECC_CRITICAL_KEYS}
+
+METAX_ECC_CORRECTED_KEYS = {
+    "metax.ecc.corrected_error_gpu_count",
+    "metax.ecc.corrected_event_count",
+}
+
+METAX_ECC_CRITICAL_KEYS = {
+    "metax.ecc.uncorrected_error_gpu_count",
+    "metax.ecc.critical_event_count",
+}
+
+METAX_ECC_RULE_ONLY_FACT_KEYS = {
+    "metax.ecc.query_status",
+    "metax.ecc.all_enabled",
+    *METAX_ECC_CORRECTED_KEYS,
+    *METAX_ECC_CRITICAL_KEYS,
 }
 
 
@@ -198,6 +257,19 @@ def compact_to_flat_facts(row: dict[str, Any]) -> dict[str, str]:
             facts[target] = str(metax[source])
     if "gpu_model_counts" in metax:
         facts["metax.gpu_model_counts"] = json.dumps(metax["gpu_model_counts"], sort_keys=True)
+    metax_ecc = gpu.get("ecc", {}) if isinstance(gpu.get("ecc"), dict) else {}
+    for source, target in [
+        ("query_status", "metax.ecc.query_status"),
+        ("gpu_count", "metax.ecc.gpu_count"),
+        ("topology_signature", "metax.ecc.topology_signature"),
+        ("all_enabled", "metax.ecc.all_enabled"),
+        ("corrected_error_gpu_count", "metax.ecc.corrected_error_gpu_count"),
+        ("uncorrected_error_gpu_count", "metax.ecc.uncorrected_error_gpu_count"),
+        ("corrected_event_count", "metax.ecc.corrected_event_count"),
+        ("critical_event_count", "metax.ecc.critical_event_count"),
+    ]:
+        if source in metax_ecc:
+            facts[target] = str(metax_ecc[source])
     for source, target in [
         ("version", "torch.version"),
         ("device_count", "torch.device_count"),
@@ -205,6 +277,76 @@ def compact_to_flat_facts(row: dict[str, Any]) -> dict[str, str]:
     ]:
         if source in torch:
             facts[target] = str(torch[source])
+
+    npu = row.get("npu", {}) if isinstance(row.get("npu"), dict) else {}
+    ascend = npu.get("ascend", {}) if isinstance(npu.get("ascend"), dict) else {}
+    npu_torch = npu.get("torch", {}) if isinstance(npu.get("torch"), dict) else {}
+    for source, target in [
+        ("chip_count", "ascend.chip_count"),
+        ("version", "ascend.version"),
+        ("npu_smi_version", "ascend.npu_smi_version"),
+    ]:
+        if source in ascend:
+            facts[target] = str(ascend[source])
+    if "health_counts" in ascend:
+        facts["ascend.health_counts"] = json.dumps(ascend["health_counts"], sort_keys=True)
+    ecc = npu.get("ecc", {}) if isinstance(npu.get("ecc"), dict) else {}
+    for source, target in [
+        ("query_status", "ascend.ecc.query_status"),
+        ("npu_count", "ascend.ecc.npu_count"),
+        ("chip_count", "ascend.ecc.chip_count"),
+        ("topology_signature", "ascend.ecc.topology_signature"),
+    ]:
+        if source in ecc:
+            facts[target] = str(ecc[source])
+    ecc_totals = ecc.get("totals", {}) if isinstance(ecc.get("totals"), dict) else {}
+    for source in sorted(ECC_SINGLE_BIT_KEYS | ECC_CRITICAL_KEYS):
+        raw_name = source.removeprefix("ascend.ecc.")
+        if raw_name in ecc_totals:
+            facts[source] = str(ecc_totals[raw_name])
+    container = row.get("container", {}) if isinstance(row.get("container"), dict) else {}
+    if "ascend_visible_devices" in container:
+        raw_visible = str(container["ascend_visible_devices"])
+        parts = [part.strip() for part in raw_visible.split(",") if part.strip()]
+        try:
+            parts = [str(x) for x in sorted(int(part) for part in parts)]
+        except ValueError:
+            parts = sorted(parts)
+        facts["ascend.visible_devices"] = ",".join(parts) if parts else raw_visible
+    for source, target in [
+        ("version", "torch.version"),
+        ("device_count", "torch.device_count"),
+        ("torch_npu_version", "torch_npu.version"),
+        ("npu_available", "torch_npu.available"),
+    ]:
+        if source in npu_torch:
+            facts[target] = str(npu_torch[source])
+
+    npu_network = npu.get("network", {}) if isinstance(npu.get("network"), dict) else {}
+    hccn_tool = npu_network.get("hccn_tool", {}) if isinstance(npu_network.get("hccn_tool"), dict) else {}
+    if "available" in hccn_tool:
+        facts["ascend.hccn_tool_available"] = str(hccn_tool["available"])
+
+    rdma = row.get("rdma", {}) if isinstance(row.get("rdma"), dict) else {}
+    if "dev_infiniband_exists" in rdma:
+        facts["ascend.rdma_dev_infiniband_exists"] = str(rdma["dev_infiniband_exists"])
+    ascend_ibv = rdma.get("ibv_devinfo", {}) if isinstance(rdma.get("ibv_devinfo"), dict) else {}
+    if isinstance(ascend_ibv.get("hca_ids"), list):
+        facts["ascend.rdma_hca_ids"] = ",".join(str(x) for x in ascend_ibv["hca_ids"])
+    ascend_sysfs = rdma.get("sysfs", {}) if isinstance(rdma.get("sysfs"), dict) else {}
+    if "port_count" in ascend_sysfs:
+        facts["ascend.rdma_sysfs_port_count"] = str(ascend_sysfs["port_count"])
+    state_rates = ascend_sysfs.get("state_rates", []) if isinstance(ascend_sysfs.get("state_rates"), list) else []
+    if state_rates:
+        facts["ascend.rdma_sysfs_state_rates"] = ";".join(str(x) for x in state_rates)
+
+    net = row.get("net", {}) if isinstance(row.get("net"), dict) else {}
+    net_sysfs = net.get("sysfs", {}) if isinstance(net.get("sysfs"), dict) else {}
+    if "interface_count" in net_sysfs:
+        facts["ascend.net_interface_count"] = str(net_sysfs["interface_count"])
+    interfaces = net_sysfs.get("interfaces", []) if isinstance(net_sysfs.get("interfaces"), list) else []
+    if interfaces:
+        facts["ascend.net_interfaces"] = ";".join(str(x) for x in interfaces)
 
     hca = row.get("hca", {}) if isinstance(row.get("hca"), dict) else {}
     ibv = hca.get("ibv_devinfo", {}) if isinstance(hca.get("ibv_devinfo"), dict) else {}
@@ -468,6 +610,8 @@ def compare_facts(pods: list[PodStaticFacts]) -> list[StaticIssue]:
     issues: list[StaticIssue] = []
     all_keys = sorted({key for pod in pods for key in pod.facts})
     for key in all_keys:
+        if key in ECC_RULE_ONLY_FACT_KEYS or key in METAX_ECC_RULE_ONLY_FACT_KEYS:
+            continue
         values = {pod.pod_name: pod.facts.get(key, "") for pod in pods}
         if len(set(values.values())) <= 1:
             continue
@@ -510,6 +654,265 @@ def compare_facts(pods: list[PodStaticFacts]) -> list[StaticIssue]:
     return issues
 
 
+def compare_metax_ecc_gates(pods: list[PodStaticFacts]) -> list[StaticIssue]:
+    issues: list[StaticIssue] = []
+    required_keys = sorted(METAX_ECC_CORRECTED_KEYS | METAX_ECC_CRITICAL_KEYS)
+    for pod in pods:
+        if "metax.attached_gpus" not in pod.facts:
+            continue
+
+        query_status = pod.facts.get("metax.ecc.query_status", "")
+        if query_status != "OK":
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:metax_ecc_query",
+                    expected="OK",
+                    actual=query_status or "missing",
+                    reason="MetaX ECC/RAS query failed, is missing, or produced incomplete output",
+                )
+            )
+            continue
+
+        missing_keys = [key for key in required_keys if key not in pod.facts]
+        if missing_keys:
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:metax_ecc_counters",
+                    expected="all ECC/RAS counters present",
+                    actual=",".join(missing_keys),
+                    reason="MetaX ECC/RAS output is missing required counters",
+                )
+            )
+            continue
+
+        try:
+            ecc_gpu_count = int(pod.facts.get("metax.ecc.gpu_count", ""))
+            attached_gpu_count = int(pod.facts.get("metax.attached_gpus", ""))
+        except ValueError:
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:metax_ecc_topology",
+                    expected="numeric GPU counts",
+                    actual=(
+                        f"ecc={pod.facts.get('metax.ecc.gpu_count', '')},"
+                        f"attached={pod.facts.get('metax.attached_gpus', '')}"
+                    ),
+                    reason="MetaX ECC topology counters are invalid",
+                )
+            )
+            continue
+
+        if ecc_gpu_count <= 0 or ecc_gpu_count != attached_gpu_count:
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:metax_ecc_topology",
+                    expected=f"ecc_gpu_count={attached_gpu_count}",
+                    actual=f"ecc_gpu_count={ecc_gpu_count}",
+                    reason="MetaX ECC/RAS query did not cover every attached GPU",
+                )
+            )
+
+        if pod.facts.get("metax.ecc.all_enabled", "").lower() != "true":
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:metax_ecc_enabled",
+                    expected="True",
+                    actual=pod.facts.get("metax.ecc.all_enabled", "missing"),
+                    reason="ECC is disabled on one or more MetaX GPUs",
+                )
+            )
+
+        try:
+            critical = {
+                key: int(pod.facts[key])
+                for key in sorted(METAX_ECC_CRITICAL_KEYS)
+                if int(pod.facts[key]) > 0
+            }
+            corrected = {
+                key: int(pod.facts[key])
+                for key in sorted(METAX_ECC_CORRECTED_KEYS)
+                if int(pod.facts[key]) > 0
+            }
+        except ValueError:
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:metax_ecc_counters",
+                    expected="non-negative integer counters",
+                    actual="invalid counter value",
+                    reason="MetaX ECC/RAS counter parsing failed",
+                )
+            )
+            continue
+
+        if critical:
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:metax_ecc_critical",
+                    expected="no uncorrected ECC or critical RAS events",
+                    actual=json.dumps(critical, sort_keys=True),
+                    reason="uncorrected ECC or critical MetaX RAS event detected",
+                )
+            )
+        if corrected:
+            issues.append(
+                StaticIssue(
+                    severity="SUSPECT",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:metax_ecc_corrected",
+                    expected="no corrected ECC or AER-CE events",
+                    actual=json.dumps(corrected, sort_keys=True),
+                    reason="corrected MetaX ECC/RAS event detected; retest required",
+                )
+            )
+    return issues
+
+
+def compare_ascend_ecc_gates(pods: list[PodStaticFacts]) -> list[StaticIssue]:
+    issues: list[StaticIssue] = []
+    required_counter_keys = sorted(ECC_SINGLE_BIT_KEYS | ECC_CRITICAL_KEYS)
+    for pod in pods:
+        if "ascend.chip_count" not in pod.facts:
+            continue
+
+        query_status = pod.facts.get("ascend.ecc.query_status", "")
+        if query_status != "OK":
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:ascend_ecc_query",
+                    expected="OK",
+                    actual=query_status or "missing",
+                    reason="ECC query failed, is missing, or produced incomplete output",
+                )
+            )
+            continue
+
+        missing_keys = [key for key in required_counter_keys if key not in pod.facts]
+        if missing_keys:
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:ascend_ecc_counters",
+                    expected="all ECC counters present",
+                    actual=",".join(missing_keys),
+                    reason="ECC output is missing required counters",
+                )
+            )
+            continue
+
+        try:
+            ecc_npu_count = int(pod.facts.get("ascend.ecc.npu_count", ""))
+            visible_npu_count = int(pod.facts.get("ascend.chip_count", ""))
+            ecc_chip_count = int(pod.facts.get("ascend.ecc.chip_count", ""))
+        except ValueError:
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:ascend_ecc_topology",
+                    expected="numeric NPU and Chip counts",
+                    actual=(
+                        f"npu={pod.facts.get('ascend.ecc.npu_count', '')},"
+                        f"visible={pod.facts.get('ascend.chip_count', '')},"
+                        f"chips={pod.facts.get('ascend.ecc.chip_count', '')}"
+                    ),
+                    reason="ECC topology counters are invalid",
+                )
+            )
+            continue
+
+        if ecc_npu_count <= 0 or ecc_chip_count <= 0 or ecc_chip_count != visible_npu_count:
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:ascend_ecc_topology",
+                    expected=f"ecc_chip_count={visible_npu_count}, physical_npu_count>0",
+                    actual=f"ecc_npu_count={ecc_npu_count}, chip_count={ecc_chip_count}",
+                    reason="ECC query did not cover every visible logical NPU chip",
+                )
+            )
+
+        try:
+            critical = {
+                key: int(pod.facts[key])
+                for key in sorted(ECC_CRITICAL_KEYS)
+                if int(pod.facts[key]) > 0
+            }
+            single_bit = {
+                key: int(pod.facts[key])
+                for key in sorted(ECC_SINGLE_BIT_KEYS)
+                if int(pod.facts[key]) > 0
+            }
+        except ValueError:
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:ascend_ecc_counters",
+                    expected="non-negative integer counters",
+                    actual="invalid counter value",
+                    reason="ECC counter parsing failed",
+                )
+            )
+            continue
+
+        if critical:
+            issues.append(
+                StaticIssue(
+                    severity="FAIL",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:ascend_ecc_critical",
+                    expected="all double-bit and isolated-page counters equal 0",
+                    actual=json.dumps(critical, sort_keys=True),
+                    reason="critical HBM ECC or isolated-page condition detected",
+                )
+            )
+        if single_bit:
+            issues.append(
+                StaticIssue(
+                    severity="SUSPECT",
+                    pod_name=pod.pod_name,
+                    node_name=pod.node_name,
+                    check="rule:ascend_ecc_single_bit",
+                    expected="current and aggregate single-bit counters equal 0",
+                    actual=json.dumps(single_bit, sort_keys=True),
+                    reason="correctable HBM single-bit ECC detected; retest required",
+                )
+            )
+    return issues
+
+
 def compare_rule_gates(
     pods: list[PodStaticFacts],
     expected_gpus: int = 0,
@@ -518,7 +921,30 @@ def compare_rule_gates(
     issues: list[StaticIssue] = []
     if expected_gpus > 0:
         for pod in pods:
-            for key in ["metax.attached_gpus", "metax.gpu_available_count", "torch.device_count"]:
+            present_count_keys = [
+                key
+                for key in [
+                    "metax.attached_gpus",
+                    "metax.gpu_available_count",
+                    "ascend.chip_count",
+                    "torch.device_count",
+                ]
+                if pod.facts.get(key, "") != ""
+            ]
+            if not present_count_keys:
+                issues.append(
+                    StaticIssue(
+                        severity="FAIL",
+                        pod_name=pod.pod_name,
+                        node_name=pod.node_name,
+                        check="rule:device_count",
+                        expected=str(expected_gpus),
+                        actual="",
+                        reason="no device count fact found for expected device count gate",
+                    )
+                )
+                continue
+            for key in present_count_keys:
                 actual = pod.facts.get(key, "")
                 if actual != str(expected_gpus):
                     issues.append(
@@ -529,7 +955,7 @@ def compare_rule_gates(
                             check=f"rule:{key}",
                             expected=str(expected_gpus),
                             actual=actual,
-                            reason="value does not match expected GPU count",
+                            reason="value does not match expected device count",
                         )
                     )
     if expected_xscale_ports > 0:
@@ -632,6 +1058,8 @@ def compare_static_results(
     issues.extend(status_issues)
     warnings.extend(status_warnings)
     issues.extend(compare_rule_gates(pods, expected_gpus=expected_gpus, expected_xscale_ports=expected_xscale_ports))
+    issues.extend(compare_metax_ecc_gates(pods))
+    issues.extend(compare_ascend_ecc_gates(pods))
     issues.extend(compare_facts(pods))
 
     status = "PASS"
@@ -780,47 +1208,131 @@ def render_node_environment_sample_section(result_dir: Path, report: dict[str, A
         return ""
 
     pod = sample.get("pod", {}) if isinstance(sample.get("pod"), dict) else {}
-    gpu = sample.get("gpu", {}) if isinstance(sample.get("gpu"), dict) else {}
-    metax = gpu.get("metax", {}) if isinstance(gpu.get("metax"), dict) else {}
-    torch = gpu.get("torch", {}) if isinstance(gpu.get("torch"), dict) else {}
-    hca = sample.get("hca", {}) if isinstance(sample.get("hca"), dict) else {}
-    ibv = hca.get("ibv_devinfo", {}) if isinstance(hca.get("ibv_devinfo"), dict) else {}
-    sysfs = hca.get("sysfs", {}) if isinstance(hca.get("sysfs"), dict) else {}
     basic = sample.get("basic", {}) if isinstance(sample.get("basic"), dict) else {}
     uname = basic.get("uname", {}) if isinstance(basic.get("uname"), dict) else {}
+    container = sample.get("container", {}) if isinstance(sample.get("container"), dict) else {}
+    storage = sample.get("storage", {}) if isinstance(sample.get("storage"), dict) else {}
 
-    rows = [
+    common_rows = [
         ("pod", pod.get("name", "unknown")),
         ("node", pod.get("node_name", "unknown")),
         ("pod_ip", pod.get("pod_ip", "unknown")),
         ("host_ip", pod.get("host_ip", "unknown")),
+        ("device_type", pod.get("device_type", "unknown")),
         ("kernel", uname.get("kernel", "unknown")),
         ("pod_time", basic.get("date", "unknown")),
-        ("gpu_model_counts", metax.get("gpu_model_counts", "unknown")),
-        ("attached_gpus", metax.get("attached_gpus", "unknown")),
-        ("gpu_available_count", metax.get("gpu_available_count", "unknown")),
-        ("mx_smi_version", metax.get("mx_smi_version", "unknown")),
-        ("driver_version", metax.get("driver_version", "unknown")),
-        ("maca_version", metax.get("maca_version", "unknown")),
-        ("bios_version", metax.get("bios_version", "unknown")),
-        ("torch_version", torch.get("version", "unknown")),
-        ("torch_device_count", torch.get("device_count", "unknown")),
-        ("hca_count", ibv.get("hca_count", "unknown")),
-        ("hca_ids", ibv.get("hca_ids", "unknown")),
-        ("xscale_port_count", sysfs.get("xscale_port_count", "unknown")),
+        ("df_mount_count", len(storage.get("df", [])) if isinstance(storage.get("df"), list) else "unknown"),
+        ("inode_mount_count", len(storage.get("inode", [])) if isinstance(storage.get("inode"), list) else "unknown"),
     ]
+
+    gpu = sample.get("gpu", {}) if isinstance(sample.get("gpu"), dict) else {}
+    metax = gpu.get("metax", {}) if isinstance(gpu.get("metax"), dict) else {}
+    metax_torch = gpu.get("torch", {}) if isinstance(gpu.get("torch"), dict) else {}
+    npu = sample.get("npu", {}) if isinstance(sample.get("npu"), dict) else {}
+    ascend = npu.get("ascend", {}) if isinstance(npu.get("ascend"), dict) else {}
+    npu_torch = npu.get("torch", {}) if isinstance(npu.get("torch"), dict) else {}
+
+    platform_title = "Platform Specific Fields"
+    platform_rows: list[tuple[str, Any]] = []
+    if ascend:
+        network = npu.get("network", {}) if isinstance(npu.get("network"), dict) else {}
+        hccn_tool = network.get("hccn_tool", {}) if isinstance(network.get("hccn_tool"), dict) else {}
+        rdma = sample.get("rdma", {}) if isinstance(sample.get("rdma"), dict) else {}
+        ibv = rdma.get("ibv_devinfo", {}) if isinstance(rdma.get("ibv_devinfo"), dict) else {}
+        rdma_sysfs = rdma.get("sysfs", {}) if isinstance(rdma.get("sysfs"), dict) else {}
+        net = sample.get("net", {}) if isinstance(sample.get("net"), dict) else {}
+        net_sysfs = net.get("sysfs", {}) if isinstance(net.get("sysfs"), dict) else {}
+        ecc = npu.get("ecc", {}) if isinstance(npu.get("ecc"), dict) else {}
+        ecc_totals = ecc.get("totals", {}) if isinstance(ecc.get("totals"), dict) else {}
+        platform_title = "Ascend / NPU Fields"
+        platform_rows = [
+            ("chip_count", ascend.get("chip_count", "unknown")),
+            ("health_counts", ascend.get("health_counts", "unknown")),
+            ("npu_smi_version", ascend.get("npu_smi_version", "unknown")),
+            ("ascend_version", ascend.get("version", "unknown")),
+            ("hbm_total_mb_values", ascend.get("hbm_total_mb_values", "unknown")),
+            ("ecc_query_status", ecc.get("query_status", "not_collected")),
+            ("ecc_npu_count", ecc.get("npu_count", "not_collected")),
+            ("ecc_chip_count", ecc.get("chip_count", "not_collected")),
+            ("ecc_topology_signature", ecc.get("topology_signature", "not_collected")),
+            ("ecc_single_bit_current", ecc_totals.get("hbm_single_bit_error_count", "not_collected")),
+            ("ecc_double_bit_current", ecc_totals.get("hbm_double_bit_error_count", "not_collected")),
+            ("ecc_single_bit_aggregate", ecc_totals.get("hbm_single_bit_aggregate_total_err_count", "not_collected")),
+            ("ecc_double_bit_aggregate", ecc_totals.get("hbm_double_bit_aggregate_total_err_count", "not_collected")),
+            ("ecc_single_bit_isolated_pages", ecc_totals.get("hbm_single_bit_isolated_pages_count", "not_collected")),
+            ("ecc_double_bit_isolated_pages", ecc_totals.get("hbm_double_bit_isolated_pages_count", "not_collected")),
+            ("ecc_single_bit_next_isolated_pages", ecc_totals.get("hbm_single_bit_next_isolated_pages_count", "not_collected")),
+            ("ecc_double_bit_next_isolated_pages", ecc_totals.get("hbm_double_bit_next_isolated_pages_count", "not_collected")),
+            ("ecc_nonzero_chips", ecc.get("nonzero_chips", [])),
+            ("ecc_errors", ecc.get("errors", [])),
+            ("torch_version", npu_torch.get("version", "unknown")),
+            ("torch_npu_version", npu_torch.get("torch_npu_version", "unknown")),
+            ("npu_available", npu_torch.get("npu_available", "unknown")),
+            ("torch_npu_device_count", npu_torch.get("device_count", "unknown")),
+            ("ASCEND_VISIBLE_DEVICES", container.get("ascend_visible_devices", "unknown")),
+            ("hccn_tool_available", hccn_tool.get("available", "not_collected")),
+            ("hccn_tool_path", hccn_tool.get("tool_path", "missing_tool")),
+            ("dev_infiniband_exists", rdma.get("dev_infiniband_exists", "not_collected")),
+            ("rdma_hca_count", ibv.get("hca_count", "missing_tool_or_no_device")),
+            ("rdma_hca_ids", ibv.get("hca_ids", "missing_tool_or_no_device")),
+            ("rdma_sysfs_port_count", rdma_sysfs.get("port_count", "not_collected")),
+            ("rdma_sysfs_state_rates", rdma_sysfs.get("state_rates", "not_collected")),
+            ("net_interface_count", net_sysfs.get("interface_count", "not_collected")),
+            ("net_interfaces", net_sysfs.get("interfaces", "not_collected")),
+        ]
+    elif metax:
+        hca = sample.get("hca", {}) if isinstance(sample.get("hca"), dict) else {}
+        ibv = hca.get("ibv_devinfo", {}) if isinstance(hca.get("ibv_devinfo"), dict) else {}
+        sysfs = hca.get("sysfs", {}) if isinstance(hca.get("sysfs"), dict) else {}
+        metax_ecc = gpu.get("ecc", {}) if isinstance(gpu.get("ecc"), dict) else {}
+        platform_title = "MetaX / GPU Fields"
+        platform_rows = [
+            ("gpu_model_counts", metax.get("gpu_model_counts", "unknown")),
+            ("attached_gpus", metax.get("attached_gpus", "unknown")),
+            ("gpu_available_count", metax.get("gpu_available_count", "unknown")),
+            ("mx_smi_version", metax.get("mx_smi_version", "unknown")),
+            ("driver_version", metax.get("driver_version", "unknown")),
+            ("maca_version", metax.get("maca_version", "unknown")),
+            ("bios_version", metax.get("bios_version", "unknown")),
+            ("ecc_query_status", metax_ecc.get("query_status", "not_collected")),
+            ("ecc_gpu_count", metax_ecc.get("gpu_count", "not_collected")),
+            ("ecc_topology_signature", metax_ecc.get("topology_signature", "not_collected")),
+            ("ecc_all_enabled", metax_ecc.get("all_enabled", "not_collected")),
+            ("ecc_disabled_gpus", metax_ecc.get("disabled_gpus", [])),
+            ("ecc_corrected_error_gpu_count", metax_ecc.get("corrected_error_gpu_count", "not_collected")),
+            ("ecc_uncorrected_error_gpu_count", metax_ecc.get("uncorrected_error_gpu_count", "not_collected")),
+            ("ecc_corrected_event_count", metax_ecc.get("corrected_event_count", "not_collected")),
+            ("ecc_critical_event_count", metax_ecc.get("critical_event_count", "not_collected")),
+            ("ecc_corrected_error_details", metax_ecc.get("corrected_error_details", {})),
+            ("ecc_uncorrected_error_details", metax_ecc.get("uncorrected_error_details", {})),
+            ("ecc_corrected_events", metax_ecc.get("corrected_events", [])),
+            ("ecc_critical_events", metax_ecc.get("critical_events", [])),
+            ("ecc_errors", metax_ecc.get("errors", [])),
+            ("torch_version", metax_torch.get("version", "unknown")),
+            ("torch_device_count", metax_torch.get("device_count", "unknown")),
+            ("hca_count", ibv.get("hca_count", "unknown")),
+            ("hca_ids", ibv.get("hca_ids", "unknown")),
+            ("xscale_port_count", sysfs.get("xscale_port_count", "unknown")),
+            ("rdma_port_count", sysfs.get("port_count", "unknown")),
+        ]
 
     lines = [
         "## Node Environment Sample",
         "",
         "Static compare passed. The following is one representative node's software and hardware summary from `static_facts.jsonl`.",
         "",
+        "### Common Fields",
+        "",
         "| item | value |",
         "| --- | --- |",
     ]
-    lines.extend(f"| {item} | {md_cell(value)} |" for item, value in rows)
+    lines.extend(f"| {item} | {md_cell(value)} |" for item, value in common_rows)
+    lines.extend(["", f"### {platform_title}", "", "| item | value |", "| --- | --- |"])
+    if platform_rows:
+        lines.extend(f"| {item} | {md_cell(value)} |" for item, value in platform_rows)
+    else:
+        lines.append("| platform | unknown |")
     return "\n".join(lines) + "\n"
-
 
 def update_summary_files(result_dir: Path, report: dict[str, Any]) -> None:
     summary_json = result_dir / "summary.json"

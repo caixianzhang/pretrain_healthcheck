@@ -30,7 +30,7 @@ POD_JSON_FILE="${POD_JSON_FILE:-}"
 usage() {
   cat <<'EOF'
 Usage:
-  JOB_NAME=<vcjob-name> [env ...] bash scripts/metax/run_vcctl_healthcheck_with_sync.sh
+  JOB_NAME=<vcjob-name> [env ...] bash scripts/ascend/run_vcctl_healthcheck_with_sync.sh
 
 This wrapper is for jobs whose pods cannot see the developer-machine project path.
 It syncs the local project into a pod-visible shared path, runs the normal vcctl

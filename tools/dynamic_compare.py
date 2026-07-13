@@ -53,6 +53,8 @@ def compare_dynamic_results(result_dir: Path, ratio_threshold: float) -> dict[st
 
     for row in facts:
         summary = row.get("summary") or {}
+        if summary.get("summary_owner") is False:
+            continue
         if not summary.get("correctness_pass", False):
             issue = {
                 "severity": "FAIL",

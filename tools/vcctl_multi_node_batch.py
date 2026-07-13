@@ -12,7 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +40,7 @@ class GroupTask:
     pods: list[Pod]
     parent_group_id: str = ""
     attempt: int = 0
+    fault_env: dict[str, str] = field(default_factory=dict)
 
 
 def iso_now() -> str:
@@ -270,9 +271,26 @@ def phase_scale(phase: str) -> int:
         return 2
     if phase == "ep8":
         return 8
+    if phase == "final_all":
+        return 0
     if phase.startswith("scale"):
         return int(phase.removeprefix("scale"))
     raise ValueError(f"unsupported phase: {phase}")
+
+
+def phase_order_key(phase: str) -> tuple[int, str]:
+    if phase == "pairwise":
+        return (10, phase)
+    if phase == "ep8":
+        return (20, phase)
+    if phase.startswith("scale"):
+        try:
+            return (100 + int(phase.removeprefix("scale")), phase)
+        except ValueError:
+            return (500, phase)
+    if phase == "final_all":
+        return (10_000, phase)
+    return (500, phase)
 
 
 def auto_phases(node_count: int, target_scale: int) -> list[str]:
@@ -340,6 +358,8 @@ def make_pairwise_rounds(pods: list[Pod], seed: int) -> list[GroupTask]:
 def make_phase_groups(phase: str, pods: list[Pod], seed: int) -> list[GroupTask]:
     if phase == "pairwise":
         return make_pairwise_rounds(pods, seed)
+    if phase == "final_all":
+        return [GroupTask("final_all", "final_all_r1", "final_all_group_0000", pods[:])]
     size = phase_scale(phase)
     shuffled = pods[:]
     random.Random(f"{seed}:{phase}").shuffle(shuffled)
@@ -442,6 +462,35 @@ def copy_failed_summary(task: GroupTask, output_dir: Path, batch_dir: Path, reas
         )
 
 
+def link_failed_group_output(task: GroupTask, output_dir: Path, batch_dir: Path, args: argparse.Namespace) -> str:
+    if args.failed_group_output_mode != "local-link":
+        return ""
+    if args.dry_run == "1" or args.dry_run.lower() == "true":
+        return ""
+    if not output_dir.exists():
+        return ""
+    links_dir = batch_dir / "failed_group_outputs"
+    links_dir.mkdir(parents=True, exist_ok=True)
+    link_path = links_dir / task.group_id
+    if link_path.exists() or link_path.is_symlink():
+        if link_path.is_dir() and not link_path.is_symlink():
+            shutil.rmtree(link_path, ignore_errors=True)
+        else:
+            try:
+                link_path.unlink()
+            except OSError:
+                pass
+    try:
+        link_path.symlink_to(output_dir)
+        return str(link_path)
+    except OSError as exc:
+        (links_dir / f"{task.group_id}.path").write_text(
+            f"{output_dir}\nsymlink_error={type(exc).__name__}:{exc}\n",
+            encoding="utf-8",
+        )
+        return ""
+
+
 def cleanup_pass_output(output_dir: Path, args: argparse.Namespace) -> None:
     if args.keep_group_outputs == "1" or args.keep_group_outputs.lower() == "true":
         return
@@ -467,14 +516,135 @@ def status_from_summary(summary: dict[str, Any], returncode: int) -> tuple[str, 
     return "FAIL", f"overall_status={status}"
 
 
+def group_result_root(args: argparse.Namespace) -> str:
+    if args.failed_group_output_mode == "local-link" and args.dry_run not in {"1", "true"}:
+        return args.group_output_root
+    return args.result_root
+
+
+def _truthy(value: str) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _phase_matches_fault(task: GroupTask, args: argparse.Namespace) -> bool:
+    phase = str(args.batch_fault_phase or "all").strip()
+    return phase in {"", "all"} or phase == task.phase or phase == task.round_id
+
+
+def _task_matches_fault_target(task: GroupTask, args: argparse.Namespace) -> bool:
+    target_node = str(args.batch_fault_node or "").strip()
+    target_pod = str(args.batch_fault_pod or "").strip()
+    if not target_node and not target_pod:
+        return True
+    return any(
+        (target_node and pod.node_name == target_node) or (target_pod and pod.pod_name == target_pod)
+        for pod in task.pods
+    )
+
+
+def _target_fault_env(prefix: str, args: argparse.Namespace) -> dict[str, str]:
+    target_pod = str(args.batch_fault_pod or "").strip()
+    target_node = str(args.batch_fault_node or "").strip()
+    if target_pod:
+        return {f"{prefix}_POD": target_pod}
+    if target_node:
+        return {f"{prefix}_NODE": target_node}
+    return {f"{prefix}_RANK": "0"}
+
+
+def build_batch_fault_env(task: GroupTask, args: argparse.Namespace) -> dict[str, str]:
+    fault_type = str(args.batch_fault_type or "").strip().lower()
+    if not fault_type:
+        return {}
+    if not _phase_matches_fault(task, args) or not _task_matches_fault_target(task, args):
+        return {}
+    max_hits = int(args.batch_fault_max_hits)
+    if max_hits > 0 and args._batch_fault_hit_count >= max_hits:
+        return {}
+
+    env: dict[str, str] = {}
+    if fault_type == "nan":
+        env.update(_target_fault_env("FAULT_NAN", args))
+    elif fault_type == "corrupt":
+        env.update(_target_fault_env("FAULT_CORRUPT", args))
+    elif fault_type == "sleep":
+        env.update(_target_fault_env("FAULT_SLEEP", args))
+        env["FAULT_SLEEP_SECONDS"] = str(args.batch_fault_sleep_seconds)
+    elif fault_type == "join_timeout":
+        env.update(_target_fault_env("FAULT_JOIN_TIMEOUT", args))
+        env["FAULT_JOIN_TIMEOUT_SECONDS"] = str(args.batch_fault_sleep_seconds)
+    elif fault_type == "net_slow":
+        env.update(_target_fault_env("FAULT_NET_SLOW", args))
+        env["FAULT_NET_SLOW_SECONDS"] = f"{float(args.batch_fault_delay_ms) / 1000.0:.6f}"
+    elif fault_type == "rank_exit":
+        env.update(_target_fault_env("FAULT_RANK_EXIT", args))
+        env["FAULT_RANK_EXIT_CODE"] = "17"
+    elif fault_type == "backend":
+        env["FAULT_BACKEND"] = "1"
+    elif fault_type == "comm_env_bad":
+        env.update(_target_fault_env("FAULT_COMM_ENV_BAD", args))
+        env["COMM_PATH_DEBUG"] = "1"
+    elif fault_type == "eth_fallback":
+        env.update(_target_fault_env("FAULT_ETH_FALLBACK", args))
+        env["COMM_PATH_DEBUG"] = "1"
+    else:
+        raise ValueError(f"unsupported BATCH_FAULT_TYPE: {fault_type}")
+
+    if _truthy(args.comm_path_debug):
+        env["COMM_PATH_DEBUG"] = "1"
+    args._batch_fault_hit_count += 1
+    return env
+
+
+def prepare_task_fault_env(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection) -> None:
+    if task.fault_env:
+        return
+    env = build_batch_fault_env(task, args)
+    if not env:
+        return
+    task.fault_env = env
+    record_event(
+        con,
+        "batch_fault_applied",
+        task.group_id,
+        {
+            "fault_type": args.batch_fault_type,
+            "fault_phase": args.batch_fault_phase,
+            "fault_node": args.batch_fault_node,
+            "fault_pod": args.batch_fault_pod,
+            "env_keys": sorted(env.keys()),
+            "nodes": [pod.node_name for pod in task.pods],
+        },
+    )
+
+
+def comm_path_rows_from_facts(task: GroupTask, status: str, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for fact in facts:
+        summary = fact.get("comm_path_summary")
+        if not isinstance(summary, dict):
+            continue
+        for row in summary.get("rows", []) or []:
+            if not isinstance(row, dict):
+                continue
+            enriched = dict(row)
+            enriched["group_id"] = task.group_id
+            enriched["phase"] = task.phase
+            enriched["round_id"] = task.round_id
+            enriched["group_status"] = status
+            rows.append(enriched)
+    return rows
+
+
 def run_group(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection, batch_dir: Path) -> str:
     table_group(con, task, "RUNNING")
     group_json = write_group_json(task, args)
     run_stage = f"{task.phase}/{task.group_id}/multi_node_dynamic_suite"
-    output_dir = Path(args.result_root) / args.batch_run_id / run_stage
+    run_result_root = group_result_root(args)
+    output_dir = Path(run_result_root) / args.batch_run_id / run_stage
     cmd = [
         "bash",
-        str(Path(args.project_dir) / "scripts/metax/run_vcctl_healthcheck.sh"),
+        str(Path(args.healthcheck_script)),
     ]
     env = os.environ.copy()
     env.update(
@@ -490,11 +660,15 @@ def run_group(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection
             "PRE_CLEAN": args.pre_clean,
             "DYNAMIC_COMPARE": args.dynamic_compare,
             "EXEC_TIMEOUT_SECONDS": str(args.group_timeout_seconds),
-            "RESULT_ROOT": args.result_root,
+            "RESULT_ROOT": run_result_root,
         }
     )
     if args.pod_project_dir:
         env["PROJECT_REMOTE_DIR"] = args.pod_project_dir
+    if _truthy(args.comm_path_debug):
+        env["COMM_PATH_DEBUG"] = "1"
+    if task.fault_env:
+        env.update(task.fault_env)
 
     started = time.monotonic()
     print(
@@ -541,11 +715,23 @@ def run_group(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection
         for row in facts
         if isinstance(row.get("pod"), dict)
     }
+    comm_path_rows = comm_path_rows_from_facts(task, status, facts)
     metrics = {
         "summary": summary.get("dynamic_compare") or {},
         "pod_count": summary.get("pod_count"),
         "result_count": summary.get("result_count"),
+        "driver_group_output_dir": str(output_dir),
     }
+    if task.fault_env:
+        metrics["batch_fault"] = {
+            "type": args.batch_fault_type,
+            "phase": args.batch_fault_phase,
+            "node": args.batch_fault_node,
+            "pod": args.batch_fault_pod,
+            "env_keys": sorted(task.fault_env.keys()),
+        }
+    if comm_path_rows:
+        metrics["comm_path_summary"] = comm_path_rows
     con.execute("update groups set status=? where group_id=?", (status, task.group_id))
     con.execute(
         """
@@ -573,6 +759,18 @@ def run_group(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection
             add_suspect(con, pod.node_name, task.phase, f"{task.group_id}:{reason}")
         con.commit()
         copy_failed_summary(task, output_dir, batch_dir, reason)
+        failed_output_link = link_failed_group_output(task, output_dir, batch_dir, args)
+        if failed_output_link:
+            metrics["shared_failed_output_link"] = failed_output_link
+            con.execute(
+                """
+                update group_results
+                set metrics_json=?
+                where id=(select max(id) from group_results where group_id=?)
+                """,
+                (json.dumps(metrics, ensure_ascii=False, sort_keys=True), task.group_id),
+            )
+            con.commit()
     if args.keep_group_outputs not in {"1", "true"} and args.dry_run not in {"1", "true"}:
         try:
             group_json.unlink()
@@ -657,6 +855,7 @@ def run_retests(
             ),
         )
         con.commit()
+        prepare_task_fault_env(task, args, con)
         status = run_group(task, args, con, batch_dir)
         con.execute("update retest_tasks set status=? where task_id=?", (status, task.group_id))
         con.commit()
@@ -694,10 +893,30 @@ def run_phase(
     candidates = phase_pass_nodes(con, pods)
     if phase == "pairwise":
         candidates = [pod for pod in pods if node_status(con, pod.node_name) not in {"FAIL", "EXCLUDED"}]
-    size = phase_scale(phase)
-    if len(candidates) < size:
-        print(f"[batch-healthcheck] phase_skip phase={phase} reason=not_enough_pass_nodes need={size} have={len(candidates)}")
-        return False
+    if phase == "final_all":
+        if len(candidates) <= 2:
+            print(
+                f"[batch-healthcheck] phase_skip phase={phase} "
+                f"reason=covered_by_pairwise have={len(candidates)}",
+                flush=True,
+            )
+            record_event(con, "phase_skip", phase, {"reason": "covered_by_pairwise", "candidates": len(candidates)})
+            return True
+    else:
+        size = phase_scale(phase)
+        if len(candidates) < size:
+            print(
+                f"[batch-healthcheck] phase_skip phase={phase} reason=not_enough_pass_nodes "
+                f"need={size} have={len(candidates)}",
+                flush=True,
+            )
+            record_event(
+                con,
+                "phase_skip",
+                phase,
+                {"reason": "not_enough_pass_nodes", "need": size, "candidates": len(candidates)},
+            )
+            return False
     tasks = make_phase_groups(phase, candidates, args.group_seed)
     print(f"[batch-healthcheck] phase_start phase={phase} groups={len(tasks)} candidates={len(candidates)}", flush=True)
     record_event(con, "phase_start", phase, {"groups": len(tasks), "candidates": len(candidates)})
@@ -715,6 +934,7 @@ def run_phase(
                 skipped_pass += 1
                 passed += 1
                 continue
+            prepare_task_fault_env(task, args, con)
             runnable.append(task)
         if not runnable:
             print(
@@ -826,9 +1046,10 @@ def write_group_plan_files(con: sqlite3.Connection, batch_dir: Path) -> None:
         """
         select phase,round_id,group_id,group_size,nodes_json,status,parent_group_id,attempt
         from groups
-        order by phase,round_id,group_id
+        order by round_id,group_id
         """
     ).fetchall()
+    rows = sorted(rows, key=lambda row: (*phase_order_key(str(row[0])), str(row[1]), str(row[2])))
     jsonl_rows: list[dict[str, Any]] = []
     md_lines = [
         "# Batch Group Plan",
@@ -873,10 +1094,75 @@ def write_group_plan_files(con: sqlite3.Connection, batch_dir: Path) -> None:
     (batch_dir / "group_plan.md").write_text("\n".join(md_lines) + "\n", encoding="utf-8")
 
 
+def write_comm_path_summary_files(con: sqlite3.Connection, batch_dir: Path) -> None:
+    rows = con.execute(
+        """
+        select group_id,status,metrics_json,created_at
+        from group_results
+        order by id
+        """
+    ).fetchall()
+    comm_rows: list[dict[str, Any]] = []
+    for group_id, status, metrics_json, created_at in rows:
+        try:
+            metrics = json.loads(metrics_json or "{}")
+        except json.JSONDecodeError:
+            metrics = {}
+        for row in metrics.get("comm_path_summary", []) or []:
+            if not isinstance(row, dict):
+                continue
+            item = dict(row)
+            item.setdefault("group_id", group_id)
+            item.setdefault("group_status", status)
+            item["created_at"] = created_at
+            comm_rows.append(item)
+    if not comm_rows:
+        return
+    (batch_dir / "comm_path_summary.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in comm_rows),
+        encoding="utf-8",
+    )
+    md_lines = [
+        "# Communication Path Summary",
+        "",
+        "| group | status | rank | pod | node | backend | runtime | key envs |",
+        "| --- | --- | ---: | --- | --- | --- | --- | --- |",
+    ]
+    for row in comm_rows:
+        env = row.get("env") if isinstance(row.get("env"), dict) else {}
+        key_envs = []
+        for key in [
+            "MCCL_IB_HCA",
+            "MCCL_IB_GID_INDEX",
+            "MCCL_SOCKET_IFNAME",
+            "MCCL_IB_DISABLE",
+            "NCCL_IB_DISABLE",
+            "NCCL_SOCKET_IFNAME",
+            "HCCL_SOCKET_IFNAME",
+            "GLOO_SOCKET_IFNAME",
+        ]:
+            if key in env:
+                key_envs.append(f"{key}={env[key]}")
+        md_lines.append(
+            "| {group} | {status} | {rank} | {pod} | {node} | {backend} | {runtime} | {envs} |".format(
+                group=row.get("group_id", ""),
+                status=row.get("group_status", ""),
+                rank=row.get("rank", ""),
+                pod=row.get("pod_name", ""),
+                node=row.get("node_name", ""),
+                backend=row.get("dist_backend", ""),
+                runtime=row.get("comm_runtime", ""),
+                envs="<br>".join(key_envs),
+            )
+        )
+    (batch_dir / "comm_path_summary.md").write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+
+
 def write_batch_summary(con: sqlite3.Connection, batch_dir: Path, args: argparse.Namespace, overall: str) -> None:
     phase_rows = con.execute(
-        "select phase,status,count(*) from groups group by phase,status order by phase,status"
+        "select phase,status,count(*) from groups group by phase,status order by status"
     ).fetchall()
+    phase_rows = sorted(phase_rows, key=lambda row: (*phase_order_key(str(row[0])), str(row[1])))
     node_rows = con.execute("select status,count(*) from nodes group by status order by status").fetchall()
     summary = {
         "overall_status": overall,
@@ -914,6 +1200,7 @@ def write_batch_summary(con: sqlite3.Connection, batch_dir: Path, args: argparse
             "- `suspect_nodes.txt`",
             "- `fail_nodes.txt`",
             "- `node_map.txt`",
+            "- `comm_path_summary.md` when COMM_PATH_DEBUG=1 produced data",
         ]
     )
     (batch_dir / "batch_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -938,6 +1225,27 @@ def cleanup_batch_tmp(args: argparse.Namespace) -> None:
         pass
 
 
+def cleanup_empty_group_output_root(args: argparse.Namespace) -> None:
+    if args.failed_group_output_mode != "local-link":
+        return
+    if args.dry_run in {"1", "true"}:
+        return
+    root = Path(args.group_output_root) / args.batch_run_id
+    if not root.exists():
+        return
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if not path.is_dir():
+            continue
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+    try:
+        root.rmdir()
+    except OSError:
+        pass
+
+
 def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     if not args.batch_run_id:
         args.batch_run_id = time.strftime("%Y%m%d_%H%M%S")
@@ -946,12 +1254,23 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     args.group_timeout_seconds = int(args.group_timeout_seconds)
     args.progress_interval_seconds = int(args.progress_interval_seconds)
     args.phase_group_concurrency = int(args.phase_group_concurrency)
+    args.batch_fault_type = str(args.batch_fault_type or "").strip().lower()
+    args.batch_fault_phase = str(args.batch_fault_phase or "all").strip()
+    args.batch_fault_max_hits = int(args.batch_fault_max_hits)
+    args.batch_fault_sleep_seconds = float(args.batch_fault_sleep_seconds)
+    args.batch_fault_delay_ms = float(args.batch_fault_delay_ms)
+    args.comm_path_debug = str(args.comm_path_debug or "0").strip()
+    args._batch_fault_hit_count = 0
+    args.failed_group_output_mode = str(args.failed_group_output_mode or "local-link").strip()
+    if args.failed_group_output_mode not in {"local-link", "shared"}:
+        raise ValueError("failed_group_output_mode must be local-link or shared")
     return args
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="vcctl multi-node grouped healthcheck batch runner")
     parser.add_argument("--project-dir", required=True)
+    parser.add_argument("--healthcheck-script", default="")
     parser.add_argument("--job-name", required=True)
     parser.add_argument("--namespace", default="default")
     parser.add_argument("--vcctl-bin", default="vcctl")
@@ -969,16 +1288,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dynamic-compare", default="1")
     parser.add_argument("--keep-group-outputs", default="0")
     parser.add_argument("--pod-project-dir", default="")
+    parser.add_argument("--group-output-root", default="/tmp/pretrain_healthcheck_group_outputs/vcctl")
+    parser.add_argument("--failed-group-output-mode", default="local-link", choices=["local-link", "shared"])
+    parser.add_argument("--batch-fault-type", default="")
+    parser.add_argument("--batch-fault-node", default="")
+    parser.add_argument("--batch-fault-pod", default="")
+    parser.add_argument("--batch-fault-phase", default="all")
+    parser.add_argument("--batch-fault-max-hits", default="0")
+    parser.add_argument("--batch-fault-sleep-seconds", default="300")
+    parser.add_argument("--batch-fault-delay-ms", default="200")
+    parser.add_argument("--comm-path-debug", default="0")
     parser.add_argument("--resume", action="store_true")
     return parser
 
 
 def main() -> int:
     args = normalize_args(build_parser().parse_args())
+    if not args.healthcheck_script:
+        args.healthcheck_script = str(Path(args.project_dir) / "scripts/metax/run_vcctl_healthcheck.sh")
     result_root = Path(args.result_root)
     batch_dir = result_root / args.batch_run_id
     batch_dir.mkdir(parents=True, exist_ok=True)
     args.batch_tmp_dir = str(Path("/tmp") / f"pretrain_healthcheck_batch_{args.batch_run_id}")
+    if args.failed_group_output_mode == "local-link" and args.dry_run not in {"1", "true"}:
+        Path(args.group_output_root, args.batch_run_id).mkdir(parents=True, exist_ok=True)
     db_path = batch_dir / "batch_results.sqlite"
     args.db_path = str(db_path)
 
@@ -986,20 +1319,32 @@ def main() -> int:
     con = init_db(db_path)
     upsert_pods(con, pods)
     phases = parse_phases(args.phases, len(pods), args.target_scale)
+    run_phases = phases[:] if "final_all" in phases else phases + ["final_all"]
 
     print(f"[batch-healthcheck] job          : {args.job_name}")
     print(f"[batch-healthcheck] batch_run_id : {args.batch_run_id}")
     print(f"[batch-healthcheck] node_count   : {len(pods)}")
-    print(f"[batch-healthcheck] phases       : {','.join(phases)}")
+    print(f"[batch-healthcheck] phases       : {','.join(run_phases)}")
     print(f"[batch-healthcheck] target_scale : {args.target_scale or 'auto'}")
     print(f"[batch-healthcheck] group_timeout: {args.group_timeout_seconds}s")
     print(f"[batch-healthcheck] concurrency  : {args.phase_group_concurrency or 'all groups per round'}")
+    print(f"[batch-healthcheck] group outputs: {args.failed_group_output_mode}")
+    if args.failed_group_output_mode == "local-link":
+        print(f"[batch-healthcheck] group output root: {Path(args.group_output_root) / args.batch_run_id}")
+    if args.batch_fault_type:
+        print(
+            f"[batch-healthcheck] batch_fault : type={args.batch_fault_type} "
+            f"phase={args.batch_fault_phase} node={args.batch_fault_node or '-'} "
+            f"pod={args.batch_fault_pod or '-'} max_hits={args.batch_fault_max_hits}"
+        )
+    if _truthy(args.comm_path_debug):
+        print("[batch-healthcheck] comm_path_debug: 1")
     print(f"[batch-healthcheck] result_dir   : {batch_dir}")
     print(f"[batch-healthcheck] sqlite       : {db_path}")
-    record_event(con, "batch_start", args.batch_run_id, {"phases": phases, "node_count": len(pods)})
+    record_event(con, "batch_start", args.batch_run_id, {"phases": run_phases, "node_count": len(pods)})
 
     overall = "PASS"
-    for phase in phases:
+    for phase in run_phases:
         if not run_phase(phase, pods, args, con, batch_dir):
             overall = "SUSPECT"
             break
@@ -1012,8 +1357,10 @@ def main() -> int:
         overall = "SUSPECT"
     write_node_files(con, batch_dir)
     write_group_plan_files(con, batch_dir)
+    write_comm_path_summary_files(con, batch_dir)
     write_batch_summary(con, batch_dir, args, overall)
     cleanup_batch_tmp(args)
+    cleanup_empty_group_output_root(args)
     record_event(con, "batch_done", args.batch_run_id, {"overall_status": overall})
     print(f"[batch-healthcheck] batch_done overall_status={overall}")
     print(f"[batch-healthcheck] pass_nodes={batch_dir / 'pass_nodes.txt'}")

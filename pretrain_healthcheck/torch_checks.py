@@ -23,6 +23,8 @@ class DistEnv:
     device_vendor: str
     comm_runtime: str
     group_id: str
+    pod_name: str
+    node_name: str
 
 
 def _import_torch():
@@ -36,6 +38,9 @@ def _import_torch():
 
 
 def _resolve_dist_backend() -> tuple[str, str]:
+    if _dynamic_pre_fault_matches("backend_fail"):
+        requested = os.environ.get("DIST_BACKEND", "nccl").strip().lower()
+        return requested, "__dynamic_fault_invalid_backend__"
     if os.environ.get("FAULT_BACKEND", "").lower() in {"1", "true", "yes", "on"}:
         requested = os.environ.get("DIST_BACKEND", "nccl").strip().lower()
         return requested, "__fault_invalid_backend__"
@@ -78,20 +83,43 @@ def _runtime_meta(backend: str) -> tuple[str, str]:
     return vendor, runtime
 
 
+def _device_api(torch: Any, backend: str, vendor: str) -> tuple[str, Any]:
+    if backend == "hccl" or vendor in {"ascend", "npu"}:
+        npu = getattr(torch, "npu", None)
+        if npu is None:
+            raise RuntimeError("torch_npu is required for Ascend/NPU dynamic checks")
+        return "npu", npu
+    return "cuda", torch.cuda
+
+
+def _synchronize(torch: Any) -> None:
+    npu = getattr(torch, "npu", None)
+    if npu is not None:
+        try:
+            if npu.is_available():
+                npu.synchronize()
+                return
+        except Exception:
+            pass
+    torch.cuda.synchronize()
+
+
 def init_dist() -> tuple[Any, Any, DistEnv]:
+    _maybe_fault_before_dist_init()
     torch, dist = _import_torch()
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available")
+    backend_requested, backend = _resolve_dist_backend()
+    device_vendor, comm_runtime = _runtime_meta(backend)
+    _maybe_import_backend_extension(backend)
+    device_type, device_api = _device_api(torch, backend, device_vendor)
+    if not device_api.is_available():
+        raise RuntimeError(f"{device_type.upper()} is not available")
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(torch.cuda.device_count())))
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-    backend_requested, backend = _resolve_dist_backend()
-    device_vendor, comm_runtime = _runtime_meta(backend)
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(device_api.device_count())))
+    device_api.set_device(local_rank)
+    device = torch.device(device_type, local_rank)
     group_id = os.environ.get("HEALTHCHECK_GROUP_ID") or os.environ.get("HC_GROUP_ID") or ""
-    _maybe_import_backend_extension(backend)
     if not dist.is_initialized():
         try:
             dist.init_process_group(backend=backend)
@@ -103,17 +131,19 @@ def init_dist() -> tuple[Any, Any, DistEnv]:
                 f"registered_backends={registered}: {exc}"
             ) from exc
     return torch, dist, DistEnv(
-        rank,
-        local_rank,
-        world_size,
-        local_world_size,
-        device,
-        hostname(),
-        backend_requested,
-        backend,
-        device_vendor,
-        comm_runtime,
-        group_id,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        local_world_size=local_world_size,
+        device=device,
+        hostname=hostname(),
+        dist_backend_requested=backend_requested,
+        dist_backend=backend,
+        device_vendor=device_vendor,
+        comm_runtime=comm_runtime,
+        group_id=group_id,
+        pod_name=os.environ.get("HC_POD_NAME", ""),
+        node_name=os.environ.get("HC_NODE_NAME", ""),
     )
 
 
@@ -122,19 +152,131 @@ def _rank_matches_env(env_name: str, rank: int) -> bool:
     return bool(value) and value == str(rank)
 
 
+def _name_matches_env(env_name: str, value: str) -> bool:
+    target = os.environ.get(env_name, "").strip()
+    return bool(target) and bool(value) and target == value
+
+
+def _fault_target_matches(prefix: str, env: DistEnv) -> bool:
+    return (
+        _rank_matches_env(f"{prefix}_RANK", env.rank)
+        or _name_matches_env(f"{prefix}_POD", env.pod_name)
+        or _name_matches_env(f"{prefix}_NODE", env.node_name)
+    )
+
+
+def _pre_dist_fault_target_matches(prefix: str) -> bool:
+    rank = int(os.environ.get("RANK", "-1"))
+    return (
+        _rank_matches_env(f"{prefix}_RANK", rank)
+        or _name_matches_env(f"{prefix}_POD", os.environ.get("HC_POD_NAME", ""))
+        or _name_matches_env(f"{prefix}_NODE", os.environ.get("HC_NODE_NAME", ""))
+    )
+
+
+def _dynamic_fault_type() -> str:
+    return os.environ.get("DYNAMIC_FAULT_TYPE", "").strip().lower().replace("-", "_")
+
+
+def _dynamic_pod_target_matches() -> bool:
+    pod_target = os.environ.get("DYNAMIC_FAULT_POD", "").strip()
+    node_target = os.environ.get("DYNAMIC_FAULT_NODE", "").strip()
+    if pod_target and pod_target != os.environ.get("HC_POD_NAME", "").strip():
+        return False
+    if node_target and node_target != os.environ.get("HC_NODE_NAME", "").strip():
+        return False
+    return True
+
+
+def _dynamic_local_rank_matches(local_rank: int) -> bool:
+    target = os.environ.get("DYNAMIC_FAULT_LOCAL_RANK", os.environ.get("DYNAMIC_FAULT_RANK", "")).strip()
+    return not target or target == str(local_rank)
+
+
+def _dynamic_pre_fault_matches(fault_type: str) -> bool:
+    if _dynamic_fault_type() != fault_type:
+        return False
+    try:
+        local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    except ValueError:
+        local_rank = -1
+    return _dynamic_pod_target_matches() and _dynamic_local_rank_matches(local_rank)
+
+
+def _dynamic_fault_matches(env: DistEnv, fault_type: str) -> bool:
+    return (
+        _dynamic_fault_type() == fault_type
+        and _dynamic_pod_target_matches()
+        and _dynamic_local_rank_matches(env.local_rank)
+    )
+
+
+def _maybe_fault_before_dist_init() -> None:
+    if _dynamic_pre_fault_matches("sleep_timeout"):
+        time.sleep(float(os.environ.get("DYNAMIC_FAULT_SLEEP_SECONDS", os.environ.get("FAULT_SLEEP_SECONDS", "300"))))
+    if _pre_dist_fault_target_matches("FAULT_COMM_ENV_BAD"):
+        os.environ["MCCL_IB_HCA"] = "__fault_bad_hca__"
+        os.environ["MCCL_IB_GID_INDEX"] = "999"
+        os.environ["MCCL_SOCKET_IFNAME"] = "__fault_bad_ifname__"
+        os.environ["NCCL_IB_HCA"] = "__fault_bad_hca__"
+        os.environ["NCCL_SOCKET_IFNAME"] = "__fault_bad_ifname__"
+        os.environ["HCCL_SOCKET_IFNAME"] = "__fault_bad_ifname__"
+        os.environ["GLOO_SOCKET_IFNAME"] = "__fault_bad_ifname__"
+    if _pre_dist_fault_target_matches("FAULT_ETH_FALLBACK"):
+        os.environ["MCCL_SOCKET_IFNAME"] = "eth0"
+        os.environ["NCCL_SOCKET_IFNAME"] = "eth0"
+        os.environ["HCCL_SOCKET_IFNAME"] = "eth0"
+        os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
+        os.environ["NCCL_IB_DISABLE"] = "1"
+        os.environ["MCCL_IB_DISABLE"] = "1"
+    if _pre_dist_fault_target_matches("FAULT_JOIN_TIMEOUT"):
+        seconds = float(os.environ.get("FAULT_JOIN_TIMEOUT_SECONDS", os.environ.get("FAULT_SLEEP_SECONDS", "300")))
+        time.sleep(seconds)
+    if _pre_dist_fault_target_matches("FAULT_RANK_EXIT"):
+        raise SystemExit(int(os.environ.get("FAULT_RANK_EXIT_CODE", "17")))
+
+
 def _maybe_fault_sleep(env: DistEnv) -> None:
-    if _rank_matches_env("FAULT_SLEEP_RANK", env.rank):
+    if _dynamic_fault_matches(env, "sleep_timeout"):
+        time.sleep(float(os.environ.get("DYNAMIC_FAULT_SLEEP_SECONDS", os.environ.get("FAULT_SLEEP_SECONDS", "300"))))
+    if _dynamic_fault_matches(env, "slow_rank"):
+        time.sleep(float(os.environ.get("DYNAMIC_FAULT_SLEEP_SECONDS", "0.2")))
+    if _fault_target_matches("FAULT_SLEEP", env):
         time.sleep(float(os.environ.get("FAULT_SLEEP_SECONDS", "30")))
+    if _fault_target_matches("FAULT_NET_SLOW", env):
+        time.sleep(float(os.environ.get("FAULT_NET_SLOW_SECONDS", "0.2")))
 
 
 def _apply_faults(torch: Any, env: DistEnv, tensor: Any) -> Any:
-    if _rank_matches_env("FAULT_NAN_RANK", env.rank) and tensor.numel() > 0:
+    if _dynamic_fault_matches(env, "nan") and tensor.numel() > 0:
         tensor = tensor.clone()
         tensor.reshape(-1)[0] = float("nan")
-    if _rank_matches_env("FAULT_CORRUPT_RANK", env.rank) and tensor.numel() > 0:
+    if _dynamic_fault_matches(env, "corrupt") and tensor.numel() > 0:
+        tensor = tensor.clone()
+        tensor.reshape(-1)[0] = tensor.reshape(-1)[0] + torch.ones((), device=env.device, dtype=tensor.dtype)
+    if _fault_target_matches("FAULT_NAN", env) and tensor.numel() > 0:
+        tensor = tensor.clone()
+        tensor.reshape(-1)[0] = float("nan")
+    if _fault_target_matches("FAULT_CORRUPT", env) and tensor.numel() > 0:
         tensor = tensor.clone()
         tensor.reshape(-1)[0] = tensor.reshape(-1)[0] + torch.ones((), device=env.device, dtype=tensor.dtype)
     return tensor
+
+
+def _fault_error_type(env: DistEnv, default: str = "") -> str:
+    if _dynamic_fault_matches(env, "nan"):
+        return "DynamicFaultInjectedNaN"
+    if _dynamic_fault_matches(env, "corrupt"):
+        return "DynamicFaultInjectedCorrupt"
+    if _dynamic_fault_matches(env, "sleep_timeout"):
+        return "DynamicFaultInjectedSleepTimeout"
+    if _fault_target_matches("FAULT_NAN", env):
+        return "FaultInjectedNaN"
+    if _fault_target_matches("FAULT_CORRUPT", env):
+        return "FaultInjectedCorrupt"
+    if _fault_target_matches("FAULT_NET_SLOW", env):
+        return "FaultInjectedNetSlow"
+    return default
 
 
 def _dtype(torch: Any, name: str) -> Any:
@@ -151,10 +293,10 @@ def _dtype(torch: Any, name: str) -> Any:
 
 
 def _sync_time(torch: Any, fn) -> float:
-    torch.cuda.synchronize()
+    _synchronize(torch)
     start = time.perf_counter()
     fn()
-    torch.cuda.synchronize()
+    _synchronize(torch)
     return time.perf_counter() - start
 
 
@@ -176,6 +318,69 @@ def _all_gather_object(dist: Any, obj: Any, world_size: int) -> list[Any]:
     gathered = [None for _ in range(world_size)]
     dist.all_gather_object(gathered, obj)
     return gathered
+
+
+def _comm_env_snapshot() -> dict[str, str]:
+    prefixes = (
+        "MCCL_",
+        "NCCL_",
+        "HCCL_",
+        "ASCEND_",
+        "GLOO_",
+    )
+    names = {
+        "DIST_BACKEND",
+        "DEVICE_VENDOR",
+        "COMM_RUNTIME",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "RANK",
+        "WORLD_SIZE",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "CUDA_VISIBLE_DEVICES",
+        "ASCEND_VISIBLE_DEVICES",
+    }
+    return {
+        key: value
+        for key, value in sorted(os.environ.items())
+        if key in names or key.endswith("_SOCKET_IFNAME") or key.endswith("_IB_HCA") or key.startswith(prefixes)
+    }
+
+
+def _write_comm_path_debug(dist: Any, env: DistEnv, output_dir: Path, label: str) -> None:
+    if os.environ.get("COMM_PATH_DEBUG", "").lower() not in {"1", "true", "yes", "on"}:
+        return
+    row = {
+        "label": label,
+        "rank": env.rank,
+        "local_rank": env.local_rank,
+        "world_size": env.world_size,
+        "hostname": env.hostname,
+        "pod_name": env.pod_name,
+        "node_name": env.node_name,
+        "dist_backend_requested": env.dist_backend_requested,
+        "dist_backend": env.dist_backend,
+        "device_vendor": env.device_vendor,
+        "comm_runtime": env.comm_runtime,
+        "env": _comm_env_snapshot(),
+    }
+    gathered = _all_gather_object(dist, row, env.world_size)
+    if env.rank != 0:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows = [item for item in gathered if isinstance(item, dict)]
+    append_jsonl(output_dir / "comm_path_summary.jsonl", rows)
+    write_json(
+        output_dir / "comm_path_summary.json",
+        {
+            "schema_version": 1,
+            "label": label,
+            "rank_count": len(rows),
+            "nodes": sorted({str(item.get("node_name", "")) for item in rows}),
+            "rows": rows,
+        },
+    )
 
 
 def _summary_from_rank_rows(
@@ -424,16 +629,16 @@ def run_bandwidth_gate(
 
         for _ in range(max(0, warmup)):
             dist.all_reduce(tensor)
-        torch.cuda.synchronize()
+        _synchronize(torch)
         dist.barrier(device_ids=[env.local_rank])
 
         local_rows: list[dict[str, Any]] = []
         for idx in range(max(1, iters)):
             _maybe_fault_sleep(env)
-            torch.cuda.synchronize()
+            _synchronize(torch)
             start = time.perf_counter()
             dist.all_reduce(tensor)
-            torch.cuda.synchronize()
+            _synchronize(torch)
             elapsed = time.perf_counter() - start
             algbw = (size / max(elapsed, 1e-12)) / 1e9
             busbw = algbw * 2 * max(0, env.world_size - 1) / max(1, env.world_size)
@@ -736,13 +941,13 @@ def _collective_bandwidth_case(
             input_split_sizes=input_split_sizes,
             output_split_sizes=output_split_sizes,
         )
-    torch.cuda.synchronize()
+    _synchronize(torch)
     dist.barrier(device_ids=[env.local_rank])
 
     local_rows: list[dict[str, Any]] = []
     for idx in range(max(1, iters)):
         _maybe_fault_sleep(env)
-        torch.cuda.synchronize()
+        _synchronize(torch)
         start = time.perf_counter()
         _collective_bandwidth_once(
             torch,
@@ -756,7 +961,7 @@ def _collective_bandwidth_case(
             input_split_sizes=input_split_sizes,
             output_split_sizes=output_split_sizes,
         )
-        torch.cuda.synchronize()
+        _synchronize(torch)
         elapsed = time.perf_counter() - start
         algbw = (effective_message_size / max(elapsed, 1e-12)) / 1e9
         busbw = algbw * _busbw_factor(op, collective_group_size)
@@ -999,6 +1204,7 @@ def run_dynamic_suite(
     torch, dist, env = init_dist()
     output_dir.mkdir(parents=True, exist_ok=True)
     env.group_id = group_id or env.group_id or f"{test_round}-{env.hostname}"
+    _write_comm_path_debug(dist, env, output_dir, "dynamic-suite")
 
     real_destroy = dist.destroy_process_group
 
@@ -1098,7 +1304,7 @@ def _run_distributed_checks(
         c = _apply_faults(torch, env, a @ b)
         nan_count, inf_count = _nan_inf_counts(torch, c)
         flops = 2.0 * n * n * n
-        error_type = "FaultInjectedCorrupt" if _rank_matches_env("FAULT_CORRUPT_RANK", env.rank) else ""
+        error_type = _fault_error_type(env)
         rows.append(
             _rank_row(
                 env,
@@ -1125,7 +1331,7 @@ def _run_distributed_checks(
         elapsed = _sync_time(torch, lambda: _repeat(lambda: (_maybe_fault_sleep(env), y.copy_(x))[1], iters)) / max(1, iters)
         checked = _apply_faults(torch, env, y)
         nan_count, inf_count = _nan_inf_counts(torch, checked)
-        error_type = "FaultInjectedCorrupt" if _rank_matches_env("FAULT_CORRUPT_RANK", env.rank) else ""
+        error_type = _fault_error_type(env)
         rows.append(
             _rank_row(
                 env,
@@ -1179,6 +1385,8 @@ def _rank_row(
     return {
         "group_id": env.group_id or f"group-{env.hostname}",
         "hostname": env.hostname,
+        "pod_name": env.pod_name,
+        "node_name": env.node_name,
         "rank": env.rank,
         "local_rank": env.local_rank,
         "gpu_id": env.local_rank,
@@ -1267,8 +1475,7 @@ def _run_collective(
         y = _apply_faults(torch, env, once())
         nan_count, inf_count = _nan_inf_counts(torch, y)
         checksum = _tensor_checksum(y)
-        if _rank_matches_env("FAULT_CORRUPT_RANK", env.rank):
-            error_type = "FaultInjectedCorrupt"
+        error_type = _fault_error_type(env, error_type)
     except Exception as exc:
         elapsed = 0.0
         nan_count = 0
@@ -1332,8 +1539,7 @@ def _run_all_to_allv_pattern(
         y = _apply_faults(torch, env, once())
         nan_count, inf_count = _nan_inf_counts(torch, y)
         checksum = _tensor_checksum(y)
-        if _rank_matches_env("FAULT_CORRUPT_RANK", env.rank):
-            error_type = "FaultInjectedCorrupt"
+        error_type = _fault_error_type(env, error_type)
     except Exception as exc:
         elapsed = 0.0
         nan_count = 0

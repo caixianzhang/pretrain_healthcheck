@@ -62,7 +62,7 @@ pretrain_healthcheck/
 在开发机或可执行 `vcctl` 的环境中运行：
 
 ```bash
-cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck/scripts/metax
+cd <pretrain_healthcheck>/scripts/metax
 
 DRY_RUN=0 \
 MODE=all \
@@ -83,7 +83,7 @@ GPUS_PER_NODE=8
 DIST_BACKEND=nccl
 DEVICE_VENDOR=metax
 COMM_RUNTIME=mccl
-RESULT_ROOT=/afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck/results/vcctl
+RESULT_ROOT=<pretrain_healthcheck>/results/vcctl
 ```
 
 说明：
@@ -130,7 +130,7 @@ bash run_vcctl_healthcheck.sh
 用于快速确认开发机可以通过 `vcctl` 控制 pod，两个 pod 可以拉起 `torchrun`，并完成最小 `all_reduce`。
 
 ```bash
-cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck/scripts/metax
+cd <pretrain_healthcheck>/scripts/metax
 
 DRY_RUN=0 MODE=multi-node PROFILE=smoke bash run_vcctl_healthcheck.sh
 ```
@@ -190,7 +190,7 @@ results/vcctl/<RUN_ID>/multi_node/
 用于确认通信库实际可见的 HCA / rail、端口状态、IB counter 是否在 All-Reduce 前后增长，并采集 `MCCL_DEBUG` / `NCCL_DEBUG` 日志。
 
 ```bash
-cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck/scripts/metax
+cd <pretrain_healthcheck>/scripts/metax
 
 DRY_RUN=0 bash run_vcctl_comm_probe.sh
 ```
@@ -206,7 +206,7 @@ DRY_RUN=0 bash run_vcctl_comm_probe.sh
 输出默认写入：
 
 ```text
-/afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck/results/vcctl_comm_probe/<RUN_ID>/
+<pretrain_healthcheck>/results/vcctl_comm_probe/<RUN_ID>/
 ```
 
 主要看每个 pod 的：
@@ -556,7 +556,7 @@ bash run_vcctl_healthcheck.sh
 ### 11.1 MetaX C550 单节点 8 卡
 
 ```bash
-cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck
+cd <pretrain_healthcheck>
 
 bash scripts/metax/run_single_node_8c550.sh
 ```
@@ -581,7 +581,7 @@ bash scripts/metax/run_single_node_8c550.sh
 NVIDIA 脚本保留用于单节点开发验证：
 
 ```bash
-cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck
+cd <pretrain_healthcheck>
 
 bash scripts/nvidia/dry_run_single_node_6h200.sh
 bash scripts/nvidia/run_single_node_6h200.sh
@@ -594,7 +594,7 @@ bash scripts/nvidia/run_single_node_6h200.sh
 ### 12.1 MetaX pod 能力探测
 
 ```bash
-cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck
+cd <pretrain_healthcheck>
 
 bash scripts/metax/probe_pod_capabilities.sh
 ```
@@ -643,7 +643,7 @@ ${RESULT_ROOT}/${RUN_ID}/${STAGE}/
 MetaX 默认：
 
 ```text
-/afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck/results/vcctl/<RUN_ID>/<STAGE>/
+<pretrain_healthcheck>/results/vcctl/<RUN_ID>/<STAGE>/
 ```
 
 阶段目录映射：
@@ -704,7 +704,7 @@ MODE=all         -> static/ + single_node/ + multi_node/
 | `NAMESPACE` | `default` | namespace |
 | `MODE` | `all` | `static`、`single-node`、`multi-node`、`all` |
 | `DEVICE_TYPE` | `metax` | 结果元信息，例如 `gpu`、`npu`、`metax` |
-| `PROJECT_REMOTE_DIR` | `/afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck` | pod 内项目路径 |
+| `PROJECT_REMOTE_DIR` | `<project>` | pod 内项目路径，默认按脚本所在项目根目录推导 |
 | `PROFILE` | `quick` | `quick`、`smoke`、`bandwidth` 或 `collective-bandwidth` |
 | `PRE_CLEAN` | `1` | 每次测试前清理可能残留的健康检查进程 |
 | `GPUS_PER_NODE` | `8` | 每个 pod / 节点的 GPU 数 |
@@ -744,7 +744,7 @@ MODE=all         -> static/ + single_node/ + multi_node/
 | `COLLECTIVE_BANDWIDTH_AVG_BUSBW` | `0` | `PROFILE=collective-bandwidth` 的平均 BusBW gate，单位 GB/s |
 | `COLLECTIVE_BANDWIDTH_EP_SIZE` | `8` | `PROFILE=collective-bandwidth` 中 `all_to_allv` 的 EP group size |
 | `SEED` | `20260623` | 随机种子 |
-| `RESULT_ROOT` | `/afs-a3-weight-share/zhangcaixian/scale_up10000/pretrain_healthcheck/results/vcctl` | 共享结果根目录 |
+| `RESULT_ROOT` | `<project>/results/vcctl` | 共享结果根目录，默认按脚本所在项目根目录推导 |
 | `RUN_ID` | 当前时间戳 | 本次运行 ID |
 | `EXEC_TIMEOUT_SECONDS` | `180` | 每个 pod exec 的超时时间；完整 collective 矩阵默认自动提升到 `1800` |
 | `MAX_PARALLEL` | `0` | 最大并发 pod 数，`0` 表示全部并发 |
@@ -754,10 +754,28 @@ MODE=all         -> static/ + single_node/ + multi_node/
 
 故障注入变量：
 
+单节点动态测试推荐使用 `DYNAMIC_FAULT_*`。`DYNAMIC_FAULT_LOCAL_RANK` 表示 pod 内 local rank，不是 job 全局 rank；当同时指定 pod/node 和 local rank 时，只会命中该 pod 内对应 rank。
+
+| 环境变量 | 含义 |
+| --- | --- |
+| `DYNAMIC_FAULT_TYPE=backend_fail` | 目标 pod 使用非法 backend，验证初始化失败路径 |
+| `DYNAMIC_FAULT_TYPE=frame_missing` | 目标 pod 不输出 dynamic compact frame，验证 `FRAME_MISSING` |
+| `DYNAMIC_FAULT_TYPE=frame_corrupt` | 目标 pod 输出非法 dynamic compact frame，验证 `FRAME_PARSE_FAIL` |
+| `DYNAMIC_FAULT_TYPE=sleep_timeout` | 目标 pod/rank sleep，验证 `DYNAMIC_TIMEOUT` |
+| `DYNAMIC_FAULT_TYPE=nan` | 目标 pod/rank 注入 NaN，验证 correctness fail |
+| `DYNAMIC_FAULT_TYPE=corrupt` | 目标 pod/rank 修改 tensor，验证 checksum/correctness fail |
+| `DYNAMIC_FAULT_TYPE=slow_rank` | 目标 pod/rank 增加短 sleep，验证性能横向比对 |
+| `DYNAMIC_FAULT_POD=<pod-name>` | 限定目标 pod |
+| `DYNAMIC_FAULT_NODE=<node-name>` | 限定目标 node |
+| `DYNAMIC_FAULT_LOCAL_RANK=<rank>` | 限定 pod 内 local rank；未设置时命中目标 pod 内所有 local rank |
+| `DYNAMIC_FAULT_SLEEP_SECONDS=<seconds>` | `sleep_timeout` / `slow_rank` 的 sleep 秒数，默认 `300` |
+
+旧 `FAULT_*` 变量仍保留兼容，主要用于多节点或历史测试命令：
+
 | 环境变量 | 含义 |
 | --- | --- |
 | `FAULT_BACKEND=1` | 强制使用非法 backend，验证初始化失败采集 |
-| `FAULT_SLEEP_RANK=<rank>` | 指定全局 rank 在测试中 sleep，模拟慢 rank / hang |
+| `FAULT_SLEEP_RANK=<rank>` | 指定全局 rank sleep，模拟慢 rank / hang |
 | `FAULT_SLEEP_SECONDS` | sleep 秒数，默认 `30` |
 | `FAULT_NAN_RANK=<rank>` | 指定全局 rank 注入 NaN |
 | `FAULT_CORRUPT_RANK=<rank>` | 指定全局 rank 修改 tensor，模拟结果污染 |
@@ -814,7 +832,7 @@ multi-node:  2/2 PASS
 训练 job 异常后，如果需要恢复同一批物理机器上的软件 / 硬件环境，可先在原 job 还存在时导出原始 job 配置、pod 到 node 的映射，并生成固定节点的 clone YAML。
 
 ```bash
-cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck/scripts/metax
+cd <pretrain_healthcheck>/scripts/metax
 
 JOB_NAME=muxi-2node1 \
 bash export_same_node_clone_yaml.sh
@@ -856,7 +874,7 @@ vcctl job run -f results/job_clone/<job_name>_<run_id>/<job_name>_clone.yaml -n 
 如果只关注单节点连通性、可运行性和节点内多卡通信，可以一条命令执行：
 
 ```bash
-cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck/scripts/metax
+cd <pretrain_healthcheck>/scripts/metax
 
 JOB_NAME=<vcjob-name> \
 DRY_RUN=0 \
@@ -912,7 +930,7 @@ dynamic_outliers.jsonl
 静态检测和单节点 dynamic-suite 通过后，可以在一个已经申请好的大 job 内执行多节点分组检测。该入口只负责多节点 group，不会重新执行 static 或 single-node。
 
 ```bash
-cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck
+cd <pretrain_healthcheck>
 
 JOB_NAME=muxi-1024node \
 TARGET_SCALE=128 \
@@ -1023,7 +1041,7 @@ bash scripts/metax/run_vcctl_multi_node_batch_healthcheck.sh
 常用命令：
 
 ```bash
-cd /mnt/hgfs/nfs_share/ailab/scale_up10000/pretrain_healthcheck/scripts/metax
+cd <pretrain_healthcheck>/scripts/metax
 
 DRY_RUN=0 MODE=multi-node PROFILE=smoke bash run_vcctl_healthcheck.sh
 

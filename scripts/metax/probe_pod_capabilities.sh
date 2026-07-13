@@ -18,6 +18,26 @@ STATIC_WORK_DIR="${STATIC_WORK_DIR:-${STATIC_WORK_ROOT}/${safe_run_stage}}"
 
 mkdir -p "${STATIC_WORK_DIR}"
 
+static_fault_target() {
+  local target=0
+  if [[ -n "${STATIC_FAULT_POD:-}" && "${STATIC_FAULT_POD}" == "${HC_POD_NAME:-}" ]]; then
+    target=1
+  fi
+  if [[ -n "${STATIC_FAULT_RANK:-}" && "${STATIC_FAULT_RANK}" == "${RANK:-}" ]]; then
+    target=1
+  fi
+  if [[ -n "${STATIC_FAULT_NODE:-}" && "${STATIC_FAULT_NODE}" == "${HC_NODE_NAME:-}" ]]; then
+    target=1
+  fi
+  [[ "${target}" == "1" && -n "${STATIC_FAULT_TYPE:-}" ]]
+}
+
+if static_fault_target && [[ "${STATIC_FAULT_TYPE}" == "probe_timeout" ]]; then
+  echo "[static-fault] target pod=${HC_POD_NAME:-} rank=${RANK:-} node=${HC_NODE_NAME:-} type=probe_timeout sleep=${STATIC_FAULT_SLEEP_SECONDS:-600}" >&2
+  sleep "${STATIC_FAULT_SLEEP_SECONDS:-600}"
+fi
+
+
 OUT_DIR="${STATIC_WORK_DIR}"
 
 SUMMARY="${OUT_DIR}/summary.tsv"
@@ -159,6 +179,9 @@ run_check basic inode df -ih
 
 run_check metax mx_smi mx-smi
 run_check metax mx_smi_help mx-smi --help
+run_check metax mx_ecc_state mx-smi --show-ecc-state -i all
+run_check metax mx_ras_count mx-smi ras --show-count -i all
+run_check metax mx_events mx-smi --show-event all -i all
 run_check metax python_torch python3 -c 'import torch; import torch.distributed as dist; print("torch", torch.__version__); print("cuda_available", torch.cuda.is_available()); print("device_count", torch.cuda.device_count()); print("distributed_backends", sorted(dist.Backend.backend_type_map.keys()))'
 run_check metax maca_env bash -lc 'env | sort | grep -E "^(MACA|MCCL|CUDA|NCCL|PYTORCH|RANK|WORLD_SIZE|MASTER_|LOCAL_|HC_)" || true'
 
@@ -272,6 +295,128 @@ def parse_mx_smi(text: str) -> dict:
     return {k: v for k, v in facts.items() if v is not None and v != ""}
 
 
+def gpu_blocks(text: str) -> list[tuple[int, str, str, str]]:
+    chunks = re.split(r"^GPU#(\d+)\s+(\S+)\s+(\S+)\s*$", text, flags=re.MULTILINE)
+    blocks = []
+    for index in range(1, len(chunks), 4):
+        if index + 3 >= len(chunks):
+            break
+        blocks.append((int(chunks[index]), chunks[index + 1], chunks[index + 2], chunks[index + 3]))
+    return blocks
+
+
+def useful_lines(text: str) -> list[str]:
+    return [
+        normalize_ws(line)
+        for line in text.splitlines()
+        if normalize_ws(line)
+        and normalize_ws(line) not in {"No error data", "no events", "End of Log"}
+        and not normalize_ws(line).startswith("=")
+    ]
+
+
+def parse_metax_ecc(
+    state_text: str,
+    count_text: str,
+    event_text: str,
+    statuses: dict[str, str],
+    expected_gpu_count: int,
+) -> dict:
+    state_blocks = gpu_blocks(state_text)
+    count_blocks = gpu_blocks(count_text)
+    event_blocks = gpu_blocks(event_text)
+    states = {}
+    corrected_details = {}
+    uncorrected_details = {}
+    event_details = {}
+    errors = []
+
+    for gpu_id, _model, _bus_id, body in state_blocks:
+        state = first_match(body, r"^\s*state\s*:\s*(\S+)\s*$")
+        if not state:
+            errors.append(f"GPU {gpu_id} missing ECC state")
+        else:
+            states[str(gpu_id)] = state
+
+    for gpu_id, _model, _bus_id, body in count_blocks:
+        match = re.search(
+            r"Uncorrected Error\s*(.*?)\s*Corrected Error\s*(.*?)(?=\nGPU#|\nEnd of Log|\Z)",
+            body,
+            flags=re.DOTALL,
+        )
+        if not match:
+            errors.append(f"GPU {gpu_id} missing RAS count sections")
+            continue
+        uncorrected = useful_lines(match.group(1))
+        corrected = useful_lines(match.group(2))
+        if uncorrected:
+            uncorrected_details[str(gpu_id)] = uncorrected
+        if corrected:
+            corrected_details[str(gpu_id)] = corrected
+
+    for gpu_id, _model, _bus_id, body in event_blocks:
+        per_gpu = {}
+        matches = list(re.finditer(r"^\s*pci\s+(aer_ue|aer_ce|synfld|dbe|mmio)\s+event info\s*$", body, flags=re.MULTILINE))
+        if not matches:
+            errors.append(f"GPU {gpu_id} missing event sections")
+            continue
+        for position, match in enumerate(matches):
+            start = match.end()
+            end = matches[position + 1].start() if position + 1 < len(matches) else len(body)
+            details = [line for line in useful_lines(body[start:end]) if line != "no events" and line != "End of Log"]
+            if details:
+                per_gpu[match.group(1)] = details
+        if per_gpu:
+            event_details[str(gpu_id)] = per_gpu
+
+    state_ids = set(states)
+    count_ids = {str(row[0]) for row in count_blocks}
+    event_ids = {str(row[0]) for row in event_blocks}
+    observed_ids = state_ids | count_ids | event_ids
+    if state_ids != count_ids or state_ids != event_ids:
+        errors.append(
+            "ECC command GPU sets differ: "
+            f"state={sorted(state_ids)},count={sorted(count_ids)},event={sorted(event_ids)}"
+        )
+    if expected_gpu_count > 0 and len(observed_ids) != expected_gpu_count:
+        errors.append(f"parsed {len(observed_ids)} GPUs, expected {expected_gpu_count}")
+
+    required_checks = ["metax/mx_ecc_state", "metax/mx_ras_count", "metax/mx_events"]
+    query_status = "OK" if all(statuses.get(key) == "OK" for key in required_checks) and observed_ids and not errors else "FAIL"
+    disabled_gpus = sorted(
+        int(gpu_id) for gpu_id, state in states.items() if state.lower() not in {"enable", "enabled"}
+    )
+    corrected_event_types = {"aer_ce"}
+    critical_event_types = {"aer_ue", "synfld", "dbe", "mmio"}
+    corrected_events = []
+    critical_events = []
+    for gpu_id, events in event_details.items():
+        for event_type, details in events.items():
+            row = {"gpu_id": int(gpu_id), "event_type": event_type, "details": details}
+            if event_type in corrected_event_types:
+                corrected_events.append(row)
+            elif event_type in critical_event_types:
+                critical_events.append(row)
+
+    return {
+        "query_status": query_status,
+        "gpu_count": len(observed_ids),
+        "topology_signature": ",".join(str(gpu_id) for gpu_id in sorted((int(value) for value in observed_ids))),
+        "states": states,
+        "all_enabled": bool(states) and not disabled_gpus,
+        "disabled_gpus": disabled_gpus,
+        "corrected_error_gpu_count": len(corrected_details),
+        "uncorrected_error_gpu_count": len(uncorrected_details),
+        "corrected_error_details": corrected_details,
+        "uncorrected_error_details": uncorrected_details,
+        "corrected_event_count": len(corrected_events),
+        "critical_event_count": len(critical_events),
+        "corrected_events": corrected_events,
+        "critical_events": critical_events,
+        "errors": errors,
+    }
+
+
 def parse_python_torch(text: str) -> dict:
     fields = {
         "version": first_match(text, r"^torch\s+(.+)$"),
@@ -337,6 +482,14 @@ status_by_check = {
     }
     for row in checks
 }
+metax_facts = parse_mx_smi(read_text("metax_mx_smi.log"))
+metax_ecc_facts = parse_metax_ecc(
+    read_text("metax_mx_ecc_state.log"),
+    read_text("metax_mx_ras_count.log"),
+    read_text("metax_mx_events.log"),
+    {key: str(value.get("status", "")) for key, value in status_by_check.items()},
+    int(metax_facts.get("attached_gpus", 0) or 0),
+)
 
 facts = {
     "schema_version": 1,
@@ -363,7 +516,8 @@ facts = {
         ),
     },
     "gpu": {
-        "metax": parse_mx_smi(read_text("metax_mx_smi.log")),
+        "metax": metax_facts,
+        "ecc": metax_ecc_facts,
         "torch": parse_python_torch(read_text("metax_python_torch.log")),
     },
     "hca": {
@@ -390,6 +544,83 @@ facts["status"] = {
 }
 facts["status"]["overall"] = "FAIL" if facts["status"]["fail_count"] else "PASS"
 
+
+def fault_target():
+    if not os.environ.get("STATIC_FAULT_TYPE"):
+        return False
+    if os.environ.get("STATIC_FAULT_POD") and os.environ.get("STATIC_FAULT_POD") == facts["pod"].get("name", ""):
+        return True
+    if os.environ.get("STATIC_FAULT_RANK") and os.environ.get("STATIC_FAULT_RANK") == os.environ.get("RANK", ""):
+        return True
+    if os.environ.get("STATIC_FAULT_NODE") and os.environ.get("STATIC_FAULT_NODE") == facts["pod"].get("node_name", ""):
+        return True
+    return False
+
+def set_check_fail(key, detail):
+    category, item = key.split("/", 1)
+    checks_map = facts.setdefault("capability", {}).setdefault("checks", {})
+    checks_map[key] = {"status": "FAIL", "detail": detail}
+    facts.setdefault("checks", []).append({"category": category, "item": item, "status": "FAIL", "detail": detail})
+
+def recompute_status():
+    statuses = [str(row.get("status", "")) for row in facts.get("checks", [])]
+    facts["status"] = {
+        "check_count": len(statuses),
+        "fail_count": sum(1 for status in statuses if status == "FAIL"),
+        "missing_count": sum(1 for status in statuses if status == "MISSING"),
+        "warn_count": sum(1 for status in statuses if status in {"MISSING", "NO_READ", "EMPTY", "SKIP"}),
+    }
+    facts["status"]["overall"] = "FAIL" if facts["status"]["fail_count"] else "PASS"
+
+if fault_target():
+    fault_type = os.environ.get("STATIC_FAULT_TYPE", "")
+    facts["fault_injection"] = {"enabled": True, "type": fault_type}
+    if fault_type == "missing_device_cmd":
+        set_check_fail("metax/mx_smi", "fault injection: simulated mx-smi failure")
+    elif fault_type == "device_count_mismatch":
+        metax_facts = facts.setdefault("gpu", {}).setdefault("metax", {})
+        torch_facts = facts.setdefault("gpu", {}).setdefault("torch", {})
+        for key in ["attached_gpus", "gpu_available_count"]:
+            if key in metax_facts:
+                try:
+                    metax_facts[key] = max(0, int(metax_facts[key]) - 1)
+                except Exception:
+                    metax_facts[key] = "fault_injected_mismatch"
+        if "device_count" in torch_facts:
+            try:
+                torch_facts["device_count"] = str(max(0, int(torch_facts["device_count"]) - 1))
+            except Exception:
+                torch_facts["device_count"] = "fault_injected_mismatch"
+    elif fault_type == "driver_version_mismatch":
+        facts.setdefault("gpu", {}).setdefault("metax", {})["driver_version"] = "fault_injected_driver_version"
+    elif fault_type == "hca_count_mismatch":
+        hca = facts.setdefault("hca", {})
+        ibv = hca.setdefault("ibv_devinfo", {})
+        sysfs = hca.setdefault("sysfs", {})
+        ibv["hca_count"] = max(0, int(ibv.get("hca_count", 1) or 1) - 1)
+        sysfs["xscale_port_count"] = max(0, int(sysfs.get("xscale_port_count", 1) or 1) - 1)
+        set_check_fail("hca/ibv_devinfo", "fault injection: simulated HCA mismatch")
+    elif fault_type == "env_missing":
+        env_keys = facts.setdefault("container", {}).setdefault("env_keys", [])
+        facts["container"]["env_keys"] = [k for k in env_keys if not k.startswith(("MCCL", "MACA", "MASTER_"))]
+        set_check_fail("metax/maca_env", "fault injection: simulated missing communication env")
+    elif fault_type in {"ecc_corrected", "ecc_single_bit", "ecc_uncorrected", "ecc_double_bit", "ecc_disabled", "ecc_query_failure"}:
+        ecc = facts.setdefault("gpu", {}).setdefault("ecc", {})
+        if fault_type in {"ecc_corrected", "ecc_single_bit"}:
+            ecc["corrected_error_gpu_count"] = 1
+            ecc["corrected_error_details"] = {"0": ["fault injection: corrected ECC"]}
+        elif fault_type in {"ecc_uncorrected", "ecc_double_bit"}:
+            ecc["uncorrected_error_gpu_count"] = 1
+            ecc["uncorrected_error_details"] = {"0": ["fault injection: uncorrected ECC"]}
+        elif fault_type == "ecc_disabled":
+            ecc["all_enabled"] = False
+            ecc["disabled_gpus"] = [0]
+        else:
+            ecc["query_status"] = "FAIL"
+            ecc.setdefault("errors", []).append("fault injection: simulated ECC query failure")
+            set_check_fail("metax/mx_ras_count", "fault injection: simulated ECC query failure")
+    recompute_status()
+
 (out_dir / "compact_facts.json").write_text(
     json.dumps(facts, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     encoding="utf-8",
@@ -399,6 +630,16 @@ PY
 if [[ "${STATIC_OUTPUT_MODE}" != "compact" || "${STATIC_COPY_RAW_OUTPUT}" == "1" || "${STATIC_COPY_RAW_OUTPUT}" == "true" ]]; then
   mkdir -p "${SHARED_OUT_DIR}"
   cp -a "${OUT_DIR}/." "${SHARED_OUT_DIR}/"
+fi
+
+if static_fault_target && [[ "${STATIC_FAULT_TYPE}" == "frame_missing" ]]; then
+  echo "[metax-probe] fault injection: suppress static result frame" >&2
+  exit 0
+fi
+if static_fault_target && [[ "${STATIC_FAULT_TYPE}" == "frame_corrupt" ]]; then
+  echo "__HC_STATIC_RESULT_JSON__ {fault_injected_corrupt_json"
+  echo "[metax-probe] fault injection: emitted corrupt static result frame" >&2
+  exit 0
 fi
 
 if ! python3 - <<'PY' "${OUT_DIR}/compact_facts.json" "${STATIC_STDOUT_MAX_BYTES}"

@@ -35,7 +35,7 @@ COMM_PATH_DEBUG="${COMM_PATH_DEBUG:-0}"
 usage() {
   cat <<'EOF'
 Usage:
-  JOB_NAME=<vcjob-name> [env ...] bash scripts/metax/run_vcctl_multi_node_batch_healthcheck.sh [--resume]
+  JOB_NAME=<vcjob-name> [env ...] bash scripts/ascend/run_vcctl_multi_node_batch_healthcheck.sh [--resume]
 
 This script only runs multi-node grouped dynamic checks. It does not run static
 or single-node dynamic-suite checks.
@@ -69,8 +69,8 @@ Common env:
   COMM_PATH_DEBUG            1 records compact communication-path env summaries. Default: 0
 
 Examples:
-  JOB_NAME=muxi-1024node DRY_RUN=0 TARGET_SCALE=128 bash scripts/metax/run_vcctl_multi_node_batch_healthcheck.sh
-  JOB_NAME=muxi-1024node BATCH_RUN_ID=20260706_153012 bash scripts/metax/run_vcctl_multi_node_batch_healthcheck.sh --resume
+  JOB_NAME=grj-megatron-128-235b-moe0708 DRY_RUN=0 TARGET_SCALE=8 bash scripts/ascend/run_vcctl_multi_node_batch_healthcheck.sh
+  JOB_NAME=grj-megatron-128-235b-moe0708 BATCH_RUN_ID=20260706_153012 bash scripts/ascend/run_vcctl_multi_node_batch_healthcheck.sh --resume
 EOF
 }
 
@@ -87,6 +87,7 @@ fi
 
 exec python3 "${PROJECT_DIR}/tools/vcctl_multi_node_batch.py" "$@" \
   --project-dir "${PROJECT_DIR}" \
+  --healthcheck-script "${SCRIPT_DIR}/run_vcctl_healthcheck.sh" \
   --job-name "${JOB_NAME}" \
   --namespace "${NAMESPACE}" \
   --vcctl-bin "${VCCTL_BIN}" \

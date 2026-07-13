@@ -190,6 +190,31 @@ def summarize_dynamic_suite(input_dir: Path) -> dict[str, Any]:
     }
 
 
+def summarize_comm_path(input_dir: Path) -> dict[str, Any]:
+    rows = read_jsonl(input_dir / "comm_path_summary.jsonl")
+    if not rows:
+        summary_json = input_dir / "comm_path_summary.json"
+        if summary_json.exists():
+            try:
+                data = json.loads(summary_json.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                data = {}
+            if isinstance(data, dict):
+                rows = [row for row in data.get("rows", []) if isinstance(row, dict)]
+    if not rows:
+        return {}
+    env_keys = sorted({key for row in rows for key in (row.get("env") or {}).keys()})
+    return {
+        "rank_count": len(rows),
+        "nodes": sorted({str(row.get("node_name", "")) for row in rows if row.get("node_name")}),
+        "pods": sorted({str(row.get("pod_name", "")) for row in rows if row.get("pod_name")}),
+        "dist_backends": sorted({str(row.get("dist_backend", "")) for row in rows if row.get("dist_backend")}),
+        "comm_runtimes": sorted({str(row.get("comm_runtime", "")) for row in rows if row.get("comm_runtime")}),
+        "env_keys": env_keys,
+        "rows": rows,
+    }
+
+
 def build_payload(args: argparse.Namespace) -> dict[str, Any]:
     input_dir = args.input_dir
     if args.kind == "smoke":
@@ -206,12 +231,22 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"unsupported kind: {args.kind}")
 
     compact["returncode"] = args.returncode
+    if (
+        args.kind == "dynamic-suite"
+        and args.returncode == 0
+        and "multi_node" in args.stage
+        and int(compact.get("rank_count", 0) or 0) == 0
+    ):
+        compact["correctness_pass"] = True
+        compact["performance_pass"] = True
+        compact["error_type"] = ""
+        compact["summary_owner"] = False
     if args.returncode != 0:
         compact["correctness_pass"] = False
         compact["performance_pass"] = False
         compact["error_type"] = compact.get("error_type") or f"returncode={args.returncode}"
 
-    return {
+    payload = {
         "schema_version": 1,
         "pod": {
             "name": args.pod_name,
@@ -224,6 +259,10 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         "local_workdir": str(input_dir),
         "summary": compact,
     }
+    comm_path = summarize_comm_path(input_dir)
+    if comm_path:
+        payload["comm_path_summary"] = comm_path
+    return payload
 
 
 def main() -> None:

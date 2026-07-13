@@ -322,6 +322,13 @@ def run_exec_for_pod(pod: PodInfo, mode: str, command: str, args: argparse.Names
     start_time = time.monotonic()
     if mode == "static":
         logs_dir = Path(args.static_driver_tmp_root) / f"pretrain_healthcheck_driver_{args.run_id}"
+    elif (
+        mode == "single-node"
+        and args.dynamic_compare
+        and args.dynamic_failed_log_mode == "local-link"
+        and not args.dry_run
+    ):
+        logs_dir = Path(args.dynamic_exec_log_root) / args.run_id / args.run_stage / "logs"
     else:
         logs_dir = Path(args.output_dir) / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -585,10 +592,13 @@ def write_commands_env(path: Path, args: argparse.Namespace) -> None:
         f"STATIC_EXPECTED_XSCALE_PORTS={args.static_expected_xscale_ports}",
         f"STATIC_KEEP_POD_FILES={args.static_keep_pod_files}",
         f"STATIC_KEEP_EXEC_LOGS={args.static_keep_exec_logs}",
+        f"STATIC_FAILED_LOG_MODE={args.static_failed_log_mode}",
         f"DYNAMIC_COMPARE={args.dynamic_compare}",
         f"DYNAMIC_COMPARE_STRICT={args.dynamic_compare_strict}",
         f"DYNAMIC_COMPARE_RATIO_THRESHOLD={args.dynamic_compare_ratio_threshold}",
         f"DYNAMIC_KEEP_EXEC_LOGS={args.dynamic_keep_exec_logs}",
+        f"DYNAMIC_EXEC_LOG_ROOT={args.dynamic_exec_log_root}",
+        f"DYNAMIC_FAILED_LOG_MODE={args.dynamic_failed_log_mode}",
         f"HEALTHCHECK_MASTER_PORT={args.healthcheck_master_port}",
         f"RESOLVED_HEALTHCHECK_MASTER_PORT={getattr(args, 'resolved_healthcheck_master_port', '')}",
         "PRE_CLEAN_CMD=" + args.pre_clean_cmd,
@@ -641,9 +651,34 @@ def read_file_if_exists(path_text: str) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def failed_static_row(result: ExecResult, error_type: str, reason: str) -> dict[str, Any]:
+def link_failed_static_log(path_text: str, result: ExecResult, suffix: str, args: argparse.Namespace) -> str:
+    if args.static_failed_log_mode != "local-link":
+        return ""
+    path = Path(path_text)
+    if not path.exists() or not path.is_file():
+        return ""
+    links_dir = Path(args.output_dir) / "failed_pod_logs"
+    links_dir.mkdir(parents=True, exist_ok=True)
+    link_path = links_dir / f"{result.pod_name}.static.{suffix}"
+    if link_path.exists() or link_path.is_symlink():
+        try:
+            link_path.unlink()
+        except OSError:
+            pass
+    try:
+        link_path.symlink_to(path)
+        return str(link_path)
+    except OSError as exc:
+        fallback = links_dir / f"{result.pod_name}.static.{suffix}.path"
+        fallback.write_text(f"{path}\nsymlink_error={type(exc).__name__}:{exc}\n", encoding="utf-8")
+        return ""
+
+
+def failed_static_row(result: ExecResult, error_type: str, reason: str, args: argparse.Namespace) -> dict[str, Any]:
     stderr = read_file_if_exists(result.stderr_path)
     match = re.search(r"^\[metax-probe\] workdir:\s*(\S+)", stderr, flags=re.MULTILINE)
+    shared_stdout_link = link_failed_static_log(result.stdout_path, result, "stdout", args)
+    shared_stderr_link = link_failed_static_log(result.stderr_path, result, "stderr", args)
     return {
         "pod_name": result.pod_name,
         "node_name": result.node_name,
@@ -656,6 +691,8 @@ def failed_static_row(result: ExecResult, error_type: str, reason: str) -> dict[
         "timeout": result.timeout,
         "stdout_path": result.stdout_path,
         "stderr_path": result.stderr_path,
+        "shared_stdout_link": shared_stdout_link,
+        "shared_stderr_link": shared_stderr_link,
         "static_workdir": match.group(1) if match else "",
         "started_at": result.started_at,
         "finished_at": result.finished_at,
@@ -664,6 +701,8 @@ def failed_static_row(result: ExecResult, error_type: str, reason: str) -> dict[
 
 
 def retain_static_exec_logs(result: ExecResult, args: argparse.Namespace) -> None:
+    if args.static_failed_log_mode == "local-link":
+        return
     shared_logs_dir = Path(args.output_dir) / "logs"
     shared_logs_dir.mkdir(parents=True, exist_ok=True)
     for attr, suffix in [("stdout_path", "stdout"), ("stderr_path", "stderr")]:
@@ -682,6 +721,8 @@ def cleanup_static_tmp_exec_logs(results: list[ExecResult], args: argparse.Names
     tmp_root = Path(args.static_driver_tmp_root) / f"pretrain_healthcheck_driver_{args.run_id}"
     removed = 0
     for result in results:
+        if result.status != "PASS":
+            continue
         for path_text in [result.stdout_path, result.stderr_path]:
             if not path_text:
                 continue
@@ -762,25 +803,25 @@ def collect_static_stdout_results(results: list[ExecResult], args: argparse.Name
             result.status = "FAIL"
             result.reason = "STATIC_TIMEOUT"
             retain_static_exec_logs(result, args)
-            failed_rows.append(failed_static_row(result, "STATIC_TIMEOUT", "static probe timed out"))
+            failed_rows.append(failed_static_row(result, "STATIC_TIMEOUT", "static probe timed out", args))
             continue
         if result.returncode != 0:
             result.status = "FAIL"
             result.reason = f"EXEC_FAIL returncode={result.returncode}"
             retain_static_exec_logs(result, args)
-            failed_rows.append(failed_static_row(result, "EXEC_FAIL", result.reason))
+            failed_rows.append(failed_static_row(result, "EXEC_FAIL", result.reason, args))
             continue
         if len(frames) == 0:
             result.status = "FAIL"
             result.reason = "FRAME_MISSING"
             retain_static_exec_logs(result, args)
-            failed_rows.append(failed_static_row(result, "FRAME_MISSING", "missing static result stdout frame"))
+            failed_rows.append(failed_static_row(result, "FRAME_MISSING", "missing static result stdout frame", args))
             continue
         if len(frames) > 1:
             result.status = "FAIL"
             result.reason = "FRAME_PROTOCOL_ERROR"
             retain_static_exec_logs(result, args)
-            failed_rows.append(failed_static_row(result, "FRAME_PROTOCOL_ERROR", "multiple static result stdout frames"))
+            failed_rows.append(failed_static_row(result, "FRAME_PROTOCOL_ERROR", "multiple static result stdout frames", args))
             continue
 
         frame = frames[0]
@@ -794,6 +835,7 @@ def collect_static_stdout_results(results: list[ExecResult], args: argparse.Name
                     result,
                     "FRAME_TOO_LARGE",
                     f"static result frame bytes {frame_bytes} exceed {args.static_stdout_max_bytes}",
+                    args,
                 )
             )
             continue
@@ -803,13 +845,13 @@ def collect_static_stdout_results(results: list[ExecResult], args: argparse.Name
             result.status = "FAIL"
             result.reason = "FRAME_PARSE_FAIL"
             retain_static_exec_logs(result, args)
-            failed_rows.append(failed_static_row(result, "FRAME_PARSE_FAIL", f"{exc.__class__.__name__}: {exc}"))
+            failed_rows.append(failed_static_row(result, "FRAME_PARSE_FAIL", f"{exc.__class__.__name__}: {exc}", args))
             continue
         if not isinstance(payload, dict):
             result.status = "FAIL"
             result.reason = "FRAME_PROTOCOL_ERROR"
             retain_static_exec_logs(result, args)
-            failed_rows.append(failed_static_row(result, "FRAME_PROTOCOL_ERROR", "static frame payload is not an object"))
+            failed_rows.append(failed_static_row(result, "FRAME_PROTOCOL_ERROR", "static frame payload is not an object", args))
             continue
 
         pod_meta = payload.setdefault("pod", {})
@@ -817,7 +859,7 @@ def collect_static_stdout_results(results: list[ExecResult], args: argparse.Name
             result.status = "FAIL"
             result.reason = "FRAME_PROTOCOL_ERROR"
             retain_static_exec_logs(result, args)
-            failed_rows.append(failed_static_row(result, "FRAME_PROTOCOL_ERROR", "static frame pod metadata is invalid"))
+            failed_rows.append(failed_static_row(result, "FRAME_PROTOCOL_ERROR", "static frame pod metadata is invalid", args))
             continue
         if str(pod_meta.get("name", "")) != result.pod_name:
             result.status = "FAIL"
@@ -828,6 +870,7 @@ def collect_static_stdout_results(results: list[ExecResult], args: argparse.Name
                     result,
                     "FRAME_ID_MISMATCH",
                     f"pod_name mismatch: frame={pod_meta.get('name', '')} expected={result.pod_name}",
+                    args,
                 )
             )
             continue
@@ -840,6 +883,7 @@ def collect_static_stdout_results(results: list[ExecResult], args: argparse.Name
                     result,
                     "FRAME_ID_MISMATCH",
                     f"run_id mismatch: frame={pod_meta.get('run_id', '')} expected={args.run_id}",
+                    args,
                 )
             )
             continue
@@ -905,7 +949,7 @@ def cleanup_dynamic_exec_logs(output_dir: Path, results: list[ExecResult]) -> in
                 continue
             path = Path(path_text)
             try:
-                if path.exists() and path.is_file() and path.is_relative_to(output_dir):
+                if path.exists() and path.is_file():
                     path.unlink()
                     removed += 1
             except OSError:
@@ -919,9 +963,52 @@ def cleanup_dynamic_exec_logs(output_dir: Path, results: list[ExecResult]) -> in
     return removed
 
 
-def failed_dynamic_row(result: ExecResult, error_type: str, reason: str) -> dict[str, Any]:
+def cleanup_dynamic_exec_log_root(args: argparse.Namespace) -> int:
+    if args.dynamic_failed_log_mode != "local-link":
+        return 0
+    run_root = Path(args.dynamic_exec_log_root) / args.run_id
+    stage_root = run_root / args.run_stage
+    if not stage_root.exists():
+        return 0
+    removed = cleanup_empty_dirs(stage_root)
+    try:
+        run_root.rmdir()
+        removed += 1
+    except OSError:
+        pass
+    return removed
+
+
+def link_failed_dynamic_log(path_text: str, result: ExecResult, suffix: str, args: argparse.Namespace) -> str:
+    if args.dynamic_failed_log_mode != "local-link":
+        return ""
+    if result.mode != "single-node":
+        return ""
+    path = Path(path_text)
+    if not path.exists() or not path.is_file():
+        return ""
+    links_dir = Path(args.output_dir) / "failed_pod_logs"
+    links_dir.mkdir(parents=True, exist_ok=True)
+    link_path = links_dir / f"{result.pod_name}.{suffix}"
+    if link_path.exists() or link_path.is_symlink():
+        try:
+            link_path.unlink()
+        except OSError:
+            pass
+    try:
+        link_path.symlink_to(path)
+        return str(link_path)
+    except OSError as exc:
+        fallback = links_dir / f"{result.pod_name}.{suffix}.path"
+        fallback.write_text(f"{path}\nsymlink_error={type(exc).__name__}:{exc}\n", encoding="utf-8")
+        return ""
+
+
+def failed_dynamic_row(result: ExecResult, error_type: str, reason: str, args: argparse.Namespace) -> dict[str, Any]:
     stderr = read_file_if_exists(result.stderr_path)
     match = re.search(r"^\[dynamic-stage\] workdir:\s*(\S+)", stderr, flags=re.MULTILINE)
+    shared_stdout_link = link_failed_dynamic_log(result.stdout_path, result, "stdout", args)
+    shared_stderr_link = link_failed_dynamic_log(result.stderr_path, result, "stderr", args)
     return {
         "pod_name": result.pod_name,
         "node_name": result.node_name,
@@ -934,6 +1021,8 @@ def failed_dynamic_row(result: ExecResult, error_type: str, reason: str) -> dict
         "timeout": result.timeout,
         "stdout_path": result.stdout_path,
         "stderr_path": result.stderr_path,
+        "shared_stdout_link": shared_stdout_link,
+        "shared_stderr_link": shared_stderr_link,
         "local_workdir": match.group(1) if match else "",
         "started_at": result.started_at,
         "finished_at": result.finished_at,
@@ -954,36 +1043,36 @@ def collect_dynamic_stdout_results(results: list[ExecResult], args: argparse.Nam
         if result.timeout:
             result.status = "FAIL"
             result.reason = "DYNAMIC_TIMEOUT"
-            failed_rows.append(failed_dynamic_row(result, "DYNAMIC_TIMEOUT", "dynamic probe timed out"))
+            failed_rows.append(failed_dynamic_row(result, "DYNAMIC_TIMEOUT", "dynamic probe timed out", args))
             continue
         if len(frames) == 0:
             if result.returncode == 0:
                 result.status = "FAIL"
                 result.reason = "DYNAMIC_FRAME_MISSING"
-            failed_rows.append(failed_dynamic_row(result, "FRAME_MISSING", result.reason or "missing dynamic frame"))
+            failed_rows.append(failed_dynamic_row(result, "FRAME_MISSING", result.reason or "missing dynamic frame", args))
             continue
         if len(frames) > 1:
             result.status = "FAIL"
             result.reason = "DYNAMIC_FRAME_PROTOCOL_ERROR"
-            failed_rows.append(failed_dynamic_row(result, "FRAME_PROTOCOL_ERROR", "multiple dynamic frames"))
+            failed_rows.append(failed_dynamic_row(result, "FRAME_PROTOCOL_ERROR", "multiple dynamic frames", args))
             continue
         try:
             payload = json.loads(frames[0])
         except json.JSONDecodeError as exc:
             result.status = "FAIL"
             result.reason = "DYNAMIC_FRAME_PARSE_FAIL"
-            failed_rows.append(failed_dynamic_row(result, "FRAME_PARSE_FAIL", f"{exc.__class__.__name__}: {exc}"))
+            failed_rows.append(failed_dynamic_row(result, "FRAME_PARSE_FAIL", f"{exc.__class__.__name__}: {exc}", args))
             continue
         if not isinstance(payload, dict):
             result.status = "FAIL"
             result.reason = "DYNAMIC_FRAME_PROTOCOL_ERROR"
-            failed_rows.append(failed_dynamic_row(result, "FRAME_PROTOCOL_ERROR", "dynamic frame payload is not an object"))
+            failed_rows.append(failed_dynamic_row(result, "FRAME_PROTOCOL_ERROR", "dynamic frame payload is not an object", args))
             continue
         pod_meta = payload.get("pod", {})
         if not isinstance(pod_meta, dict) or str(pod_meta.get("name", "")) != result.pod_name:
             result.status = "FAIL"
             result.reason = "DYNAMIC_FRAME_ID_MISMATCH"
-            failed_rows.append(failed_dynamic_row(result, "FRAME_ID_MISMATCH", "pod_name mismatch"))
+            failed_rows.append(failed_dynamic_row(result, "FRAME_ID_MISMATCH", "pod_name mismatch", args))
             continue
         pod_meta.setdefault("node_name", result.node_name)
         pod_meta.setdefault("pod_ip", result.pod_ip)
@@ -998,6 +1087,7 @@ def collect_dynamic_stdout_results(results: list[ExecResult], args: argparse.Nam
                     result,
                     "DYNAMIC_CHECK_FAILED",
                     result.reason or f"returncode={result.returncode}",
+                    args,
                 )
             )
 
@@ -1108,10 +1198,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--static-expected-xscale-ports", type=int, default=0)
     parser.add_argument("--static-keep-pod-files", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--static-keep-exec-logs", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--static-failed-log-mode", choices=["local-link", "shared"], default="local-link")
     parser.add_argument("--dynamic-compare", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--dynamic-compare-strict", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dynamic-compare-ratio-threshold", type=float, default=0.7)
     parser.add_argument("--dynamic-keep-exec-logs", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--dynamic-exec-log-root", default="/tmp/pretrain_healthcheck_exec_logs/vcctl")
+    parser.add_argument("--dynamic-failed-log-mode", choices=["local-link", "shared"], default="local-link")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--pod-json-file", default="")
     return parser
@@ -1199,7 +1292,19 @@ def main() -> int:
                 if removed_dynamic_logs:
                     print(f"[vcctl-healthcheck] removed dynamic exec logs: {removed_dynamic_logs}")
     if args.mode in {"multi-node", "all"}:
-        results.extend(run_mode(pods, "multi-node", args.multi_node_cmd, args))
+        multi_node_results = run_mode(pods, "multi-node", args.multi_node_cmd, args)
+        results.extend(multi_node_results)
+        if args.dynamic_compare and not args.dry_run:
+            collect_dynamic_stdout_results(multi_node_results, args)
+            dynamic_compare_report = compare_dynamic_results(
+                output_dir,
+                ratio_threshold=args.dynamic_compare_ratio_threshold,
+            )
+            write_dynamic_compare_report(output_dir, dynamic_compare_report)
+            if not args.dynamic_keep_exec_logs:
+                removed_dynamic_logs = cleanup_dynamic_exec_logs(output_dir, results)
+                if removed_dynamic_logs:
+                    print(f"[vcctl-healthcheck] removed dynamic exec logs: {removed_dynamic_logs}")
 
     result_rows = [asdict(result) for result in results]
     write_jsonl(output_dir / "results.jsonl", result_rows)
@@ -1224,6 +1329,9 @@ def main() -> int:
     removed_tmp_dirs = cleanup_driver_tmp_dirs(args)
     if removed_tmp_dirs:
         print(f"[vcctl-healthcheck] removed empty driver tmp dirs: {removed_tmp_dirs}")
+    removed_dynamic_log_dirs = cleanup_dynamic_exec_log_root(args)
+    if removed_dynamic_log_dirs:
+        print(f"[vcctl-healthcheck] removed empty dynamic exec log dirs: {removed_dynamic_log_dirs}")
     print(f"[vcctl-healthcheck] overall_status={overall}")
     print(f"[vcctl-healthcheck] output={output_dir}")
     return 0 if overall in {"PASS", "DRY_RUN"} else 1

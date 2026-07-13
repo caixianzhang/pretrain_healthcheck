@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+JOB_NAME="${JOB_NAME:-grj-megatron-128-235b-moe0708}"
+NAMESPACE="${NAMESPACE:-default}"
+PROJECT_REMOTE_DIR="${PROJECT_REMOTE_DIR:-${PROJECT_DIR}}"
+RESULT_ROOT="${RESULT_ROOT:-${PROJECT_DIR}/results/vcctl_comm_probe}"
+RUN_ID="${RUN_ID:-comm_probe_$(date +%Y%m%d_%H%M%S)}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-16}"
+DIST_BACKEND="${DIST_BACKEND:-hccl}"
+DEVICE_VENDOR="${DEVICE_VENDOR:-ascend}"
+COMM_RUNTIME="${COMM_RUNTIME:-hccl}"
+MESSAGE_SIZES="${MESSAGE_SIZES:-1G}"
+WARMUP="${WARMUP:-1}"
+ITERS="${ITERS:-3}"
+EXEC_TIMEOUT_SECONDS="${EXEC_TIMEOUT_SECONDS:-900}"
+DRY_RUN="${DRY_RUN:-0}"
+ASCEND_LD_LIBRARY_PATH="${ASCEND_LD_LIBRARY_PATH:-/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/cann-8.5.0/aarch64-linux/lib64}"
+ASCEND_ENV_CMD="${ASCEND_ENV_CMD:-}"
+if [[ -z "${ASCEND_ENV_CMD}" ]]; then
+  ASCEND_ENV_CMD="export LD_LIBRARY_PATH=\"${ASCEND_LD_LIBRARY_PATH}:\${LD_LIBRARY_PATH:-}\""
+fi
+
+MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && ${ASCEND_ENV_CMD} && OUT_DIR=\"\$HC_POD_RESULT_DIR\" HC_POD_RESULT_DIR=\"\$HC_POD_RESULT_DIR\" HEALTHCHECK_MASTER_PORT=\"__HC_MASTER_PORT__\" HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" GPUS_PER_NODE=\"${GPUS_PER_NODE}\" DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" MESSAGE_SIZES=\"${MESSAGE_SIZES}\" WARMUP=\"${WARMUP}\" ITERS=\"${ITERS}\" RUN_TORCH_DEBUG=1 bash scripts/ascend/probe_comm_path.sh"
+
+echo "[ascend-comm-probe] project: ${PROJECT_DIR}"
+echo "[ascend-comm-probe] job: ${JOB_NAME}"
+echo "[ascend-comm-probe] result_root: ${RESULT_ROOT}"
+echo "[ascend-comm-probe] run_id: ${RUN_ID}"
+
+JOB_NAME="${JOB_NAME}" \
+NAMESPACE="${NAMESPACE}" \
+MODE=multi-node \
+PROFILE=quick \
+DRY_RUN="${DRY_RUN}" \
+RESULT_ROOT="${RESULT_ROOT}" \
+RUN_ID="${RUN_ID}" \
+PROJECT_REMOTE_DIR="${PROJECT_REMOTE_DIR}" \
+GPUS_PER_NODE="${GPUS_PER_NODE}" \
+EXEC_TIMEOUT_SECONDS="${EXEC_TIMEOUT_SECONDS}" \
+MULTI_NODE_CMD="${MULTI_NODE_CMD}" \
+bash "${SCRIPT_DIR}/run_vcctl_healthcheck.sh"

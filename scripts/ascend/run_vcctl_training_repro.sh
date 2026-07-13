@@ -25,7 +25,7 @@ MAX_PARALLEL="${MAX_PARALLEL:-0}"
 usage() {
   cat <<'EOF'
 Usage:
-  JOB_NAME=<vcjob-name> DRY_RUN=0 bash scripts/metax/run_vcctl_training_repro.sh
+  JOB_NAME=<vcjob-name> DRY_RUN=0 bash scripts/ascend/run_vcctl_training_repro.sh
 
 This wrapper starts the target Megatron training script in every pod of a vcctl
 job concurrently. It is intended for reproducing training-time MCCL/MCR errors
@@ -46,7 +46,7 @@ Common env:
 Example:
   JOB_NAME=grj-megatron-muxi-0630-moe-30ba3b \
   DRY_RUN=0 \
-  bash scripts/metax/run_vcctl_training_repro.sh
+  bash scripts/ascend/run_vcctl_training_repro.sh
 EOF
 }
 
@@ -86,7 +86,7 @@ args=(
   --job-name "${JOB_NAME}"
   --namespace "${NAMESPACE}"
   --mode multi-node
-  --device-type metax-training
+  --device-type ascend-training
   --result-root "${TRAIN_RESULT_ROOT}"
   --pod-result-root "${POD_TRAIN_RESULT_ROOT}"
   --run-id "${RUN_ID}"
