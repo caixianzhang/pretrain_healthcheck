@@ -157,11 +157,22 @@ def _name_matches_env(env_name: str, value: str) -> bool:
     return bool(target) and bool(value) and target == value
 
 
+def _value_matches_csv_env(env_name: str, value: str | int) -> bool:
+    actual = str(value).strip()
+    if not actual:
+        return False
+    targets = {item.strip() for item in os.environ.get(env_name, "").split(",") if item.strip()}
+    return actual in targets
+
+
 def _fault_target_matches(prefix: str, env: DistEnv) -> bool:
     return (
         _rank_matches_env(f"{prefix}_RANK", env.rank)
+        or _value_matches_csv_env(f"{prefix}_RANKS", env.rank)
         or _name_matches_env(f"{prefix}_POD", env.pod_name)
+        or _value_matches_csv_env(f"{prefix}_PODS", env.pod_name)
         or _name_matches_env(f"{prefix}_NODE", env.node_name)
+        or _value_matches_csv_env(f"{prefix}_NODES", env.node_name)
     )
 
 
@@ -169,8 +180,11 @@ def _pre_dist_fault_target_matches(prefix: str) -> bool:
     rank = int(os.environ.get("RANK", "-1"))
     return (
         _rank_matches_env(f"{prefix}_RANK", rank)
+        or _value_matches_csv_env(f"{prefix}_RANKS", rank)
         or _name_matches_env(f"{prefix}_POD", os.environ.get("HC_POD_NAME", ""))
+        or _value_matches_csv_env(f"{prefix}_PODS", os.environ.get("HC_POD_NAME", ""))
         or _name_matches_env(f"{prefix}_NODE", os.environ.get("HC_NODE_NAME", ""))
+        or _value_matches_csv_env(f"{prefix}_NODES", os.environ.get("HC_NODE_NAME", ""))
     )
 
 

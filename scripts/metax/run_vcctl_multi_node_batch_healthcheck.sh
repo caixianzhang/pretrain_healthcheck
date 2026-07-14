@@ -26,6 +26,8 @@ FAILED_GROUP_OUTPUT_MODE="${FAILED_GROUP_OUTPUT_MODE:-local-link}"
 BATCH_FAULT_TYPE="${BATCH_FAULT_TYPE:-}"
 BATCH_FAULT_NODE="${BATCH_FAULT_NODE:-}"
 BATCH_FAULT_POD="${BATCH_FAULT_POD:-}"
+BATCH_FAULT_NODES="${BATCH_FAULT_NODES:-}"
+BATCH_FAULT_PODS="${BATCH_FAULT_PODS:-}"
 BATCH_FAULT_PHASE="${BATCH_FAULT_PHASE:-all}"
 BATCH_FAULT_MAX_HITS="${BATCH_FAULT_MAX_HITS:-0}"
 BATCH_FAULT_SLEEP_SECONDS="${BATCH_FAULT_SLEEP_SECONDS:-300}"
@@ -62,6 +64,8 @@ Common env:
   BATCH_FAULT_TYPE           Optional fault injection: nan|corrupt|sleep|backend|join_timeout|comm_env_bad|eth_fallback|net_slow|rank_exit.
   BATCH_FAULT_NODE           Node name to inject into. Optional for backend/global tests.
   BATCH_FAULT_POD            Pod name to inject into. Optional for backend/global tests.
+  BATCH_FAULT_NODES          Comma-separated node names. Combined with BATCH_FAULT_NODE.
+  BATCH_FAULT_PODS           Comma-separated pod names. Combined with BATCH_FAULT_POD.
   BATCH_FAULT_PHASE          pairwise|ep8|scale64|scale128|scale256|final_all|all. Default: all
   BATCH_FAULT_MAX_HITS       0 means all matching groups; N limits injected groups. Default: 0
   BATCH_FAULT_SLEEP_SECONDS  Sleep/join-timeout seconds. Default: 300
@@ -109,6 +113,8 @@ exec python3 "${PROJECT_DIR}/tools/vcctl_multi_node_batch.py" "$@" \
   --batch-fault-type "${BATCH_FAULT_TYPE}" \
   --batch-fault-node "${BATCH_FAULT_NODE}" \
   --batch-fault-pod "${BATCH_FAULT_POD}" \
+  --batch-fault-nodes "${BATCH_FAULT_NODES}" \
+  --batch-fault-pods "${BATCH_FAULT_PODS}" \
   --batch-fault-phase "${BATCH_FAULT_PHASE}" \
   --batch-fault-max-hits "${BATCH_FAULT_MAX_HITS}" \
   --batch-fault-sleep-seconds "${BATCH_FAULT_SLEEP_SECONDS}" \
