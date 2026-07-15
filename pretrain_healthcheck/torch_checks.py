@@ -818,75 +818,103 @@ def _make_ep_group(dist: Any, env: DistEnv, ep_size: int) -> tuple[Any, int, int
     return selected_group, selected_group_rank, group_size, selected_ranks
 
 
-def _collective_bandwidth_once(
+@dataclass
+class _CollectiveBandwidthWorkspace:
+    input_tensor: Any
+    output_tensor: Any | None = None
+    output_tensors: list[Any] | None = None
+    input_chunks: list[Any] | None = None
+    input_split_sizes: list[int] | None = None
+    output_split_sizes: list[int] | None = None
+
+
+def _prepare_collective_bandwidth_workspace(
     torch: Any,
-    dist: Any,
     env: DistEnv,
     op: str,
-    tensor: Any,
-    group: Any | None = None,
-    group_rank: int | None = None,
-    group_size: int | None = None,
+    tensor_numel: int,
+    group_rank: int,
+    group_size: int,
+    dtype: Any,
     input_split_sizes: list[int] | None = None,
     output_split_sizes: list[int] | None = None,
-) -> Any:
-    group_rank = env.rank if group_rank is None else group_rank
-    group_size = env.world_size if group_size is None else group_size
-    if op == "all_reduce":
-        out = tensor.clone()
-        dist.all_reduce(out, group=group)
-        return out
-    if op == "broadcast":
-        out = tensor.clone()
-        src = 0 if group is None else group_rank
-        if group is not None:
-            src = 0
-        dist.broadcast(out, src=src, group=group)
-        return out
-    if op == "reduce_scatter":
-        padded_numel = ((tensor.numel() + group_size - 1) // group_size) * group_size
-        if padded_numel != tensor.numel():
-            inp = torch.empty(padded_numel, device=env.device, dtype=tensor.dtype)
-            inp[: tensor.numel()].copy_(tensor)
-        else:
-            inp = tensor
-        chunks = list(inp.chunk(group_size))
-        out = torch.empty_like(chunks[group_rank])
-        dist.reduce_scatter(out, chunks, group=group)
-        return out
-    if op == "all_gather":
-        out = [torch.empty_like(tensor) for _ in range(group_size)]
-        dist.all_gather(out, tensor, group=group)
-        return out[0]
-    if op == "all_to_all":
-        padded_numel = ((tensor.numel() + group_size - 1) // group_size) * group_size
-        if padded_numel != tensor.numel():
-            inp = torch.empty(padded_numel, device=env.device, dtype=tensor.dtype)
-            inp[: tensor.numel()].copy_(tensor)
-        else:
-            inp = tensor
-        out = torch.empty_like(inp)
-        split = inp.numel() // group_size
-        dist.all_to_all_single(
-            out,
-            inp,
-            output_split_sizes=[split for _ in range(group_size)],
-            input_split_sizes=[split for _ in range(group_size)],
-            group=group,
+) -> _CollectiveBandwidthWorkspace:
+    # Keep buffer allocation outside warmup and timed collective iterations.
+    if op in {"all_reduce", "broadcast"}:
+        return _CollectiveBandwidthWorkspace(
+            input_tensor=torch.zeros(tensor_numel, device=env.device, dtype=dtype)
         )
-        return out
+    if op == "reduce_scatter":
+        padded_numel = ((tensor_numel + group_size - 1) // group_size) * group_size
+        input_tensor = torch.zeros(padded_numel, device=env.device, dtype=dtype)
+        input_chunks = list(input_tensor.chunk(group_size))
+        return _CollectiveBandwidthWorkspace(
+            input_tensor=input_tensor,
+            output_tensor=torch.empty_like(input_chunks[group_rank]),
+            input_chunks=input_chunks,
+        )
+    if op == "all_gather":
+        input_tensor = torch.zeros(tensor_numel, device=env.device, dtype=dtype)
+        return _CollectiveBandwidthWorkspace(
+            input_tensor=input_tensor,
+            output_tensors=[torch.empty_like(input_tensor) for _ in range(group_size)],
+        )
+    if op == "all_to_all":
+        padded_numel = ((tensor_numel + group_size - 1) // group_size) * group_size
+        input_tensor = torch.zeros(padded_numel, device=env.device, dtype=dtype)
+        split = padded_numel // group_size
+        split_sizes = [split for _ in range(group_size)]
+        return _CollectiveBandwidthWorkspace(
+            input_tensor=input_tensor,
+            output_tensor=torch.empty_like(input_tensor),
+            input_split_sizes=split_sizes,
+            output_split_sizes=split_sizes,
+        )
     if op == "all_to_allv":
         if input_split_sizes is None or output_split_sizes is None:
             raise RuntimeError("all_to_allv requires split sizes")
-        out = torch.empty(sum(output_split_sizes), device=env.device, dtype=tensor.dtype)
-        dist.all_to_all_single(
-            out,
-            tensor,
-            output_split_sizes=output_split_sizes,
+        return _CollectiveBandwidthWorkspace(
+            input_tensor=torch.zeros(sum(input_split_sizes), device=env.device, dtype=dtype),
+            output_tensor=torch.empty(sum(output_split_sizes), device=env.device, dtype=dtype),
             input_split_sizes=input_split_sizes,
+            output_split_sizes=output_split_sizes,
+        )
+    raise ValueError(op)
+
+
+def _collective_bandwidth_once(
+    dist: Any,
+    op: str,
+    workspace: _CollectiveBandwidthWorkspace,
+    group: Any | None = None,
+) -> None:
+    if op == "all_reduce":
+        dist.all_reduce(workspace.input_tensor, group=group)
+        return
+    if op == "broadcast":
+        dist.broadcast(workspace.input_tensor, src=0, group=group)
+        return
+    if op == "reduce_scatter":
+        if workspace.output_tensor is None or workspace.input_chunks is None:
+            raise RuntimeError("reduce_scatter workspace is incomplete")
+        dist.reduce_scatter(workspace.output_tensor, workspace.input_chunks, group=group)
+        return
+    if op == "all_gather":
+        if workspace.output_tensors is None:
+            raise RuntimeError("all_gather workspace is incomplete")
+        dist.all_gather(workspace.output_tensors, workspace.input_tensor, group=group)
+        return
+    if op in {"all_to_all", "all_to_allv"}:
+        if workspace.output_tensor is None:
+            raise RuntimeError(f"{op} workspace is incomplete")
+        dist.all_to_all_single(
+            workspace.output_tensor,
+            workspace.input_tensor,
+            output_split_sizes=workspace.output_split_sizes,
+            input_split_sizes=workspace.input_split_sizes,
             group=group,
         )
-        return out
+        return
     raise ValueError(op)
 
 
@@ -941,19 +969,23 @@ def _collective_bandwidth_case(
     else:
         tensor_numel = numel
 
-    tensor = torch.empty(tensor_numel, device=env.device, dtype=dtype)
+    workspace = _prepare_collective_bandwidth_workspace(
+        torch,
+        env,
+        op,
+        tensor_numel,
+        collective_group_rank,
+        collective_group_size,
+        dtype,
+        input_split_sizes=input_split_sizes,
+        output_split_sizes=output_split_sizes,
+    )
     for _ in range(max(0, warmup)):
         _collective_bandwidth_once(
-            torch,
             dist,
-            env,
             op,
-            tensor,
+            workspace,
             group=collective_group,
-            group_rank=collective_group_rank,
-            group_size=collective_group_size,
-            input_split_sizes=input_split_sizes,
-            output_split_sizes=output_split_sizes,
         )
     _synchronize(torch)
     dist.barrier(device_ids=[env.local_rank])
@@ -964,16 +996,10 @@ def _collective_bandwidth_case(
         _synchronize(torch)
         start = time.perf_counter()
         _collective_bandwidth_once(
-            torch,
             dist,
-            env,
             op,
-            tensor,
+            workspace,
             group=collective_group,
-            group_rank=collective_group_rank,
-            group_size=collective_group_size,
-            input_split_sizes=input_split_sizes,
-            output_split_sizes=output_split_sizes,
         )
         _synchronize(torch)
         elapsed = time.perf_counter() - start

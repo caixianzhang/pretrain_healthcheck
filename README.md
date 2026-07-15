@@ -827,6 +827,28 @@ multi-node:  2/2 PASS
 ../design_docs/pretrain_healthcheck_metax_test_summary.md
 ```
 
+### 华为官方 HCCL 单机 16 卡 All-Reduce 对照
+
+Ascend 环境可以使用官方 `all_reduce_test` 对齐 dynamic-suite 的单机 16 卡 1G All-Reduce 测试：
+
+```bash
+cd <pretrain_healthcheck>/scripts/ascend
+
+JOB_NAME=<vcjob-name> \
+DRY_RUN=0 \
+bash run_vcctl_hccl_single_node_allreduce.sh
+```
+
+脚本会在每个 Pod 内独立运行 16 个 MPI rank，不使用跨 Pod hostfile 或 SSH。默认工作负载为 `1G`、`bfp16`、warmup 1 次、计时 3 次。脚本只执行 `aligned_baseline`：设置运行 HCCL test 所需的基础环境，不注入 AIV、超大 HCCL buffer、Intra-RoCE、deterministic 或固定 CPU affinity 等场景特定调优参数。
+
+官方 HCCL test 输出 AlgBW；脚本按 16-rank All-Reduce 系数换算 BusBW：
+
+```text
+BusBW = AlgBW * 2 * (16 - 1) / 16 = AlgBW * 1.875
+```
+
+聚合结果写入 `results/hccl_official_single_node/<RUN_ID>/`。逐 Pod 原始 stdout/stderr 保存在开发机 `/tmp/pretrain_healthcheck_hccl_official/<RUN_ID>/`，仅失败日志通过 `failed_pod_logs/` 软链接暴露。
+
 ## 16. 同硬件环境 clone YAML
 
 训练 job 异常后，如果需要恢复同一批物理机器上的软件 / 硬件环境，可先在原 job 还存在时导出原始 job 配置、pod 到 node 的映射，并生成固定节点的 clone YAML。
