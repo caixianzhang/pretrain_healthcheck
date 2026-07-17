@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import json
 from pathlib import Path
 
 from .analyze import analyze_results
@@ -123,6 +125,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_suite.add_argument("--seed", type=int, default=20260623)
     p_suite.add_argument("--test-round", default="dynamic_suite")
     p_suite.add_argument("--group-id", default="")
+
+    p_retest = sub.add_parser("run-case-retest", help="retest an exact frozen collective case plan")
+    p_retest.add_argument("--output-dir", type=Path, required=True)
+    p_retest.add_argument("--plan-b64", required=True)
+    p_retest.add_argument("--dtype", default="bf16", choices=["fp32", "bf16", "fp16"])
+    p_retest.add_argument("--ep-size", type=int, default=8)
+    p_retest.add_argument("--warmup", type=int, default=1)
+    p_retest.add_argument("--iters", type=int, default=3)
+    p_retest.add_argument("--diagnostic-iters", type=int, default=3)
+    p_retest.add_argument("--seed", type=int, default=20260623)
+    p_retest.add_argument("--test-round", default="dynamic_retest")
+    p_retest.add_argument("--group-id", default="")
 
     p_analyze = sub.add_parser("analyze", help="analyze a result directory")
     p_analyze.add_argument("--input-dir", type=Path, required=True)
@@ -258,6 +272,29 @@ def main() -> None:
             collective_bandwidth_iters=args.collective_bandwidth_iters,
             collective_bandwidth_min_busbw=args.collective_bandwidth_min_busbw,
             collective_bandwidth_avg_busbw=args.collective_bandwidth_avg_busbw,
+            test_round=args.test_round,
+            group_id=args.group_id,
+        )
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"wrote {args.output_dir}")
+        return
+    if args.cmd == "run-case-retest":
+        import os
+
+        from .torch_checks import run_collective_case_retest
+
+        cases = json.loads(base64.b64decode(args.plan_b64.encode("ascii")).decode("utf-8"))
+        if not isinstance(cases, list):
+            raise ValueError("retest plan must decode to a JSON list")
+        run_collective_case_retest(
+            output_dir=args.output_dir,
+            dtype_name=args.dtype,
+            cases=cases,
+            ep_size=args.ep_size,
+            warmup=args.warmup,
+            iters=args.iters,
+            diagnostic_iters=args.diagnostic_iters,
+            seed=args.seed,
             test_round=args.test_round,
             group_id=args.group_id,
         )

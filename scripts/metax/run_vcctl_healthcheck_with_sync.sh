@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_PROJECT_DIR="${LOCAL_PROJECT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+source "${LOCAL_PROJECT_DIR}/scripts/common/driver_python.sh"
 LOCAL_PROJECT_PARENT="$(dirname "${LOCAL_PROJECT_DIR}")"
 LOCAL_PROJECT_NAME="$(basename "${LOCAL_PROJECT_DIR}")"
 
@@ -39,6 +40,7 @@ healthcheck, then copies pod-side results back to the local result root.
 Common env:
   JOB_NAME             vcjob name. Required unless POD_JSON_FILE is set.
   NAMESPACE            Kubernetes namespace. Default: default
+  DRIVER_PYTHON        Developer-machine Python >=3.9. Default: auto-discover
   LOCAL_PROJECT_DIR    Local pretrain_healthcheck path. Default: current project
   REMOTE_PROJECT_DIR   Pod-visible project path. Default: /tmp/pretrain_healthcheck_<RUN_ID>
   LOCAL_RESULT_ROOT    Local result root. Default: LOCAL_PROJECT_DIR/results/vcctl
@@ -74,6 +76,9 @@ if [[ ! -d "${LOCAL_PROJECT_DIR}" ]]; then
   exit 2
 fi
 
+resolve_driver_python
+print_driver_python
+
 TMP_DIR="$(mktemp -d /tmp/pretrain_vcctl_sync.XXXXXX)"
 cleanup() {
   rm -rf "${TMP_DIR}"
@@ -86,7 +91,7 @@ if [[ -z "${POD_JSON_FILE}" ]]; then
 fi
 
 master_info="$(
-  python3 - "${PODS_JSON}" "${CONTAINER_NAME}" <<'PY'
+  "${DRIVER_PYTHON}" - "${PODS_JSON}" "${CONTAINER_NAME}" <<'PY'
 import json
 import sys
 
@@ -160,7 +165,7 @@ PY
 )"
 
 pod_infos="$(
-  python3 - "${PODS_JSON}" "${CONTAINER_NAME}" <<'PY'
+  "${DRIVER_PYTHON}" - "${PODS_JSON}" "${CONTAINER_NAME}" <<'PY'
 import json
 import sys
 
@@ -328,14 +333,15 @@ if [[ "${SYNC_RESULTS_BACK}" == "1" || "${SYNC_RESULTS_BACK}" == "true" ]]; then
       echo "[vcctl-sync] rerunning static compare after result sync-back"
       static_result_dir="${LOCAL_RESULT_ROOT}/${RUN_ID}/static"
       set +e
-      python3 "${LOCAL_PROJECT_DIR}/tools/static_compare.py" \
+      "${DRIVER_PYTHON}" "${LOCAL_PROJECT_DIR}/tools/static_compare.py" \
         --result-dir "${static_result_dir}" \
-        --workers "${STATIC_COMPARE_WORKERS:-0}"
+        --workers "${STATIC_COMPARE_WORKERS:-0}" \
+        --ecc-policy "${STATIC_ECC_POLICY:-alert}"
       post_sync_compare_rc=$?
       set -e
       if [[ -f "${static_result_dir}/summary.json" ]]; then
         final_status="$(
-          python3 - "${static_result_dir}/summary.json" <<'PY'
+          "${DRIVER_PYTHON}" - "${static_result_dir}/summary.json" <<'PY'
 import json
 import sys
 

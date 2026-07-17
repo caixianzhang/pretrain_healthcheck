@@ -5,6 +5,10 @@ import unittest
 from pretrain_healthcheck.torch_checks import (
     _CollectiveBandwidthWorkspace,
     _collective_bandwidth_once,
+    _object_from_packet,
+    _object_packet,
+    _routing_counts,
+    _routing_output_counts,
 )
 
 
@@ -59,8 +63,6 @@ class CollectiveBandwidthBufferTests(unittest.TestCase):
             "all_to_all": _CollectiveBandwidthWorkspace(
                 input_tensor=object(),
                 output_tensor=object(),
-                input_split_sizes=[2, 2],
-                output_split_sizes=[2, 2],
             ),
             "all_to_allv": _CollectiveBandwidthWorkspace(
                 input_tensor=object(),
@@ -80,6 +82,49 @@ class CollectiveBandwidthBufferTests(unittest.TestCase):
                 self.assertIs(dist.calls[0][1], dist.calls[1][1])
                 if op in {"reduce_scatter", "all_gather", "all_to_all", "all_to_allv"}:
                     self.assertIs(dist.calls[0][2], dist.calls[1][2])
+
+                if op == "all_to_all":
+                    self.assertIsNone(dist.calls[0][3])
+                    self.assertIsNone(dist.calls[0][4])
+                elif op == "all_to_allv":
+                    self.assertEqual(dist.calls[0][3], [2, 2])
+                    self.assertEqual(dist.calls[0][4], [1, 3])
+
+
+class SplitSizeExchangeTests(unittest.TestCase):
+    def test_reconstructs_512_rank_receive_splits_without_collective(self) -> None:
+        world_size = 512
+        destination_rank = 317
+        total_tokens = 1_073_741_824
+        for pattern in ("uniform", "empty_expert", "hot_expert", "skewed", "random"):
+            with self.subTest(pattern=pattern):
+                expected = [
+                    _routing_counts(pattern, world_size, total_tokens, source_rank, 20260706)[destination_rank]
+                    for source_rank in range(world_size)
+                ]
+                received = _routing_output_counts(
+                    pattern,
+                    world_size,
+                    total_tokens,
+                    destination_rank,
+                    20260706,
+                )
+                self.assertEqual(received, expected)
+
+    def test_rejects_invalid_destination_rank(self) -> None:
+        with self.assertRaisesRegex(ValueError, "outside world size"):
+            _routing_output_counts("uniform", 4, 1024, 4, 20260706)
+
+
+class ObjectPacketTests(unittest.TestCase):
+    def test_round_trip_preserves_nested_metadata(self) -> None:
+        obj = {"rank": 7, "rows": [{"latency": 0.125}], "ok": True}
+        self.assertEqual(_object_from_packet(_object_packet(obj)), obj)
+
+    def test_rejects_truncated_packet(self) -> None:
+        packet = _object_packet({"rank": 7})
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            _object_from_packet(packet[:-1])
 
 
 if __name__ == "__main__":

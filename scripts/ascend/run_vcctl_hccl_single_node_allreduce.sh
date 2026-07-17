@@ -8,6 +8,7 @@ JOB_NAME="${JOB_NAME:-}"
 NAMESPACE="${NAMESPACE:-default}"
 VCCTL_BIN="${VCCTL_BIN:-vcctl}"
 CONTAINER_NAME="${CONTAINER_NAME:-}"
+POD_NAMES="${POD_NAMES:-}"
 RESULT_ROOT="${RESULT_ROOT:-${PROJECT_DIR}/results/hccl_official_single_node}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN="${DRY_RUN:-1}"
@@ -33,6 +34,7 @@ fi
 echo "[hccl-single-node] project      : ${PROJECT_DIR}"
 echo "[hccl-single-node] job          : ${JOB_NAME}"
 echo "[hccl-single-node] namespace    : ${NAMESPACE}"
+echo "[hccl-single-node] pod filter   : ${POD_NAMES:-all}"
 echo "[hccl-single-node] run id       : ${RUN_ID}"
 echo "[hccl-single-node] output       : ${RESULT_ROOT}/${RUN_ID}"
 echo "[hccl-single-node] workload     : ${NPUS_PER_NODE} ranks, all_reduce, ${MESSAGE_SIZE}, ${DTYPE}, warmup=${WARMUP}, iters=${ITERS}"
@@ -44,6 +46,7 @@ exec python3 "${PROJECT_DIR}/tools/vcctl_hccl_single_node_allreduce.py" \
   --namespace "${NAMESPACE}" \
   --vcctl-bin "${VCCTL_BIN}" \
   --container-name "${CONTAINER_NAME}" \
+  --pod-names "${POD_NAMES}" \
   --result-root "${RESULT_ROOT}" \
   --run-id "${RUN_ID}" \
   --ascend-env-script "${ASCEND_ENV_SCRIPT}" \

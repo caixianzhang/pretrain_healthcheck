@@ -72,3 +72,12 @@ def test_remote_command_uses_portable_baseline_only() -> None:
     assert "HCCL_OP_EXPANSION_MODE" not in aligned
     assert "HCCL_BUFFSIZE" not in aligned
     assert "CPU_AFFINITY_CONF" not in aligned
+
+
+def test_select_pods_filters_exact_names_in_requested_order() -> None:
+    pod_a = MODULE.Pod("pod-a", "default", "worker", "worker", "node-a", "10.0.0.1", "10.1.0.1")
+    pod_b = MODULE.Pod("pod-b", "default", "worker", "worker", "node-b", "10.0.0.2", "10.1.0.2")
+
+    selected = MODULE.select_pods([pod_a, pod_b], ["pod-b"])
+
+    assert selected == [pod_b]

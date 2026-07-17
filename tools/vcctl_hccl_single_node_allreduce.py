@@ -148,6 +148,18 @@ def pod_sort_key(pod: Pod) -> tuple[int, int, str]:
     return group, int(suffix) if suffix.isdigit() else 0, pod.pod_name
 
 
+def select_pods(pods: list[Pod], requested_names: list[str]) -> list[Pod]:
+    if not requested_names:
+        return pods
+    if len(requested_names) != len(set(requested_names)):
+        raise ValueError("pod filter contains duplicate names")
+    by_name = {pod.pod_name: pod for pod in pods}
+    missing = [name for name in requested_names if name not in by_name]
+    if missing:
+        raise ValueError(f"requested pods not found: {','.join(missing)}")
+    return [by_name[name] for name in requested_names]
+
+
 def message_size_bytes(value: str) -> int:
     match = re.fullmatch(r"\s*(\d+)\s*([KMGT]?)B?\s*", value, re.IGNORECASE)
     if not match:
@@ -253,7 +265,7 @@ def load_pods(args: argparse.Namespace) -> list[Pod]:
     pods.sort(key=pod_sort_key)
     if not pods:
         raise RuntimeError(f"no scheduled pods found for job {args.job_name!r}")
-    return pods
+    return select_pods(pods, args.pod_names)
 
 
 def run_one(args: argparse.Namespace, pod: Pod, variant: str, log_root: Path) -> Result:
@@ -438,6 +450,7 @@ def write_parameters(path: Path, args: argparse.Namespace) -> None:
     values = {
         "JOB_NAME": args.job_name,
         "NAMESPACE": args.namespace,
+        "POD_NAMES": ",".join(args.pod_names),
         "RUN_ID": args.run_id,
         "NPUS_PER_NODE": args.npus_per_node,
         "DTYPE": args.dtype,
@@ -462,6 +475,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--namespace", default="default")
     parser.add_argument("--vcctl-bin", default="vcctl")
     parser.add_argument("--container-name", default="")
+    parser.add_argument("--pod-names", default="")
     parser.add_argument("--result-root", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--ascend-env-script", required=True)
@@ -479,6 +493,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", type=int, choices=(0, 1), default=1)
     args = parser.parse_args()
     args.dry_run = bool(args.dry_run)
+    args.pod_names = [name.strip() for name in args.pod_names.split(",") if name.strip()]
     args.message_size_bytes = message_size_bytes(args.message_size)
     if args.npus_per_node < 2:
         parser.error("--npus-per-node must be at least 2")

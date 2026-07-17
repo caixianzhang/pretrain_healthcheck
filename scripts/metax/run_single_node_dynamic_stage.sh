@@ -35,6 +35,7 @@ dynamic_fault_pod_matches() {
 }
 
 emit_compact_frame() {
+  local sidecar="${WORK_DIR}/.hc_dynamic_result.v2"
   python3 "${PROJECT_DIR}/tools/dynamic_compact.py" \
     --input-dir "${WORK_DIR}" \
     --kind "${STAGE_KIND}" \
@@ -44,7 +45,30 @@ emit_compact_frame() {
     --pod-name "${HC_POD_NAME:-}" \
     --node-name "${HC_NODE_NAME:-}" \
     --pod-ip "${HC_POD_IP:-}" \
-    --host-ip "${HC_HOST_IP:-}" || true
+    --host-ip "${HC_HOST_IP:-}" \
+    --expected-ranks "${GPUS_PER_NODE}" \
+    --expected-bandwidth-message-sizes "${BANDWIDTH_MESSAGE_SIZES:-1G}" \
+    --expected-collective-message-sizes "${COLLECTIVE_BANDWIDTH_MESSAGE_SIZES:-${COLLECTIVE_ACCEPTANCE_MESSAGE_SIZES}}" \
+    --expected-collective-ops "${COLLECTIVE_BANDWIDTH_OPS:-${COLLECTIVE_ACCEPTANCE_OPS}}" \
+    --expected-collective-moe-patterns "${COLLECTIVE_BANDWIDTH_MOE_PATTERNS:-${MOE_PATTERNS:-uniform,skewed,hot_expert,random,empty_expert}}" \
+    --frame-output "${sidecar}" \
+    --no-stdout || return 1
+
+  if dynamic_fault_pod_matches && [[ "${DYNAMIC_FAULT_TYPE:-}" == "frame_missing" ]]; then
+    echo "[dynamic-stage] dynamic fault frame_missing: suppressing compact frame and sidecar" >&2
+    rm -f "${sidecar}"
+  elif dynamic_fault_pod_matches && [[ "${DYNAMIC_FAULT_TYPE:-}" == "frame_corrupt" ]]; then
+    echo "[dynamic-stage] dynamic fault frame_corrupt: emitting invalid compact frame" >&2
+    rm -f "${sidecar}"
+    echo "__HC_DYNAMIC_RESULT_JSON__ {invalid-json"
+  elif dynamic_fault_pod_matches && [[ "${DYNAMIC_FAULT_TYPE:-}" == "frame_transport_truncate" ]]; then
+    local truncate_bytes="${DYNAMIC_FAULT_FRAME_BYTES:-512}"
+    echo "[dynamic-stage] dynamic fault frame_transport_truncate: bytes=${truncate_bytes}" >&2
+    head -c "${truncate_bytes}" "${sidecar}"
+    echo
+  else
+    cat "${sidecar}"
+  fi
 }
 
 cd "${PROJECT_DIR}" || exit 1
@@ -137,13 +161,6 @@ case "${STAGE_KIND}" in
     ;;
 esac
 
-if dynamic_fault_pod_matches && [[ "${DYNAMIC_FAULT_TYPE:-}" == "frame_missing" ]]; then
-  echo "[dynamic-stage] dynamic fault frame_missing: suppressing compact frame" >&2
-elif dynamic_fault_pod_matches && [[ "${DYNAMIC_FAULT_TYPE:-}" == "frame_corrupt" ]]; then
-  echo "[dynamic-stage] dynamic fault frame_corrupt: emitting invalid compact frame" >&2
-  echo "__HC_DYNAMIC_RESULT_JSON__ {invalid-json"
-else
-  emit_compact_frame "${rc}"
-fi
+emit_compact_frame "${rc}" || true
 
 exit "${rc}"

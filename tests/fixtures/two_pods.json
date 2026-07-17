@@ -1,0 +1,54 @@
+{
+  "items": [
+    {
+      "metadata": {
+        "name": "healthcheck-master-0",
+        "namespace": "default",
+        "labels": {"volcano.sh/task-spec": "master"}
+      },
+      "spec": {
+        "nodeName": "node-a",
+        "containers": [{
+          "name": "master",
+          "env": [
+            {"name": "RANK", "value": "0"},
+            {"name": "WORLD_SIZE", "value": "2"},
+            {"name": "MASTER_ADDR", "value": "healthcheck-master-0.healthcheck"},
+            {"name": "MASTER_PORT", "value": "23456"}
+          ]
+        }]
+      },
+      "status": {
+        "phase": "Running",
+        "podIP": "198.51.100.10",
+        "hostIP": "192.0.2.10",
+        "containerStatuses": [{"name": "master", "ready": true, "restartCount": 0}]
+      }
+    },
+    {
+      "metadata": {
+        "name": "healthcheck-worker-0",
+        "namespace": "default",
+        "labels": {"volcano.sh/task-spec": "worker"}
+      },
+      "spec": {
+        "nodeName": "node-b",
+        "containers": [{
+          "name": "worker",
+          "env": [
+            {"name": "RANK", "value": "1"},
+            {"name": "WORLD_SIZE", "value": "2"},
+            {"name": "MASTER_ADDR", "value": "healthcheck-master-0.healthcheck"},
+            {"name": "MASTER_PORT", "value": "23456"}
+          ]
+        }]
+      },
+      "status": {
+        "phase": "Running",
+        "podIP": "198.51.100.11",
+        "hostIP": "192.0.2.11",
+        "containerStatuses": [{"name": "worker", "ready": true, "restartCount": 0}]
+      }
+    }
+  ]
+}

@@ -604,7 +604,7 @@ if fault_target():
         env_keys = facts.setdefault("container", {}).setdefault("env_keys", [])
         facts["container"]["env_keys"] = [k for k in env_keys if not k.startswith(("MCCL", "MACA", "MASTER_"))]
         set_check_fail("metax/maca_env", "fault injection: simulated missing communication env")
-    elif fault_type in {"ecc_corrected", "ecc_single_bit", "ecc_uncorrected", "ecc_double_bit", "ecc_disabled", "ecc_query_failure"}:
+    elif fault_type in {"ecc_corrected", "ecc_single_bit", "ecc_uncorrected", "ecc_double_bit", "ecc_critical_event", "ecc_disabled", "ecc_query_failure"}:
         ecc = facts.setdefault("gpu", {}).setdefault("ecc", {})
         if fault_type in {"ecc_corrected", "ecc_single_bit"}:
             ecc["corrected_error_gpu_count"] = 1
@@ -612,6 +612,11 @@ if fault_target():
         elif fault_type in {"ecc_uncorrected", "ecc_double_bit"}:
             ecc["uncorrected_error_gpu_count"] = 1
             ecc["uncorrected_error_details"] = {"0": ["fault injection: uncorrected ECC"]}
+        elif fault_type == "ecc_critical_event":
+            ecc["critical_event_count"] = 1
+            ecc["critical_events"] = [
+                {"gpu_id": 0, "event_type": "dbe", "details": ["fault injection: critical DBE event"]}
+            ]
         elif fault_type == "ecc_disabled":
             ecc["all_enabled"] = False
             ecc["disabled_gpus"] = [0]

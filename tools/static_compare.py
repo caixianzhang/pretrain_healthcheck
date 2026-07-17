@@ -85,6 +85,23 @@ ECC_CRITICAL_KEYS = {
     "ascend.ecc.hbm_double_bit_next_isolated_pages_count",
 }
 
+ASCEND_ECC_AGGREGATE_KEYS = {
+    "ascend.ecc.hbm_single_bit_aggregate_total_err_count",
+    "ascend.ecc.hbm_double_bit_aggregate_total_err_count",
+}
+
+ASCEND_ECC_CURRENT_WARNING_KEYS = {
+    "ascend.ecc.hbm_single_bit_error_count",
+}
+
+ASCEND_ECC_CURRENT_CRITICAL_KEYS = {
+    "ascend.ecc.hbm_double_bit_error_count",
+    "ascend.ecc.hbm_single_bit_isolated_pages_count",
+    "ascend.ecc.hbm_double_bit_isolated_pages_count",
+    "ascend.ecc.hbm_single_bit_next_isolated_pages_count",
+    "ascend.ecc.hbm_double_bit_next_isolated_pages_count",
+}
+
 ECC_RULE_ONLY_FACT_KEYS = {"ascend.ecc.query_status", *ECC_SINGLE_BIT_KEYS, *ECC_CRITICAL_KEYS}
 
 METAX_ECC_CORRECTED_KEYS = {
@@ -113,6 +130,7 @@ class PodStaticFacts:
     status_rows: dict[str, dict[str, str]]
     facts: dict[str, str]
     errors: list[str]
+    raw: dict[str, Any] | None = None
 
 
 @dataclass
@@ -124,6 +142,57 @@ class StaticIssue:
     expected: str
     actual: str
     reason: str
+
+
+def ecc_alert(
+    pod: PodStaticFacts,
+    vendor: str,
+    severity: str,
+    source: str,
+    category: str,
+    reason: str,
+    *,
+    device_id: Any = "",
+    chip_id: Any = "",
+    counter_name: str = "",
+    counter_value: Any = "",
+    event_detail: Any = "",
+    action: str = "observe",
+) -> dict[str, Any]:
+    return {
+        "vendor": vendor,
+        "severity": severity,
+        "pod_name": pod.pod_name,
+        "node_name": pod.node_name,
+        "pod_ip": pod.pod_ip,
+        "device_id": device_id,
+        "chip_id": chip_id,
+        "source": source,
+        "category": category,
+        "counter_name": counter_name,
+        "counter_value": counter_value,
+        "event_detail": event_detail,
+        "reason": reason,
+        "action": action,
+    }
+
+
+def issue_from_ecc_alert(alert: dict[str, Any], check: str, expected: str) -> StaticIssue:
+    actual = alert.get("event_detail") or {
+        "counter_name": alert.get("counter_name", ""),
+        "counter_value": alert.get("counter_value", ""),
+        "device_id": alert.get("device_id", ""),
+        "chip_id": alert.get("chip_id", ""),
+    }
+    return StaticIssue(
+        severity=str(alert["severity"]),
+        pod_name=str(alert["pod_name"]),
+        node_name=str(alert["node_name"]),
+        check=check,
+        expected=expected,
+        actual=json.dumps(actual, ensure_ascii=False, sort_keys=True) if not isinstance(actual, str) else actual,
+        reason=str(alert["reason"]),
+    )
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -400,6 +469,7 @@ def load_compact_fact_row(row: dict[str, Any], pods_by_name: dict[str, dict[str,
         status_rows=status_rows,
         facts=compact_to_flat_facts(row),
         errors=[] if pod_name else ["missing pod.name in compact facts"],
+        raw=row,
     )
 
 
@@ -441,6 +511,7 @@ def load_pod_static_result(pod_dir: Path, pods_by_name: dict[str, dict[str, Any]
         status_rows=status_rows,
         facts=facts,
         errors=errors,
+        raw=None,
     )
 
 
@@ -530,6 +601,7 @@ def load_aggregated_static_results(result_dir: Path, pods_by_name: dict[str, dic
                     },
                     facts={str(k): str(v) for k, v in row.get("legacy_flat_facts", {}).items()},
                     errors=[],
+                    raw=row,
                 )
             )
         else:
@@ -654,88 +726,78 @@ def compare_facts(pods: list[PodStaticFacts]) -> list[StaticIssue]:
     return issues
 
 
-def compare_metax_ecc_gates(pods: list[PodStaticFacts]) -> list[StaticIssue]:
+def compare_metax_ecc_gates(
+    pods: list[PodStaticFacts], ecc_policy: str = "alert"
+) -> tuple[list[StaticIssue], list[dict[str, Any]]]:
     issues: list[StaticIssue] = []
+    alerts: list[dict[str, Any]] = []
     required_keys = sorted(METAX_ECC_CORRECTED_KEYS | METAX_ECC_CRITICAL_KEYS)
     for pod in pods:
         if "metax.attached_gpus" not in pod.facts:
             continue
 
+        raw = pod.raw or {}
+        gpu = raw.get("gpu", {}) if isinstance(raw.get("gpu"), dict) else {}
+        ecc = gpu.get("ecc", {}) if isinstance(gpu.get("ecc"), dict) else {}
+
         query_status = pod.facts.get("metax.ecc.query_status", "")
         if query_status != "OK":
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:metax_ecc_query",
-                    expected="OK",
-                    actual=query_status or "missing",
-                    reason="MetaX ECC/RAS query failed, is missing, or produced incomplete output",
-                )
+            alert = ecc_alert(
+                pod, "metax", "FAIL", "status", "query_failure",
+                "MetaX ECC/RAS query failed, is missing, or produced incomplete output",
+                event_detail=ecc.get("errors", query_status or "missing"), action="ops_check",
             )
+            alerts.append(alert)
+            issues.append(issue_from_ecc_alert(alert, "rule:metax_ecc_query", "OK"))
             continue
 
         missing_keys = [key for key in required_keys if key not in pod.facts]
         if missing_keys:
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:metax_ecc_counters",
-                    expected="all ECC/RAS counters present",
-                    actual=",".join(missing_keys),
-                    reason="MetaX ECC/RAS output is missing required counters",
-                )
+            alert = ecc_alert(
+                pod, "metax", "FAIL", "status", "missing_counters",
+                "MetaX ECC/RAS output is missing required counters",
+                event_detail=missing_keys, action="ops_check",
             )
+            alerts.append(alert)
+            issues.append(issue_from_ecc_alert(alert, "rule:metax_ecc_counters", "all ECC/RAS counters present"))
             continue
 
         try:
             ecc_gpu_count = int(pod.facts.get("metax.ecc.gpu_count", ""))
             attached_gpu_count = int(pod.facts.get("metax.attached_gpus", ""))
         except ValueError:
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:metax_ecc_topology",
-                    expected="numeric GPU counts",
-                    actual=(
-                        f"ecc={pod.facts.get('metax.ecc.gpu_count', '')},"
-                        f"attached={pod.facts.get('metax.attached_gpus', '')}"
-                    ),
-                    reason="MetaX ECC topology counters are invalid",
-                )
+            alert = ecc_alert(
+                pod, "metax", "FAIL", "status", "invalid_topology",
+                "MetaX ECC topology counters are invalid",
+                event_detail={
+                    "ecc_gpu_count": pod.facts.get("metax.ecc.gpu_count", ""),
+                    "attached_gpu_count": pod.facts.get("metax.attached_gpus", ""),
+                }, action="ops_check",
             )
+            alerts.append(alert)
+            issues.append(issue_from_ecc_alert(alert, "rule:metax_ecc_topology", "numeric GPU counts"))
             continue
 
         if ecc_gpu_count <= 0 or ecc_gpu_count != attached_gpu_count:
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:metax_ecc_topology",
-                    expected=f"ecc_gpu_count={attached_gpu_count}",
-                    actual=f"ecc_gpu_count={ecc_gpu_count}",
-                    reason="MetaX ECC/RAS query did not cover every attached GPU",
-                )
+            alert = ecc_alert(
+                pod, "metax", "FAIL", "status", "topology_mismatch",
+                "MetaX ECC/RAS query did not cover every attached GPU",
+                counter_name="ecc_gpu_count", counter_value=ecc_gpu_count,
+                event_detail={"attached_gpu_count": attached_gpu_count}, action="ops_check",
             )
+            alerts.append(alert)
+            issues.append(issue_from_ecc_alert(alert, "rule:metax_ecc_topology", f"ecc_gpu_count={attached_gpu_count}"))
 
         if pod.facts.get("metax.ecc.all_enabled", "").lower() != "true":
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:metax_ecc_enabled",
-                    expected="True",
-                    actual=pod.facts.get("metax.ecc.all_enabled", "missing"),
-                    reason="ECC is disabled on one or more MetaX GPUs",
+            disabled = ecc.get("disabled_gpus", []) or [""]
+            for gpu_id in disabled:
+                alert = ecc_alert(
+                    pod, "metax", "FAIL", "status", "ecc_disabled",
+                    "ECC is disabled on one or more MetaX GPUs",
+                    device_id=gpu_id, event_detail=ecc.get("states", {}), action="quarantine",
                 )
-            )
+                alerts.append(alert)
+                issues.append(issue_from_ecc_alert(alert, "rule:metax_ecc_enabled", "True"))
 
         try:
             critical = {
@@ -749,81 +811,116 @@ def compare_metax_ecc_gates(pods: list[PodStaticFacts]) -> list[StaticIssue]:
                 if int(pod.facts[key]) > 0
             }
         except ValueError:
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:metax_ecc_counters",
-                    expected="non-negative integer counters",
-                    actual="invalid counter value",
-                    reason="MetaX ECC/RAS counter parsing failed",
-                )
+            alert = ecc_alert(
+                pod, "metax", "FAIL", "status", "invalid_counters",
+                "MetaX ECC/RAS counter parsing failed", event_detail="invalid counter value", action="ops_check",
             )
+            alerts.append(alert)
+            issues.append(issue_from_ecc_alert(alert, "rule:metax_ecc_counters", "non-negative integer counters"))
             continue
 
-        if critical:
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:metax_ecc_critical",
-                    expected="no uncorrected ECC or critical RAS events",
-                    actual=json.dumps(critical, sort_keys=True),
-                    reason="uncorrected ECC or critical MetaX RAS event detected",
+        corrected_details = ecc.get("corrected_error_details", {}) if isinstance(ecc.get("corrected_error_details"), dict) else {}
+        uncorrected_details = ecc.get("uncorrected_error_details", {}) if isinstance(ecc.get("uncorrected_error_details"), dict) else {}
+        counter_specs = [
+            (corrected_details, "corrected_error_details", "corrected_count", "corrected MetaX ECC/RAS cumulative count detected"),
+            (uncorrected_details, "uncorrected_error_details", "uncorrected_count", "uncorrected MetaX ECC/RAS cumulative count detected without a critical event"),
+        ]
+        for details, detail_key, category, reason in counter_specs:
+            for gpu_id, values in sorted(details.items(), key=lambda item: str(item[0])):
+                severity = "SUSPECT" if ecc_policy == "strict" and category == "corrected_count" else "WARN"
+                if ecc_policy == "strict" and category == "uncorrected_count":
+                    severity = "FAIL"
+                action = "quarantine" if severity == "FAIL" else "retest" if severity == "SUSPECT" else "observe"
+                alert = ecc_alert(
+                    pod, "metax", severity, "counter", category, reason,
+                    device_id=gpu_id, counter_name=detail_key, counter_value=len(values) if isinstance(values, list) else 1,
+                    event_detail=values, action=action,
                 )
+                alerts.append(alert)
+                if severity in {"SUSPECT", "FAIL"}:
+                    issues.append(issue_from_ecc_alert(alert, f"rule:metax_ecc_{category}", "0"))
+
+        corrected_events = ecc.get("corrected_events", []) if isinstance(ecc.get("corrected_events"), list) else []
+        critical_events = ecc.get("critical_events", []) if isinstance(ecc.get("critical_events"), list) else []
+        for event in corrected_events:
+            severity = "SUSPECT" if ecc_policy == "strict" else "WARN"
+            alert = ecc_alert(
+                pod, "metax", severity, "event", str(event.get("event_type", "corrected_event")),
+                "corrected MetaX RAS event detected", device_id=event.get("gpu_id", ""),
+                event_detail=event.get("details", []), action="retest",
             )
-        if corrected:
-            issues.append(
-                StaticIssue(
-                    severity="SUSPECT",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:metax_ecc_corrected",
-                    expected="no corrected ECC or AER-CE events",
-                    actual=json.dumps(corrected, sort_keys=True),
-                    reason="corrected MetaX ECC/RAS event detected; retest required",
-                )
+            alerts.append(alert)
+            if severity == "SUSPECT":
+                issues.append(issue_from_ecc_alert(alert, "rule:metax_ecc_corrected_event", "no corrected RAS events"))
+
+        for event in critical_events:
+            alert = ecc_alert(
+                pod, "metax", "FAIL", "event", str(event.get("event_type", "critical_event")),
+                "critical MetaX RAS event detected", device_id=event.get("gpu_id", ""),
+                event_detail=event.get("details", []), action="quarantine",
             )
-    return issues
+            alerts.append(alert)
+            issues.append(issue_from_ecc_alert(alert, "rule:metax_ecc_critical_event", "no critical RAS events"))
+
+        # Legacy compact facts may contain aggregate counters without device details.
+        if int(pod.facts.get("metax.ecc.corrected_error_gpu_count", "0")) > 0 and not corrected_details:
+            severity = "SUSPECT" if ecc_policy == "strict" else "WARN"
+            alert = ecc_alert(pod, "metax", severity, "counter", "corrected_count", "corrected MetaX ECC/RAS cumulative count detected", counter_name="corrected_error_gpu_count", counter_value=pod.facts["metax.ecc.corrected_error_gpu_count"], action="retest")
+            alerts.append(alert)
+            if severity == "SUSPECT":
+                issues.append(issue_from_ecc_alert(alert, "rule:metax_ecc_corrected", "0"))
+        if int(pod.facts.get("metax.ecc.uncorrected_error_gpu_count", "0")) > 0 and not uncorrected_details:
+            severity = "FAIL" if ecc_policy == "strict" else "WARN"
+            alert = ecc_alert(pod, "metax", severity, "counter", "uncorrected_count", "uncorrected MetaX ECC/RAS cumulative count detected without a critical event", counter_name="uncorrected_error_gpu_count", counter_value=pod.facts["metax.ecc.uncorrected_error_gpu_count"], action="quarantine" if severity == "FAIL" else "observe")
+            alerts.append(alert)
+            if severity == "FAIL":
+                issues.append(issue_from_ecc_alert(alert, "rule:metax_ecc_critical", "0"))
+        if int(pod.facts.get("metax.ecc.corrected_event_count", "0")) > 0 and not corrected_events:
+            severity = "SUSPECT" if ecc_policy == "strict" else "WARN"
+            alert = ecc_alert(pod, "metax", severity, "event", "corrected_event", "corrected MetaX RAS event detected", counter_name="corrected_event_count", counter_value=pod.facts["metax.ecc.corrected_event_count"], action="retest")
+            alerts.append(alert)
+            if severity == "SUSPECT":
+                issues.append(issue_from_ecc_alert(alert, "rule:metax_ecc_corrected_event", "0"))
+        if int(pod.facts.get("metax.ecc.critical_event_count", "0")) > 0 and not critical_events:
+            alert = ecc_alert(pod, "metax", "FAIL", "event", "critical_event", "critical MetaX RAS event detected", counter_name="critical_event_count", counter_value=pod.facts["metax.ecc.critical_event_count"], action="quarantine")
+            alerts.append(alert)
+            issues.append(issue_from_ecc_alert(alert, "rule:metax_ecc_critical_event", "0"))
+    return issues, alerts
 
 
-def compare_ascend_ecc_gates(pods: list[PodStaticFacts]) -> list[StaticIssue]:
+def compare_ascend_ecc_gates(
+    pods: list[PodStaticFacts], ecc_policy: str = "alert"
+) -> tuple[list[StaticIssue], list[dict[str, Any]]]:
     issues: list[StaticIssue] = []
+    alerts: list[dict[str, Any]] = []
     required_counter_keys = sorted(ECC_SINGLE_BIT_KEYS | ECC_CRITICAL_KEYS)
     for pod in pods:
         if "ascend.chip_count" not in pod.facts:
             continue
 
+        raw = pod.raw or {}
+        npu = raw.get("npu", {}) if isinstance(raw.get("npu"), dict) else {}
+        ecc = npu.get("ecc", {}) if isinstance(npu.get("ecc"), dict) else {}
+
         query_status = pod.facts.get("ascend.ecc.query_status", "")
         if query_status != "OK":
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:ascend_ecc_query",
-                    expected="OK",
-                    actual=query_status or "missing",
-                    reason="ECC query failed, is missing, or produced incomplete output",
-                )
+            alert = ecc_alert(
+                pod, "ascend", "FAIL", "status", "query_failure",
+                "ECC query failed, is missing, or produced incomplete output",
+                event_detail=ecc.get("errors", query_status or "missing"), action="ops_check",
             )
+            alerts.append(alert)
+            issues.append(issue_from_ecc_alert(alert, "rule:ascend_ecc_query", "OK"))
             continue
 
         missing_keys = [key for key in required_counter_keys if key not in pod.facts]
         if missing_keys:
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:ascend_ecc_counters",
-                    expected="all ECC counters present",
-                    actual=",".join(missing_keys),
-                    reason="ECC output is missing required counters",
-                )
+            alert = ecc_alert(
+                pod, "ascend", "FAIL", "status", "missing_counters",
+                "ECC output is missing required counters", event_detail=missing_keys, action="ops_check",
             )
+            alerts.append(alert)
+            issues.append(issue_from_ecc_alert(alert, "rule:ascend_ecc_counters", "all ECC counters present"))
             continue
 
         try:
@@ -831,35 +928,27 @@ def compare_ascend_ecc_gates(pods: list[PodStaticFacts]) -> list[StaticIssue]:
             visible_npu_count = int(pod.facts.get("ascend.chip_count", ""))
             ecc_chip_count = int(pod.facts.get("ascend.ecc.chip_count", ""))
         except ValueError:
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:ascend_ecc_topology",
-                    expected="numeric NPU and Chip counts",
-                    actual=(
-                        f"npu={pod.facts.get('ascend.ecc.npu_count', '')},"
-                        f"visible={pod.facts.get('ascend.chip_count', '')},"
-                        f"chips={pod.facts.get('ascend.ecc.chip_count', '')}"
-                    ),
-                    reason="ECC topology counters are invalid",
-                )
+            alert = ecc_alert(
+                pod, "ascend", "FAIL", "status", "invalid_topology",
+                "ECC topology counters are invalid", event_detail={
+                    "npu_count": pod.facts.get("ascend.ecc.npu_count", ""),
+                    "visible_chip_count": pod.facts.get("ascend.chip_count", ""),
+                    "ecc_chip_count": pod.facts.get("ascend.ecc.chip_count", ""),
+                }, action="ops_check",
             )
+            alerts.append(alert)
+            issues.append(issue_from_ecc_alert(alert, "rule:ascend_ecc_topology", "numeric NPU and Chip counts"))
             continue
 
         if ecc_npu_count <= 0 or ecc_chip_count <= 0 or ecc_chip_count != visible_npu_count:
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:ascend_ecc_topology",
-                    expected=f"ecc_chip_count={visible_npu_count}, physical_npu_count>0",
-                    actual=f"ecc_npu_count={ecc_npu_count}, chip_count={ecc_chip_count}",
-                    reason="ECC query did not cover every visible logical NPU chip",
-                )
+            alert = ecc_alert(
+                pod, "ascend", "FAIL", "status", "topology_mismatch",
+                "ECC query did not cover every visible logical NPU chip",
+                counter_name="ecc_chip_count", counter_value=ecc_chip_count,
+                event_detail={"physical_npu_count": ecc_npu_count, "visible_chip_count": visible_npu_count}, action="ops_check",
             )
+            alerts.append(alert)
+            issues.append(issue_from_ecc_alert(alert, "rule:ascend_ecc_topology", f"ecc_chip_count={visible_npu_count}, physical_npu_count>0"))
 
         try:
             critical = {
@@ -873,44 +962,65 @@ def compare_ascend_ecc_gates(pods: list[PodStaticFacts]) -> list[StaticIssue]:
                 if int(pod.facts[key]) > 0
             }
         except ValueError:
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:ascend_ecc_counters",
-                    expected="non-negative integer counters",
-                    actual="invalid counter value",
-                    reason="ECC counter parsing failed",
-                )
+            alert = ecc_alert(
+                pod, "ascend", "FAIL", "status", "invalid_counters",
+                "ECC counter parsing failed", event_detail="invalid counter value", action="ops_check",
             )
+            alerts.append(alert)
+            issues.append(issue_from_ecc_alert(alert, "rule:ascend_ecc_counters", "non-negative integer counters"))
             continue
 
-        if critical:
-            issues.append(
-                StaticIssue(
-                    severity="FAIL",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:ascend_ecc_critical",
-                    expected="all double-bit and isolated-page counters equal 0",
-                    actual=json.dumps(critical, sort_keys=True),
-                    reason="critical HBM ECC or isolated-page condition detected",
+        nonzero_chips = ecc.get("nonzero_chips", []) if isinstance(ecc.get("nonzero_chips"), list) else []
+        emitted_keys: set[str] = set()
+        for chip in nonzero_chips:
+            if not isinstance(chip, dict):
+                continue
+            for raw_name, raw_value in chip.items():
+                if raw_name in {"npu_id", "chip_id"} or not isinstance(raw_value, int) or raw_value <= 0:
+                    continue
+                key = f"ascend.ecc.{raw_name}"
+                emitted_keys.add(key)
+                if key in ASCEND_ECC_CURRENT_CRITICAL_KEYS:
+                    severity, action = "FAIL", "quarantine"
+                    reason = "current uncorrectable HBM ECC or isolated-page condition detected"
+                elif ecc_policy == "strict":
+                    severity = "FAIL" if key in ECC_CRITICAL_KEYS else "SUSPECT"
+                    action = "quarantine" if severity == "FAIL" else "retest"
+                    reason = "Ascend ECC counter detected under strict policy"
+                else:
+                    severity, action = "WARN", "observe"
+                    reason = "historical or correctable Ascend ECC counter detected"
+                alert = ecc_alert(
+                    pod, "ascend", severity, "counter", raw_name, reason,
+                    device_id=chip.get("npu_id", ""), chip_id=chip.get("chip_id", ""),
+                    counter_name=raw_name, counter_value=raw_value, action=action,
                 )
+                alerts.append(alert)
+                if severity in {"SUSPECT", "FAIL"}:
+                    issues.append(issue_from_ecc_alert(alert, f"rule:ascend_ecc_{raw_name}", "0"))
+
+        # Legacy compact facts only have aggregate totals; preserve their policy semantics.
+        for key, value in sorted({**single_bit, **critical}.items()):
+            if key in emitted_keys:
+                continue
+            if key in ASCEND_ECC_CURRENT_CRITICAL_KEYS:
+                severity, action = "FAIL", "quarantine"
+                reason = "current uncorrectable HBM ECC or isolated-page condition detected"
+            elif ecc_policy == "strict":
+                severity = "FAIL" if key in ECC_CRITICAL_KEYS else "SUSPECT"
+                action = "quarantine" if severity == "FAIL" else "retest"
+                reason = "Ascend ECC counter detected under strict policy"
+            else:
+                severity, action = "WARN", "observe"
+                reason = "historical or correctable Ascend ECC counter detected"
+            alert = ecc_alert(
+                pod, "ascend", severity, "counter", key.removeprefix("ascend.ecc."), reason,
+                counter_name=key.removeprefix("ascend.ecc."), counter_value=value, action=action,
             )
-        if single_bit:
-            issues.append(
-                StaticIssue(
-                    severity="SUSPECT",
-                    pod_name=pod.pod_name,
-                    node_name=pod.node_name,
-                    check="rule:ascend_ecc_single_bit",
-                    expected="current and aggregate single-bit counters equal 0",
-                    actual=json.dumps(single_bit, sort_keys=True),
-                    reason="correctable HBM single-bit ECC detected; retest required",
-                )
-            )
-    return issues
+            alerts.append(alert)
+            if severity in {"SUSPECT", "FAIL"}:
+                issues.append(issue_from_ecc_alert(alert, f"rule:{key.replace('.', '_')}", "0"))
+    return issues, alerts
 
 
 def compare_rule_gates(
@@ -981,7 +1091,10 @@ def compare_static_results(
     workers: int = 0,
     expected_gpus: int = 0,
     expected_xscale_ports: int = 0,
+    ecc_policy: str = "alert",
 ) -> dict[str, Any]:
+    if ecc_policy not in {"alert", "strict"}:
+        raise ValueError(f"unsupported ECC policy: {ecc_policy}")
     pods_jsonl = result_dir / "pods.jsonl"
     pods_by_name = {
         str(row.get("pod_name", "")): row
@@ -1023,6 +1136,9 @@ def compare_static_results(
             "failed_pods": failed_pods,
             "issues": issues,
             "warnings": [{"reason": "no aggregated static facts or pod static result directories found"}],
+            "ecc_policy": ecc_policy,
+            "ecc_alerts": [],
+            "ecc_summary": summarize_ecc_alerts([], ecc_policy),
             "pods": [],
         }
 
@@ -1058,8 +1174,11 @@ def compare_static_results(
     issues.extend(status_issues)
     warnings.extend(status_warnings)
     issues.extend(compare_rule_gates(pods, expected_gpus=expected_gpus, expected_xscale_ports=expected_xscale_ports))
-    issues.extend(compare_metax_ecc_gates(pods))
-    issues.extend(compare_ascend_ecc_gates(pods))
+    metax_ecc_issues, metax_ecc_alerts = compare_metax_ecc_gates(pods, ecc_policy=ecc_policy)
+    ascend_ecc_issues, ascend_ecc_alerts = compare_ascend_ecc_gates(pods, ecc_policy=ecc_policy)
+    ecc_alerts = metax_ecc_alerts + ascend_ecc_alerts
+    issues.extend(metax_ecc_issues)
+    issues.extend(ascend_ecc_issues)
     issues.extend(compare_facts(pods))
 
     status = "PASS"
@@ -1072,7 +1191,7 @@ def compare_static_results(
         "static_compare_status": status,
         "pod_count": len(pods),
         "issue_count": len(issues),
-        "warning_count": len(warnings),
+        "warning_count": len(warnings) + sum(1 for alert in ecc_alerts if alert.get("severity") == "WARN"),
         "failed_pod_count": len(failed_pods),
         "rule_gate": {
             "expected_gpus": expected_gpus,
@@ -1081,6 +1200,16 @@ def compare_static_results(
         "failed_pods": failed_pods,
         "issues": [asdict(issue) for issue in sorted(issues, key=lambda x: (x.severity, x.pod_name, x.check))],
         "warnings": warnings,
+        "ecc_policy": ecc_policy,
+        "ecc_alerts": sorted(
+            ecc_alerts,
+            key=lambda item: (
+                str(item.get("severity", "")), str(item.get("vendor", "")),
+                str(item.get("node_name", "")), str(item.get("device_id", "")),
+                str(item.get("chip_id", "")), str(item.get("category", "")),
+            ),
+        ),
+        "ecc_summary": summarize_ecc_alerts(ecc_alerts, ecc_policy),
         "pods": [
             {
                 "pod_name": pod.pod_name,
@@ -1091,6 +1220,35 @@ def compare_static_results(
             }
             for pod in pods
         ],
+    }
+
+
+def summarize_ecc_alerts(alerts: list[dict[str, Any]], ecc_policy: str) -> dict[str, Any]:
+    severity_counts = Counter(str(alert.get("severity", "")) for alert in alerts)
+    vendor_counts = Counter(str(alert.get("vendor", "")) for alert in alerts)
+    affected_nodes = sorted({str(alert.get("node_name", "")) for alert in alerts if alert.get("node_name")})
+    affected_pods = sorted({str(alert.get("pod_name", "")) for alert in alerts if alert.get("pod_name")})
+    status = "PASS"
+    if severity_counts.get("FAIL", 0):
+        status = "FAIL"
+    elif severity_counts.get("SUSPECT", 0):
+        status = "SUSPECT"
+    elif severity_counts.get("WARN", 0):
+        status = "WARN"
+    return {
+        "status": status,
+        "policy": ecc_policy,
+        "alert_count": len(alerts),
+        "warning_count": severity_counts.get("WARN", 0),
+        "suspect_count": severity_counts.get("SUSPECT", 0),
+        "fail_count": severity_counts.get("FAIL", 0),
+        "affected_node_count": len(affected_nodes),
+        "affected_pod_count": len(affected_pods),
+        "affected_nodes": affected_nodes,
+        "affected_pods": affected_pods,
+        "vendor_counts": dict(sorted(vendor_counts.items())),
+        "jsonl_report": "static_ecc_alerts.jsonl",
+        "markdown_report": "static_ecc_alerts.md",
     }
 
 
@@ -1105,6 +1263,7 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def write_markdown(path: Path, report: dict[str, Any]) -> None:
+    ecc_summary = report.get("ecc_summary", {})
     lines = [
         "# Static Compare Summary",
         "",
@@ -1113,6 +1272,8 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
         f"- issue_count: `{report.get('issue_count', 0)}`",
         f"- warning_count: `{report.get('warning_count', 0)}`",
         f"- failed_pod_count: `{report.get('failed_pod_count', 0)}`",
+        f"- ecc_alert_status: `{ecc_summary.get('status', 'PASS')}`",
+        f"- ecc_affected_node_count: `{ecc_summary.get('affected_node_count', 0)}`",
         "",
         "## Issues",
         "",
@@ -1155,13 +1316,67 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
     else:
         lines.append("No global capability warnings.")
 
+    lines.extend(["", "## ECC/RAS Alerts", ""])
+    if report.get("ecc_alerts"):
+        lines.extend(
+            [
+                f"- policy: `{report.get('ecc_policy', 'alert')}`",
+                f"- status: `{ecc_summary.get('status', 'PASS')}`",
+                f"- warning_count: `{ecc_summary.get('warning_count', 0)}`",
+                f"- fail_count: `{ecc_summary.get('fail_count', 0)}`",
+                f"- affected_nodes: `{','.join(ecc_summary.get('affected_nodes', []))}`",
+                "- detailed_report: `static_ecc_alerts.md`",
+            ]
+        )
+    else:
+        lines.append("No ECC/RAS alerts detected.")
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_ecc_alert_markdown(path: Path, report: dict[str, Any]) -> None:
+    summary = report.get("ecc_summary", {})
+    alerts = report.get("ecc_alerts", [])
+    lines = [
+        "# Static ECC/RAS Alerts",
+        "",
+        f"- status: `{summary.get('status', 'PASS')}`",
+        f"- policy: `{summary.get('policy', report.get('ecc_policy', 'alert'))}`",
+        f"- alert_count: `{summary.get('alert_count', 0)}`",
+        f"- warning_count: `{summary.get('warning_count', 0)}`",
+        f"- suspect_count: `{summary.get('suspect_count', 0)}`",
+        f"- fail_count: `{summary.get('fail_count', 0)}`",
+        f"- affected_node_count: `{summary.get('affected_node_count', 0)}`",
+        "",
+    ]
+    if not alerts:
+        lines.append("No ECC/RAS alerts detected.")
+    else:
+        lines.extend(
+            [
+                "| severity | vendor | pod | node | device | chip | source | category | counter | value | detail | action |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        for alert in alerts:
+            lines.append(
+                "| {severity} | {vendor} | {pod_name} | {node_name} | {device_id} | {chip_id} | "
+                "{source} | {category} | {counter_name} | {counter_value} | {event_detail} | {action} |".format(
+                    **{key: md_cell(alert.get(key, "")) for key in [
+                        "severity", "vendor", "pod_name", "node_name", "device_id", "chip_id", "source",
+                        "category", "counter_name", "counter_value", "event_detail", "action",
+                    ]}
+                )
+            )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_static_compare_outputs(result_dir: Path, report: dict[str, Any]) -> None:
     write_json(result_dir / "static_compare.json", report)
     write_jsonl(result_dir / "static_outliers.jsonl", report.get("issues", []))
+    write_jsonl(result_dir / "static_ecc_alerts.jsonl", report.get("ecc_alerts", []))
     write_markdown(result_dir / "static_compare.md", report)
+    write_ecc_alert_markdown(result_dir / "static_ecc_alerts.md", report)
 
 
 def summarize_result_rows(rows: list[dict[str, Any]]) -> str:
@@ -1195,6 +1410,44 @@ def format_summary_value(value: Any) -> str:
 
 def md_cell(value: Any) -> str:
     return format_summary_value(value).replace("|", "/")
+
+
+def render_ecc_alert_section(report: dict[str, Any] | None) -> str:
+    if not report:
+        return ""
+    summary = report.get("ecc_summary", {})
+    alerts = report.get("ecc_alerts", [])
+    lines = [
+        "## ECC/RAS Alerts",
+        "",
+        f"- status: `{summary.get('status', 'PASS')}`",
+        f"- policy: `{summary.get('policy', report.get('ecc_policy', 'alert'))}`",
+        f"- warning_count: `{summary.get('warning_count', 0)}`",
+        f"- fail_count: `{summary.get('fail_count', 0)}`",
+        f"- affected_node_count: `{summary.get('affected_node_count', 0)}`",
+        "- detailed_report: `static_ecc_alerts.md`",
+        "",
+    ]
+    if not alerts:
+        lines.append("No ECC/RAS alerts detected.")
+        return "\n".join(lines) + "\n"
+    lines.extend(
+        [
+            "| severity | vendor | pod | node | device | chip | category | value | action |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    for alert in alerts:
+        lines.append(
+            "| {severity} | {vendor} | {pod_name} | {node_name} | {device_id} | {chip_id} | "
+            "{category} | {counter_value} | {action} |".format(
+                **{key: md_cell(alert.get(key, "")) for key in [
+                    "severity", "vendor", "pod_name", "node_name", "device_id", "chip_id",
+                    "category", "counter_value", "action",
+                ]}
+            )
+        )
+    return "\n".join(lines) + "\n"
 
 
 def render_node_environment_sample_section(result_dir: Path, report: dict[str, Any] | None) -> str:
@@ -1360,12 +1613,16 @@ def update_summary_files(result_dir: Path, report: dict[str, Any]) -> None:
                 "",
             ]
         )
+        ecc_section = render_ecc_alert_section(report)
         node_sample_section = render_node_environment_sample_section(result_dir, report)
+        text = re.sub(r"\n## ECC/RAS Alerts\n.*?(?=\n## |\Z)", "\n", text, flags=re.S)
         text = re.sub(r"\n## Node Environment Sample\n.*?(?=\n## |\Z)", "\n", text, flags=re.S)
         if "## Static Compare" in text:
             text = re.sub(r"\n## Static Compare\n.*?(?=\n## |\Z)", "\n" + static_section, text, flags=re.S)
         else:
             text = text.rstrip() + "\n\n" + static_section
+        if ecc_section:
+            text = text.rstrip() + "\n\n" + ecc_section
         if node_sample_section:
             text = text.rstrip() + "\n\n" + node_sample_section
         summary_md.write_text(text, encoding="utf-8")
@@ -1382,6 +1639,12 @@ def main() -> int:
         default=0,
         help="Expected xscale/HCA port count per pod. 0 disables this rule gate.",
     )
+    parser.add_argument(
+        "--ecc-policy",
+        choices=["alert", "strict"],
+        default="alert",
+        help="ECC policy: alert keeps cumulative counters as warnings; strict restores legacy gates.",
+    )
     args = parser.parse_args()
 
     report = compare_static_results(
@@ -1389,6 +1652,7 @@ def main() -> int:
         workers=args.workers,
         expected_gpus=args.expected_gpus,
         expected_xscale_ports=args.expected_xscale_ports,
+        ecc_policy=args.ecc_policy,
     )
     write_static_compare_outputs(args.result_dir, report)
     update_summary_files(args.result_dir, report)

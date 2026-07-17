@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import json
 import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -15,12 +17,32 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from dynamic_compare import compare_dynamic_results, write_report as write_dynamic_compare_report
-from static_compare import compare_static_results, render_node_environment_sample_section, write_static_compare_outputs
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from tools.dynamic_compare import compare_dynamic_results, write_report as write_dynamic_compare_report
+from pretrain_healthcheck.common import parse_size
+from tools.dynamic_frame import (
+    CHUNK_MANIFEST_PREFIX,
+    CHUNK_PREFIX,
+    DEFAULT_CHUNK_SIZE,
+    DynamicFrameError,
+    V1_PREFIX,
+    V2_PREFIX,
+    decode_frame_line,
+    sha256_hex,
+)
+from tools.static_compare import (
+    compare_static_results,
+    render_ecc_alert_section,
+    render_node_environment_sample_section,
+    write_static_compare_outputs,
+)
 
 
 STATIC_RESULT_PREFIX = "__HC_STATIC_RESULT_JSON__ "
-DYNAMIC_RESULT_PREFIX = "__HC_DYNAMIC_RESULT_JSON__ "
+DYNAMIC_RESULT_PREFIXES = (V2_PREFIX, V1_PREFIX)
 
 
 @dataclass
@@ -312,6 +334,7 @@ def command_with_exports(command: str, pod: PodInfo, args: argparse.Namespace, p
         "WORLD_SIZE": pod.world_size,
         "MASTER_ADDR": pod.master_addr,
         "MASTER_PORT": pod.master_port,
+        "HC_DYNAMIC_RETEST_PLAN_B64": getattr(args, "dynamic_retest_plan_b64", ""),
     }
     export_text = " ".join(f"{key}={json.dumps(value)}" for key, value in exports.items())
     return f"export {export_text}; {command}"
@@ -577,6 +600,8 @@ def write_commands_env(path: Path, args: argparse.Namespace) -> None:
         f"DEVICE_TYPE={args.device_type}",
         f"RUN_ID={args.run_id}",
         f"RUN_STAGE={args.run_stage}",
+        f"DRIVER_PYTHON={os.environ.get('DRIVER_PYTHON', sys.executable)}",
+        f"DRIVER_PYTHON_VERSION={os.environ.get('DRIVER_PYTHON_VERSION', '.'.join(map(str, sys.version_info[:3])))}",
         f"RESULT_ROOT={args.result_root}",
         f"POD_RESULT_ROOT={args.pod_result_root or '/tmp/pretrain_healthcheck_driver_' + args.run_id}",
         f"OUTPUT_DIR={args.output_dir}",
@@ -590,21 +615,34 @@ def write_commands_env(path: Path, args: argparse.Namespace) -> None:
         f"STATIC_COMPARE_STRICT={args.static_compare_strict}",
         f"STATIC_EXPECTED_GPUS={args.static_expected_gpus}",
         f"STATIC_EXPECTED_XSCALE_PORTS={args.static_expected_xscale_ports}",
+        f"STATIC_ECC_POLICY={args.static_ecc_policy}",
         f"STATIC_KEEP_POD_FILES={args.static_keep_pod_files}",
         f"STATIC_KEEP_EXEC_LOGS={args.static_keep_exec_logs}",
         f"STATIC_FAILED_LOG_MODE={args.static_failed_log_mode}",
         f"DYNAMIC_COMPARE={args.dynamic_compare}",
         f"DYNAMIC_COMPARE_STRICT={args.dynamic_compare_strict}",
+        f"DYNAMIC_COMPARE_MEASUREMENT_BATCHES={args.dynamic_compare_measurement_batches}",
+        f"DYNAMIC_COMPARE_RETEST_MEASUREMENT_BATCHES={args.dynamic_compare_retest_measurement_batches}",
         f"DYNAMIC_COMPARE_RATIO_THRESHOLD={args.dynamic_compare_ratio_threshold}",
+        f"DYNAMIC_COMPARE_BUSBW_RATIO_THRESHOLD={args.dynamic_compare_busbw_ratio_threshold}",
+        f"DYNAMIC_COMPARE_LATENCY_RATIO_THRESHOLD={args.dynamic_compare_latency_ratio_threshold}",
+        f"DYNAMIC_COMPARE_SMALL_MAX_SIZE={args.dynamic_compare_small_max_size}",
+        f"DYNAMIC_COMPARE_LARGE_MIN_SIZE={args.dynamic_compare_large_min_size}",
+        f"DYNAMIC_COMPARE_SMALL_LATENCY_WARN={int(args.dynamic_compare_small_latency_warn)}",
+        f"DYNAMIC_COMPARE_MIN_COHORT={args.dynamic_compare_min_cohort}",
+        f"DYNAMIC_COMPARE_AUTO_RETEST={int(args.dynamic_compare_auto_retest)}",
         f"DYNAMIC_KEEP_EXEC_LOGS={args.dynamic_keep_exec_logs}",
         f"DYNAMIC_EXEC_LOG_ROOT={args.dynamic_exec_log_root}",
         f"DYNAMIC_FAILED_LOG_MODE={args.dynamic_failed_log_mode}",
+        f"DYNAMIC_FRAME_RECOVERY_DEADLINE_SECONDS={args.dynamic_frame_recovery_deadline_seconds}",
+        f"DYNAMIC_FRAME_CHUNK_SIZE={args.dynamic_frame_chunk_size}",
         f"HEALTHCHECK_MASTER_PORT={args.healthcheck_master_port}",
         f"RESOLVED_HEALTHCHECK_MASTER_PORT={getattr(args, 'resolved_healthcheck_master_port', '')}",
         "PRE_CLEAN_CMD=" + args.pre_clean_cmd,
         "STATIC_CMD=" + args.static_cmd,
         "SINGLE_NODE_CMD=" + args.single_node_cmd,
         "MULTI_NODE_CMD=" + args.multi_node_cmd,
+        "DYNAMIC_RETEST_CMD=" + args.dynamic_retest_cmd,
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -639,6 +677,8 @@ def merge_dynamic_compare_status(overall: str, dynamic_compare_report: dict[str,
     dynamic_status = dynamic_compare_report.get("dynamic_compare_status")
     if dynamic_status == "FAIL":
         return "FAIL"
+    if dynamic_status in {"SUSPECT", "INCONCLUSIVE", "RETEST_REQUIRED"} and overall == "PASS":
+        return "SUSPECT"
     return overall
 
 
@@ -1030,71 +1070,343 @@ def failed_dynamic_row(result: ExecResult, error_type: str, reason: str, args: a
     }
 
 
-def collect_dynamic_stdout_results(results: list[ExecResult], args: argparse.Namespace) -> dict[str, Any]:
+def dynamic_frame_lines(stdout: str) -> list[str]:
+    return [line for line in stdout.splitlines() if line.startswith(DYNAMIC_RESULT_PREFIXES)]
+
+
+def dynamic_sidecar_path(result: ExecResult) -> str:
+    stderr = read_file_if_exists(result.stderr_path)
+    matches = re.findall(r"^\[dynamic-compact\] sidecar:\s*(\S+)", stderr, flags=re.MULTILINE)
+    if not matches:
+        return ""
+    path = matches[-1]
+    if not path.startswith("/tmp/pretrain_healthcheck_") or "/../" in path or path.endswith("/.."):
+        return ""
+    return path
+
+
+def validate_dynamic_identity(payload: dict[str, Any], result: ExecResult, args: argparse.Namespace) -> None:
+    pod_meta = payload.get("pod")
+    if not isinstance(pod_meta, dict):
+        raise DynamicFrameError("payload pod metadata is missing")
+    expected = {
+        "name": result.pod_name,
+        "run_id": args.run_id,
+        "stage": args.run_stage,
+    }
+    for key, value in expected.items():
+        if str(pod_meta.get(key, "")) != str(value):
+            raise DynamicFrameError(f"payload identity mismatch for {key}: expected={value!r} actual={pod_meta.get(key)!r}")
+
+
+def parse_dynamic_frame(stdout: str, result: ExecResult, args: argparse.Namespace) -> tuple[dict[str, Any], str]:
+    frames = dynamic_frame_lines(stdout)
+    if not frames:
+        raise DynamicFrameError("dynamic frame missing")
+    if len(frames) != 1:
+        raise DynamicFrameError(f"expected one dynamic frame, got {len(frames)}")
+    payload, protocol = decode_frame_line(frames[0])
+    validate_dynamic_identity(payload, result, args)
+    return payload, protocol
+
+
+def parse_recovery_output(
+    stdout: str,
+    manifest: dict[str, Any] | None,
+    chunks: dict[int, bytes],
+) -> tuple[dict[str, Any] | None, dict[int, bytes]]:
+    for line in stdout.splitlines():
+        if line.startswith(CHUNK_MANIFEST_PREFIX):
+            try:
+                candidate = json.loads(line[len(CHUNK_MANIFEST_PREFIX) :])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(candidate, dict):
+                continue
+            if manifest is not None and candidate != manifest:
+                raise DynamicFrameError("sidecar manifest changed during recovery")
+            manifest = candidate
+        elif line.startswith(CHUNK_PREFIX):
+            try:
+                row = json.loads(line[len(CHUNK_PREFIX) :])
+                index = int(row["index"])
+                chunk = base64.b64decode(str(row["payload"]), validate=True)
+                if len(chunk) != int(row["chunk_bytes"]):
+                    continue
+                if sha256_hex(chunk) != str(row["chunk_sha256"]):
+                    continue
+                chunks[index] = chunk
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+    return manifest, chunks
+
+
+def recover_dynamic_sidecar(
+    result: ExecResult,
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    sidecar = dynamic_sidecar_path(result)
+    event: dict[str, Any] = {
+        "pod_name": result.pod_name,
+        "node_name": result.node_name,
+        "sidecar": sidecar,
+        "attempts": 0,
+        "chunks_received": 0,
+        "status": "FAILED",
+        "reason": "",
+    }
+    if not sidecar:
+        event["reason"] = "trusted sidecar path missing"
+        return None, event
+
+    deadline = time.monotonic() + args.dynamic_frame_recovery_deadline_seconds
+    backoff = 1.0
+    manifest: dict[str, Any] | None = None
+    chunks: dict[int, bytes] = {}
+    while time.monotonic() < deadline:
+        total = int(manifest.get("total_chunks", 0)) if manifest else 0
+        missing = [index for index in range(total) if index not in chunks] if total else []
+        indexes_arg = ",".join(map(str, missing))
+        command = (
+            f"python3 {shlex.quote(str(PROJECT_DIR / 'tools' / 'dynamic_frame.py'))} emit-chunks "
+            f"--path {shlex.quote(sidecar)} --chunk-size {args.dynamic_frame_chunk_size}"
+        )
+        if indexes_arg:
+            command += f" --indexes {shlex.quote(indexes_arg)}"
+        exec_cmd = [
+            args.vcctl_bin,
+            "pod",
+            "exec",
+            result.pod_name,
+            "-n",
+            args.namespace,
+            "-c",
+            result.container_name,
+            "--",
+            "bash",
+            "-lc",
+            command,
+        ]
+        event["attempts"] += 1
+        try:
+            proc = run_capture(exec_cmd, timeout=min(args.vcctl_timeout_seconds, max(1, int(deadline - time.monotonic()))))
+            if proc.returncode == 0:
+                manifest, chunks = parse_recovery_output(proc.stdout, manifest, chunks)
+            else:
+                event["reason"] = f"sidecar read failed: returncode={proc.returncode} stderr={proc.stderr.strip()}"
+                if "No such file" in proc.stderr or "not found" in proc.stderr:
+                    break
+        except (subprocess.TimeoutExpired, DynamicFrameError) as exc:
+            event["reason"] = f"{type(exc).__name__}: {exc}"
+
+        if manifest:
+            total = int(manifest.get("total_chunks", 0))
+            if total > 0 and all(index in chunks for index in range(total)):
+                data = b"".join(chunks[index] for index in range(total))
+                if len(data) != int(manifest.get("file_bytes", -1)):
+                    event["reason"] = "reassembled sidecar length mismatch"
+                elif sha256_hex(data) != str(manifest.get("file_sha256", "")):
+                    event["reason"] = "reassembled sidecar SHA256 mismatch"
+                else:
+                    try:
+                        payload, protocol = decode_frame_line(data.decode("utf-8").rstrip("\n"))
+                        validate_dynamic_identity(payload, result, args)
+                    except (UnicodeDecodeError, DynamicFrameError) as exc:
+                        event["reason"] = f"{type(exc).__name__}: {exc}"
+                    else:
+                        event.update(
+                            status="RECOVERED",
+                            protocol=protocol,
+                            chunks_received=len(chunks),
+                            sidecar_bytes=len(data),
+                            sidecar_sha256=sha256_hex(data),
+                            reason="",
+                        )
+                        return payload, event
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(backoff, max(0.0, deadline - time.monotonic())))
+        backoff = min(backoff * 2.0, 8.0)
+
+    event["chunks_received"] = len(chunks)
+    if not event["reason"]:
+        event["reason"] = "recovery deadline exceeded"
+    return None, event
+
+
+def collect_dynamic_stdout_results(
+    results: list[ExecResult],
+    args: argparse.Namespace,
+    *,
+    facts_filename: str = "dynamic_facts.jsonl",
+    failed_filename: str = "dynamic_failed_pods.jsonl",
+    transport_filename: str = "dynamic_transport.json",
+) -> dict[str, Any]:
     facts_rows: list[dict[str, Any]] = []
     failed_rows: list[dict[str, Any]] = []
+    transport_events: list[dict[str, Any]] = []
+    resolved: dict[str, tuple[dict[str, Any] | None, str, dict[str, Any], bool]] = {}
+    pending: list[tuple[ExecResult, DynamicFrameError]] = []
+    for result in results:
+        if result.mode not in {"single-node", "multi-node"}:
+            continue
+        if result.timeout:
+            continue
+        stdout = read_file_if_exists(result.stdout_path)
+        try:
+            payload, protocol = parse_dynamic_frame(stdout, result, args)
+            event = {
+                "pod_name": result.pod_name,
+                "node_name": result.node_name,
+                "status": "INITIAL_OK",
+                "protocol": protocol,
+                "attempts": 0,
+            }
+        except DynamicFrameError as initial_exc:
+            pending.append((result, initial_exc))
+        else:
+            resolved[result.pod_name] = (payload, protocol, event, False)
+
+    if pending:
+        workers = len(pending) if args.max_parallel <= 0 else min(args.max_parallel, len(pending))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            futures = {executor.submit(recover_dynamic_sidecar, result, args): (result, initial_exc) for result, initial_exc in pending}
+            for future in concurrent.futures.as_completed(futures):
+                result, initial_exc = futures[future]
+                try:
+                    payload, event = future.result()
+                except Exception as exc:
+                    payload = None
+                    event = {
+                        "pod_name": result.pod_name,
+                        "node_name": result.node_name,
+                        "status": "FAILED",
+                        "attempts": 0,
+                        "reason": f"internal recovery error: {type(exc).__name__}: {exc}",
+                    }
+                event["initial_error"] = str(initial_exc)
+                protocol = str(event.get("protocol", "v2-gzip-base64"))
+                resolved[result.pod_name] = (payload, protocol, event, payload is not None)
 
     for result in results:
         if result.mode not in {"single-node", "multi-node"}:
             continue
-        stdout = read_file_if_exists(result.stdout_path)
-        frames = [line[len(DYNAMIC_RESULT_PREFIX) :] for line in stdout.splitlines() if line.startswith(DYNAMIC_RESULT_PREFIX)]
-
         if result.timeout:
             result.status = "FAIL"
             result.reason = "DYNAMIC_TIMEOUT"
             failed_rows.append(failed_dynamic_row(result, "DYNAMIC_TIMEOUT", "dynamic probe timed out", args))
+            transport_events.append(
+                {"pod_name": result.pod_name, "node_name": result.node_name, "status": "NOT_ATTEMPTED", "reason": "probe timeout"}
+            )
             continue
-        if len(frames) == 0:
-            if result.returncode == 0:
-                result.status = "FAIL"
-                result.reason = "DYNAMIC_FRAME_MISSING"
-            failed_rows.append(failed_dynamic_row(result, "FRAME_MISSING", result.reason or "missing dynamic frame", args))
-            continue
-        if len(frames) > 1:
+        payload, protocol, transport_event, recovered = resolved[result.pod_name]
+        if payload is None:
             result.status = "FAIL"
-            result.reason = "DYNAMIC_FRAME_PROTOCOL_ERROR"
-            failed_rows.append(failed_dynamic_row(result, "FRAME_PROTOCOL_ERROR", "multiple dynamic frames", args))
+            result.reason = "RESULT_TRANSPORT_FAIL"
+            failed_rows.append(
+                failed_dynamic_row(result, "RESULT_TRANSPORT_FAIL", str(transport_event.get("reason", "recovery failed")), args)
+            )
+            transport_events.append(transport_event)
             continue
-        try:
-            payload = json.loads(frames[0])
-        except json.JSONDecodeError as exc:
+
+        coverage = payload.get("coverage")
+        if result.returncode == 0 and isinstance(coverage, dict) and not coverage.get("complete", False):
             result.status = "FAIL"
-            result.reason = "DYNAMIC_FRAME_PARSE_FAIL"
-            failed_rows.append(failed_dynamic_row(result, "FRAME_PARSE_FAIL", f"{exc.__class__.__name__}: {exc}", args))
+            result.reason = "DATA_INCOMPLETE"
+            failed_rows.append(
+                failed_dynamic_row(result, "DATA_INCOMPLETE", "; ".join(map(str, coverage.get("errors", []))), args)
+            )
+            transport_event["status"] = "DATA_INCOMPLETE"
+            transport_events.append(transport_event)
             continue
-        if not isinstance(payload, dict):
-            result.status = "FAIL"
-            result.reason = "DYNAMIC_FRAME_PROTOCOL_ERROR"
-            failed_rows.append(failed_dynamic_row(result, "FRAME_PROTOCOL_ERROR", "dynamic frame payload is not an object", args))
-            continue
+
         pod_meta = payload.get("pod", {})
-        if not isinstance(pod_meta, dict) or str(pod_meta.get("name", "")) != result.pod_name:
-            result.status = "FAIL"
-            result.reason = "DYNAMIC_FRAME_ID_MISMATCH"
-            failed_rows.append(failed_dynamic_row(result, "FRAME_ID_MISMATCH", "pod_name mismatch", args))
-            continue
         pod_meta.setdefault("node_name", result.node_name)
         pod_meta.setdefault("pod_ip", result.pod_ip)
-        payload.setdefault("driver_result", asdict(result))
+        driver_result = asdict(result)
+        driver_result.update(frame_protocol=protocol, frame_recovered=recovered, frame_recovery_attempts=transport_event.get("attempts", 0))
+        payload["driver_result"] = driver_result
         facts_rows.append(payload)
+        transport_events.append(transport_event)
         summary = payload.get("summary", {})
         if result.returncode != 0 or not isinstance(summary, dict) or not summary.get("correctness_pass", False):
             result.status = "FAIL"
             result.reason = str(summary.get("error_type", "")) if isinstance(summary, dict) else f"returncode={result.returncode}"
             failed_rows.append(
-                failed_dynamic_row(
-                    result,
-                    "DYNAMIC_CHECK_FAILED",
-                    result.reason or f"returncode={result.returncode}",
-                    args,
-                )
+                failed_dynamic_row(result, "DYNAMIC_CHECK_FAILED", result.reason or f"returncode={result.returncode}", args)
             )
 
     output_dir = Path(args.output_dir)
-    write_jsonl(output_dir / "dynamic_facts.jsonl", facts_rows)
-    write_jsonl(output_dir / "dynamic_failed_pods.jsonl", failed_rows)
-    return {"fact_count": len(facts_rows), "failed_count": len(failed_rows)}
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_jsonl(output_dir / facts_filename, facts_rows)
+    write_jsonl(output_dir / failed_filename, failed_rows)
+    transport = {
+        "schema_version": 1,
+        "expected_pods": len([result for result in results if result.mode in {"single-node", "multi-node"}]),
+        "accepted_facts": len(facts_rows),
+        "initial_ok": sum(row.get("status") == "INITIAL_OK" for row in transport_events),
+        "recovery_attempts": sum(int(row.get("attempts", 0) or 0) for row in transport_events),
+        "recovery_success": sum(row.get("status") == "RECOVERED" for row in transport_events),
+        "recovery_failed": sum(row.get("status") == "FAILED" for row in transport_events),
+        "data_incomplete": sum(row.get("status") == "DATA_INCOMPLETE" for row in transport_events),
+        "events": transport_events,
+    }
+    (output_dir / transport_filename).write_text(json.dumps(transport, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {"fact_count": len(facts_rows), "failed_count": len(failed_rows), **transport}
+
+
+def compare_dynamic_with_one_retest(
+    pods: list[PodInfo],
+    mode: str,
+    initial_results: list[ExecResult],
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], list[ExecResult]]:
+    collect_dynamic_stdout_results(initial_results, args)
+    compare_kwargs = {
+        "ratio_threshold": args.dynamic_compare_busbw_ratio_threshold,
+        "latency_ratio_threshold": args.dynamic_compare_latency_ratio_threshold,
+        "min_cohort": args.dynamic_compare_min_cohort,
+        "small_max_bytes": args.dynamic_compare_small_max_bytes,
+        "large_min_bytes": args.dynamic_compare_large_min_bytes,
+        "small_latency_warn": args.dynamic_compare_small_latency_warn,
+        "small_latency_abs_delta_seconds": args.dynamic_compare_small_latency_abs_delta_ms / 1000.0,
+        "small_latency_mad_multiplier": args.dynamic_compare_small_latency_mad_multiplier,
+    }
+    report = compare_dynamic_results(Path(args.output_dir), **compare_kwargs)
+    retest_results: list[ExecResult] = []
+    if (
+        report.get("retest_required")
+        and args.dynamic_compare_auto_retest
+        and args.dynamic_retest_cmd
+        and report.get("retest_plan")
+    ):
+        plan_json = json.dumps(report["retest_plan"], ensure_ascii=False, separators=(",", ":"))
+        args.dynamic_retest_plan_b64 = base64.b64encode(plan_json.encode("utf-8")).decode("ascii")
+        print(
+            f"[vcctl-healthcheck] dynamic_retest_start mode={mode} cases={len(report['retest_plan'])}",
+            flush=True,
+        )
+        retest_results = run_mode(pods, mode, args.dynamic_retest_cmd, args)
+        collect_dynamic_stdout_results(
+            retest_results,
+            args,
+            facts_filename="dynamic_retest_facts.jsonl",
+            failed_filename="dynamic_retest_failed_pods.jsonl",
+            transport_filename="dynamic_retest_transport.json",
+        )
+        report = compare_dynamic_results(
+            Path(args.output_dir),
+            retest_facts_path=Path(args.output_dir) / "dynamic_retest_facts.jsonl",
+            **compare_kwargs,
+        )
+        print(
+            f"[vcctl-healthcheck] dynamic_retest_done mode={mode} status={report.get('dynamic_compare_status')}",
+            flush=True,
+        )
+    report["initial_measurement_batches"] = args.dynamic_compare_measurement_batches
+    report["retest_measurement_batches"] = args.dynamic_compare_retest_measurement_batches
+    write_dynamic_compare_report(Path(args.output_dir), report)
+    return report, retest_results
 
 
 def write_summary_md(
@@ -1122,6 +1434,26 @@ def write_summary_md(
             f"| {pod.pod_name} | {pod.container_name} | {pod.rank} | {pod.world_size} | "
             f"{pod.phase} | {pod.ready} | {pod.node_name} | {pod.pod_ip} |"
         )
+    transport_path = path.parent / "dynamic_transport.json"
+    if transport_path.exists():
+        try:
+            transport = json.loads(transport_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            transport = {}
+        lines.extend(
+            [
+                "",
+                "## Dynamic Result Transport",
+                "",
+                f"- expected_pods: `{transport.get('expected_pods', 0)}`",
+                f"- accepted_facts: `{transport.get('accepted_facts', 0)}`",
+                f"- initial_ok: `{transport.get('initial_ok', 0)}`",
+                f"- recovery_attempts: `{transport.get('recovery_attempts', 0)}`",
+                f"- recovery_success: `{transport.get('recovery_success', 0)}`",
+                f"- recovery_failed: `{transport.get('recovery_failed', 0)}`",
+                f"- data_incomplete: `{transport.get('data_incomplete', 0)}`",
+            ]
+        )
     lines.extend(
         [
             "",
@@ -1148,6 +1480,9 @@ def write_summary_md(
                 "- report: `static_compare.md`",
             ]
         )
+        ecc_alert_section = render_ecc_alert_section(static_compare_report)
+        if ecc_alert_section:
+            lines.extend(["", ecc_alert_section.rstrip()])
         node_sample_section = render_node_environment_sample_section(path.parent, static_compare_report)
         if node_sample_section:
             lines.extend(["", node_sample_section.rstrip()])
@@ -1186,7 +1521,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--healthcheck-port-start", type=int, default=29500)
     parser.add_argument("--healthcheck-port-end", type=int, default=29999)
     parser.add_argument("--exec-timeout-seconds", type=int, default=3600)
-    parser.add_argument("--static-exec-timeout-seconds", type=int, default=120)
+    parser.add_argument("--static-exec-timeout-seconds", type=int, default=180)
     parser.add_argument("--static-stdout-max-bytes", type=int, default=1048576)
     parser.add_argument("--static-driver-tmp-root", default="/tmp")
     parser.add_argument("--vcctl-timeout-seconds", type=int, default=120)
@@ -1196,15 +1531,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--static-compare-strict", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--static-expected-gpus", type=int, default=0)
     parser.add_argument("--static-expected-xscale-ports", type=int, default=0)
+    parser.add_argument("--static-ecc-policy", choices=["alert", "strict"], default="alert")
     parser.add_argument("--static-keep-pod-files", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--static-keep-exec-logs", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--static-failed-log-mode", choices=["local-link", "shared"], default="local-link")
     parser.add_argument("--dynamic-compare", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--dynamic-compare-strict", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dynamic-compare-measurement-batches", type=int, default=1)
+    parser.add_argument("--dynamic-compare-retest-measurement-batches", type=int, default=3)
     parser.add_argument("--dynamic-compare-ratio-threshold", type=float, default=0.7)
+    parser.add_argument("--dynamic-compare-busbw-ratio-threshold", type=float, default=0.7)
+    parser.add_argument("--dynamic-compare-latency-ratio-threshold", type=float, default=1.5)
+    parser.add_argument("--dynamic-compare-small-max-size", type=parse_size, default=parse_size("1M"))
+    parser.add_argument("--dynamic-compare-large-min-size", type=parse_size, default=parse_size("1G"))
+    parser.add_argument("--dynamic-compare-small-latency-warn", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--dynamic-compare-small-latency-abs-delta-ms", type=float, default=0.2)
+    parser.add_argument("--dynamic-compare-small-latency-mad-multiplier", type=float, default=6.0)
+    parser.add_argument("--dynamic-compare-min-cohort", type=int, default=3)
+    parser.add_argument("--dynamic-compare-auto-retest", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dynamic-retest-cmd", default="")
     parser.add_argument("--dynamic-keep-exec-logs", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--dynamic-exec-log-root", default="/tmp/pretrain_healthcheck_exec_logs/vcctl")
     parser.add_argument("--dynamic-failed-log-mode", choices=["local-link", "shared"], default="local-link")
+    parser.add_argument("--dynamic-frame-recovery-deadline-seconds", type=int, default=60)
+    parser.add_argument("--dynamic-frame-chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--pod-json-file", default="")
     return parser
@@ -1212,6 +1562,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    for attr in ("dynamic_compare_measurement_batches", "dynamic_compare_retest_measurement_batches"):
+        if getattr(args, attr) < 1:
+            raise SystemExit(f"{attr.replace('_', '-')} must be >= 1")
+    if args.dynamic_frame_recovery_deadline_seconds < 1:
+        raise SystemExit("dynamic-frame-recovery-deadline-seconds must be >= 1")
+    if args.dynamic_frame_chunk_size < 256:
+        raise SystemExit("dynamic-frame-chunk-size must be >= 256")
+    args.dynamic_compare_small_max_bytes = args.dynamic_compare_small_max_size
+    args.dynamic_compare_large_min_bytes = args.dynamic_compare_large_min_size
+    if args.dynamic_compare_busbw_ratio_threshold == 0.7 and args.dynamic_compare_ratio_threshold != 0.7:
+        args.dynamic_compare_busbw_ratio_threshold = args.dynamic_compare_ratio_threshold
+    args.dynamic_retest_plan_b64 = ""
     if not args.run_stage:
         args.run_stage = args.mode.replace("-", "_")
     output_dir = Path(args.result_root) / args.run_id / args.run_stage
@@ -1242,6 +1604,7 @@ def main() -> int:
     if resolved_port:
         args.multi_node_cmd = args.multi_node_cmd.replace("__HC_MASTER_PORT__", resolved_port)
         args.single_node_cmd = args.single_node_cmd.replace("__HC_MASTER_PORT__", resolved_port)
+        args.dynamic_retest_cmd = args.dynamic_retest_cmd.replace("__HC_MASTER_PORT__", resolved_port)
         args.static_cmd = args.static_cmd.replace("__HC_MASTER_PORT__", resolved_port)
         args.pre_clean_cmd = args.pre_clean_cmd.replace("__HC_MASTER_PORT__", resolved_port)
 
@@ -1271,6 +1634,7 @@ def main() -> int:
                 workers=args.static_compare_workers,
                 expected_gpus=args.static_expected_gpus,
                 expected_xscale_ports=args.static_expected_xscale_ports,
+                ecc_policy=args.static_ecc_policy,
             )
             write_static_compare_outputs(output_dir, static_compare_report)
         if not args.static_keep_exec_logs and not args.dry_run:
@@ -1281,12 +1645,10 @@ def main() -> int:
         single_node_results = run_mode(pods, "single-node", args.single_node_cmd, args)
         results.extend(single_node_results)
         if args.dynamic_compare and not args.dry_run:
-            collect_dynamic_stdout_results(single_node_results, args)
-            dynamic_compare_report = compare_dynamic_results(
-                output_dir,
-                ratio_threshold=args.dynamic_compare_ratio_threshold,
+            dynamic_compare_report, retest_results = compare_dynamic_with_one_retest(
+                pods, "single-node", single_node_results, args
             )
-            write_dynamic_compare_report(output_dir, dynamic_compare_report)
+            results.extend(retest_results)
             if not args.dynamic_keep_exec_logs:
                 removed_dynamic_logs = cleanup_dynamic_exec_logs(output_dir, results)
                 if removed_dynamic_logs:
@@ -1295,12 +1657,10 @@ def main() -> int:
         multi_node_results = run_mode(pods, "multi-node", args.multi_node_cmd, args)
         results.extend(multi_node_results)
         if args.dynamic_compare and not args.dry_run:
-            collect_dynamic_stdout_results(multi_node_results, args)
-            dynamic_compare_report = compare_dynamic_results(
-                output_dir,
-                ratio_threshold=args.dynamic_compare_ratio_threshold,
+            dynamic_compare_report, retest_results = compare_dynamic_with_one_retest(
+                pods, "multi-node", multi_node_results, args
             )
-            write_dynamic_compare_report(output_dir, dynamic_compare_report)
+            results.extend(retest_results)
             if not args.dynamic_keep_exec_logs:
                 removed_dynamic_logs = cleanup_dynamic_exec_logs(output_dir, results)
                 if removed_dynamic_logs:

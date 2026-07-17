@@ -3,22 +3,39 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+source "${PROJECT_DIR}/scripts/common/driver_python.sh"
 
 JOB_NAME="${JOB_NAME:-}"
 NAMESPACE="${NAMESPACE:-default}"
 VCCTL_BIN="${VCCTL_BIN:-vcctl}"
 POD_JSON_FILE="${POD_JSON_FILE:-}"
+PRESERVE_POD_JSON_ORDER="${PRESERVE_POD_JSON_ORDER:-0}"
 RESULT_ROOT="${RESULT_ROOT:-${PROJECT_DIR}/results/vcctl}"
 BATCH_RUN_ID="${BATCH_RUN_ID:-}"
 TARGET_SCALE="${TARGET_SCALE:-0}"
 PHASES="${PHASES:-}"
 GROUP_SEED="${GROUP_SEED:-20260706}"
 GROUP_TIMEOUT_SECONDS="${GROUP_TIMEOUT_SECONDS:-180}"
+FINAL_ALL_TIMEOUT_SECONDS="${FINAL_ALL_TIMEOUT_SECONDS:-300}"
 PROGRESS_INTERVAL_SECONDS="${PROGRESS_INTERVAL_SECONDS:-10}"
 PHASE_GROUP_CONCURRENCY="${PHASE_GROUP_CONCURRENCY:-0}"
 DRY_RUN="${DRY_RUN:-1}"
 PRE_CLEAN="${PRE_CLEAN:-1}"
 DYNAMIC_COMPARE="${DYNAMIC_COMPARE:-1}"
+DYNAMIC_COMPARE_BUSBW_RATIO_THRESHOLD="${DYNAMIC_COMPARE_BUSBW_RATIO_THRESHOLD:-0.7}"
+DYNAMIC_COMPARE_LATENCY_RATIO_THRESHOLD="${DYNAMIC_COMPARE_LATENCY_RATIO_THRESHOLD:-1.5}"
+DYNAMIC_COMPARE_SMALL_MAX_SIZE="${DYNAMIC_COMPARE_SMALL_MAX_SIZE:-1M}"
+DYNAMIC_COMPARE_LARGE_MIN_SIZE="${DYNAMIC_COMPARE_LARGE_MIN_SIZE:-1G}"
+DYNAMIC_COMPARE_SMALL_LATENCY_WARN="${DYNAMIC_COMPARE_SMALL_LATENCY_WARN:-0}"
+DYNAMIC_COMPARE_MIN_COHORT="${DYNAMIC_COMPARE_MIN_COHORT:-3}"
+DYNAMIC_COMPARE_AUTO_RETEST="${DYNAMIC_COMPARE_AUTO_RETEST:-1}"
+DYNAMIC_COMPARE_SMALL_LATENCY_ABS_DELTA_MS="${DYNAMIC_COMPARE_SMALL_LATENCY_ABS_DELTA_MS:-0.2}"
+DYNAMIC_COMPARE_SMALL_LATENCY_MAD_MULTIPLIER="${DYNAMIC_COMPARE_SMALL_LATENCY_MAD_MULTIPLIER:-6}"
+DYNAMIC_COMPARE_RETEST_MAX_GROUPS="${DYNAMIC_COMPARE_RETEST_MAX_GROUPS:-32}"
+DYNAMIC_COMPARE_RETEST_TIME_BUDGET_SECONDS="${DYNAMIC_COMPARE_RETEST_TIME_BUDGET_SECONDS:-120}"
+DYNAMIC_COMPARE_SYSTEMIC_CANDIDATE_FRACTION="${DYNAMIC_COMPARE_SYSTEMIC_CANDIDATE_FRACTION:-0.05}"
+BATCH_RUNTIME_WARN_SECONDS="${BATCH_RUNTIME_WARN_SECONDS:-900}"
+DISABLE_FINAL_SUPERSET_SKIP="${DISABLE_FINAL_SUPERSET_SKIP:-0}"
 KEEP_GROUP_OUTPUTS="${KEEP_GROUP_OUTPUTS:-0}"
 POD_PROJECT_DIR="${POD_PROJECT_DIR:-}"
 GROUP_OUTPUT_ROOT="${GROUP_OUTPUT_ROOT:-/tmp/pretrain_healthcheck_group_outputs/vcctl}"
@@ -45,13 +62,17 @@ or single-node dynamic-suite checks.
 Common env:
   JOB_NAME                   Existing vcjob name to inspect and test.
   NAMESPACE                  Kubernetes namespace. Default: default
+  DRIVER_PYTHON              Developer-machine Python >=3.9. Default: auto-discover
   POD_JSON_FILE              Optional saved vcctl pod JSON for dry-run/local tests.
+  PRESERVE_POD_JSON_ORDER    1 preserves POD_JSON_FILE order for fixed-rank diagnosis. Default: 0
   RESULT_ROOT                Shared result root. Default: <project>/results/vcctl
   BATCH_RUN_ID               Batch id. Default: current timestamp
   TARGET_SCALE               Max phase scale, for example 128 or 256. Default: auto
   PHASES                     Comma-separated phases. Default: auto by node count
   GROUP_SEED                 Deterministic grouping seed. Default: 20260706
   GROUP_TIMEOUT_SECONDS      Per-group timeout passed to run_vcctl_healthcheck. Default: 180
+  FINAL_ALL_TIMEOUT_SECONDS  Final-all group timeout. Default: 300
+  BATCH_RUNTIME_WARN_SECONDS Warn when total runtime exceeds this target; execution continues. Default: 900
   PROGRESS_INTERVAL_SECONDS  Progress print interval while one group is running. Default: 10
   PHASE_GROUP_CONCURRENCY    Max groups to run concurrently within one round. 0 means all. Default: 0
   DRY_RUN                    1 previews commands. Default: 1
@@ -89,23 +110,41 @@ if [[ -z "${JOB_NAME}" ]]; then
   exit 2
 fi
 
-exec python3 "${PROJECT_DIR}/tools/vcctl_multi_node_batch.py" "$@" \
+resolve_driver_python
+print_driver_python
+exec "${DRIVER_PYTHON}" "${PROJECT_DIR}/tools/vcctl_multi_node_batch.py" "$@" \
   --project-dir "${PROJECT_DIR}" \
   --job-name "${JOB_NAME}" \
   --namespace "${NAMESPACE}" \
   --vcctl-bin "${VCCTL_BIN}" \
   --pod-json-file "${POD_JSON_FILE}" \
+  $([[ "${PRESERVE_POD_JSON_ORDER}" == "1" || "${PRESERVE_POD_JSON_ORDER}" == "true" ]] && printf '%s' '--preserve-pod-json-order' || printf '%s' '--no-preserve-pod-json-order') \
   --result-root "${RESULT_ROOT}" \
   --batch-run-id "${BATCH_RUN_ID}" \
   --target-scale "${TARGET_SCALE}" \
   --phases "${PHASES}" \
   --group-seed "${GROUP_SEED}" \
   --group-timeout-seconds "${GROUP_TIMEOUT_SECONDS}" \
+  --final-all-timeout-seconds "${FINAL_ALL_TIMEOUT_SECONDS}" \
   --progress-interval-seconds "${PROGRESS_INTERVAL_SECONDS}" \
   --phase-group-concurrency "${PHASE_GROUP_CONCURRENCY}" \
   --dry-run "${DRY_RUN}" \
   --pre-clean "${PRE_CLEAN}" \
   --dynamic-compare "${DYNAMIC_COMPARE}" \
+  --dynamic-compare-busbw-ratio-threshold "${DYNAMIC_COMPARE_BUSBW_RATIO_THRESHOLD}" \
+  --dynamic-compare-latency-ratio-threshold "${DYNAMIC_COMPARE_LATENCY_RATIO_THRESHOLD}" \
+  --dynamic-compare-small-max-size "${DYNAMIC_COMPARE_SMALL_MAX_SIZE}" \
+  --dynamic-compare-large-min-size "${DYNAMIC_COMPARE_LARGE_MIN_SIZE}" \
+  $([[ "${DYNAMIC_COMPARE_SMALL_LATENCY_WARN}" == "1" || "${DYNAMIC_COMPARE_SMALL_LATENCY_WARN}" == "true" ]] && printf '%s' '--dynamic-compare-small-latency-warn' || printf '%s' '--no-dynamic-compare-small-latency-warn') \
+  --dynamic-compare-min-cohort "${DYNAMIC_COMPARE_MIN_COHORT}" \
+  --dynamic-compare-small-latency-abs-delta-ms "${DYNAMIC_COMPARE_SMALL_LATENCY_ABS_DELTA_MS}" \
+  --dynamic-compare-small-latency-mad-multiplier "${DYNAMIC_COMPARE_SMALL_LATENCY_MAD_MULTIPLIER}" \
+  --dynamic-compare-retest-max-groups "${DYNAMIC_COMPARE_RETEST_MAX_GROUPS}" \
+  --dynamic-compare-retest-time-budget-seconds "${DYNAMIC_COMPARE_RETEST_TIME_BUDGET_SECONDS}" \
+  --dynamic-compare-systemic-candidate-fraction "${DYNAMIC_COMPARE_SYSTEMIC_CANDIDATE_FRACTION}" \
+  --batch-runtime-warn-seconds "${BATCH_RUNTIME_WARN_SECONDS}" \
+  $([[ "${DISABLE_FINAL_SUPERSET_SKIP}" == "1" || "${DISABLE_FINAL_SUPERSET_SKIP}" == "true" ]] && printf '%s' '--disable-final-superset-skip' || printf '%s' '--no-disable-final-superset-skip') \
+  $([[ "${DYNAMIC_COMPARE_AUTO_RETEST}" == "0" || "${DYNAMIC_COMPARE_AUTO_RETEST}" == "false" ]] && printf '%s' '--no-dynamic-compare-auto-retest' || printf '%s' '--dynamic-compare-auto-retest') \
   --keep-group-outputs "${KEEP_GROUP_OUTPUTS}" \
   --pod-project-dir "${POD_PROJECT_DIR}" \
   --group-output-root "${GROUP_OUTPUT_ROOT}" \

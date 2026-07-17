@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pickle
 import time
 import uuid
 from dataclasses import dataclass
@@ -102,6 +103,84 @@ def _synchronize(torch: Any) -> None:
         except Exception:
             pass
     torch.cuda.synchronize()
+
+
+def _timing_event_api(torch: Any, env: DistEnv) -> Any | None:
+    if env.dist_backend == "hccl" or env.device_vendor in {"ascend", "npu"}:
+        return getattr(torch, "npu", None)
+    return getattr(torch, "cuda", None)
+
+
+def _new_timing_event(torch: Any, env: DistEnv) -> Any | None:
+    api = _timing_event_api(torch, env)
+    event_type = getattr(api, "Event", None) if api is not None else None
+    if event_type is None:
+        return None
+    try:
+        return event_type(enable_timing=True)
+    except TypeError:
+        return event_type()
+
+
+def _steady_state_timings(
+    torch: Any,
+    dist: Any,
+    env: DistEnv,
+    operation: Any,
+    iters: int,
+    measurement_batches: int | None = None,
+) -> tuple[list[float], str]:
+    """Measure continuous collective loops; allocation and warmup stay outside."""
+    batch_count = max(
+        1,
+        int(
+            measurement_batches
+            if measurement_batches is not None
+            else os.environ.get("DYNAMIC_COMPARE_MEASUREMENT_BATCHES", "1")
+        ),
+    )
+    iteration_count = max(1, iters)
+    latencies: list[float] = []
+    timing_mode = "steady_state_device_event"
+    for _ in range(batch_count):
+        _synchronize(torch)
+        dist.barrier(device_ids=[env.local_rank])
+        start_event = _new_timing_event(torch, env)
+        end_event = _new_timing_event(torch, env)
+        host_start = time.perf_counter()
+        if start_event is not None and end_event is not None:
+            start_event.record()
+        for _idx in range(iteration_count):
+            _maybe_fault_sleep(env)
+            operation()
+        if start_event is not None and end_event is not None:
+            end_event.record()
+        _synchronize(torch)
+        if start_event is not None and end_event is not None:
+            elapsed = float(start_event.elapsed_time(end_event)) / 1000.0
+        else:
+            timing_mode = "steady_state_host_fallback"
+            elapsed = time.perf_counter() - host_start
+        latencies.append(elapsed / iteration_count)
+    return latencies, timing_mode
+
+
+def _diagnostic_round_timings(
+    torch: Any,
+    env: DistEnv,
+    operation: Any,
+    iters: int,
+) -> list[float]:
+    """Per-round synchronized timing used only by targeted diagnostic retests."""
+    latencies: list[float] = []
+    for _ in range(max(1, iters)):
+        _synchronize(torch)
+        started = time.perf_counter()
+        _maybe_fault_sleep(env)
+        operation()
+        _synchronize(torch)
+        latencies.append(time.perf_counter() - started)
+    return latencies
 
 
 def init_dist() -> tuple[Any, Any, DistEnv]:
@@ -328,10 +407,53 @@ def _nan_inf_counts(torch: Any, tensor: Any) -> tuple[int, int]:
     return int(torch.isnan(f).sum().item()), int(torch.isinf(f).sum().item())
 
 
+def _object_packet(obj: Any) -> bytes:
+    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    if len(payload) > 0xFFFFFFFF:
+        raise ValueError("serialized healthcheck metadata exceeds 4 GiB")
+    return len(payload).to_bytes(4, "big") + payload
+
+
+def _object_from_packet(packet: bytes) -> Any:
+    if len(packet) < 4:
+        raise ValueError("healthcheck metadata packet is missing its length header")
+    payload_size = int.from_bytes(packet[:4], "big")
+    if payload_size > len(packet) - 4:
+        raise ValueError("healthcheck metadata packet is truncated")
+    return pickle.loads(packet[4 : 4 + payload_size])
+
+
 def _all_gather_object(dist: Any, obj: Any, world_size: int) -> list[Any]:
-    gathered = [None for _ in range(world_size)]
-    dist.all_gather_object(gathered, obj)
-    return gathered
+    """Gather bounded metadata through fixed-size accelerator tensors.
+
+    PyTorch's variable-length object collective has produced corrupted object
+    sizes on large MCCL groups. A fixed uint8 packet keeps the size protocol
+    explicit and avoids allocating from an untrusted decoded length.
+    """
+    torch, _ = _import_torch()
+    backend = str(dist.get_backend()).lower()
+    vendor = os.environ.get("DEVICE_VENDOR", "").strip().lower()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device_type = "npu" if backend == "hccl" or vendor in {"ascend", "npu"} else "cuda"
+    device = torch.device(device_type, local_rank)
+    packet = _object_packet(obj)
+    max_bytes = int(os.environ.get("HC_OBJECT_GATHER_MAX_BYTES", str(16 * 1024 * 1024)))
+    if len(packet) > max_bytes:
+        raise ValueError(f"healthcheck metadata packet is {len(packet)} bytes; limit is {max_bytes}")
+
+    packet_size = torch.tensor([len(packet)], dtype=torch.int32, device=device)
+    dist.all_reduce(packet_size, op=dist.ReduceOp.MAX)
+    padded_size = int(packet_size.item())
+    if padded_size <= 0 or padded_size > max_bytes:
+        raise RuntimeError(f"invalid gathered healthcheck metadata size: {padded_size}")
+
+    send = torch.zeros(padded_size, dtype=torch.uint8, device=device)
+    send[: len(packet)].copy_(torch.tensor(list(packet), dtype=torch.uint8, device=device))
+    received = [torch.empty_like(send) for _ in range(world_size)]
+    dist.all_gather(received, send)
+    if int(dist.get_rank()) != 0:
+        return []
+    return [_object_from_packet(bytes(tensor.cpu().tolist())) for tensor in received]
 
 
 def _comm_env_snapshot() -> dict[str, str]:
@@ -497,12 +619,41 @@ def _routing_counts(pattern: str, world_size: int, total_tokens: int, rank: int,
     if pattern == "random":
         import random
 
-        rng = random.Random(seed + rank)
+        # Build one deterministic random distribution and rotate it by source
+        # rank. This keeps per-rank routes different while allowing every peer
+        # to reconstruct receive splits locally without a metadata collective.
+        rng = random.Random(seed)
         weights = [rng.randint(1, 100) for _ in range(world_size)]
         total = sum(weights)
-        counts = [total_tokens * w // total for w in weights]
-        counts[-1] += total_tokens - sum(counts)
+        base_counts = [total_tokens * w // total for w in weights]
+        base_counts[-1] += total_tokens - sum(base_counts)
+        shift = rank % world_size
+        return base_counts[-shift:] + base_counts[:-shift] if shift else base_counts
+    raise ValueError(f"unsupported MoE pattern: {pattern}")
+
+
+def _routing_output_counts(
+    pattern: str,
+    world_size: int,
+    total_tokens: int,
+    destination_rank: int,
+    seed: int,
+) -> list[int]:
+    """Reconstruct one destination's receive splits in source-rank order."""
+    if not 0 <= destination_rank < world_size:
+        raise ValueError(f"destination rank {destination_rank} is outside world size {world_size}")
+    if pattern in {"uniform", "empty_expert", "skewed"}:
+        count = _routing_counts(pattern, world_size, total_tokens, 0, seed)[destination_rank]
+        return [count for _ in range(world_size)]
+    if pattern == "hot_expert":
+        base = max(1, total_tokens // (world_size * 4))
+        remainder = total_tokens - base * world_size
+        counts = [base for _ in range(world_size)]
+        counts[destination_rank] += remainder
         return counts
+    if pattern == "random":
+        base_counts = _routing_counts(pattern, world_size, total_tokens, 0, seed)
+        return [base_counts[(destination_rank - source_rank) % world_size] for source_rank in range(world_size)]
     raise ValueError(f"unsupported MoE pattern: {pattern}")
 
 
@@ -646,14 +797,15 @@ def run_bandwidth_gate(
         _synchronize(torch)
         dist.barrier(device_ids=[env.local_rank])
 
+        local_latencies, timing_mode = _steady_state_timings(
+            torch,
+            dist,
+            env,
+            lambda: dist.all_reduce(tensor),
+            iters,
+        )
         local_rows: list[dict[str, Any]] = []
-        for idx in range(max(1, iters)):
-            _maybe_fault_sleep(env)
-            _synchronize(torch)
-            start = time.perf_counter()
-            dist.all_reduce(tensor)
-            _synchronize(torch)
-            elapsed = time.perf_counter() - start
+        for idx, elapsed in enumerate(local_latencies):
             algbw = (size / max(elapsed, 1e-12)) / 1e9
             busbw = algbw * 2 * max(0, env.world_size - 1) / max(1, env.world_size)
             local_rows.append(
@@ -675,6 +827,9 @@ def run_bandwidth_gate(
                     "message_size": size_to_label(size),
                     "message_bytes": size,
                     "round": idx,
+                    "measurement_batch": idx,
+                    "iterations_per_batch": max(1, iters),
+                    "timing_mode": timing_mode,
                     "rank_latency": elapsed,
                     "rank_algbw": algbw,
                     "rank_busbw": busbw,
@@ -688,9 +843,10 @@ def run_bandwidth_gate(
 
             round_busbw: list[float] = []
             round_rows: list[dict[str, Any]] = []
-            for idx in range(max(1, iters)):
-                values = [row for row in flat if int(row["round"]) == idx]
-                elapsed = max(float(row["rank_latency"]) for row in values)
+            for idx in range(len(local_latencies)):
+                values = [row for row in flat if int(row["measurement_batch"]) == idx]
+                slowest = max(values, key=lambda row: float(row["rank_latency"]))
+                elapsed = float(slowest["rank_latency"])
                 algbw = (size / max(elapsed, 1e-12)) / 1e9
                 busbw = algbw * 2 * max(0, env.world_size - 1) / max(1, env.world_size)
                 round_busbw.append(busbw)
@@ -705,6 +861,10 @@ def run_bandwidth_gate(
                         "message_bytes": size,
                         "dtype": dtype_name,
                         "round": idx,
+                        "measurement_batch": idx,
+                        "iterations_per_batch": max(1, iters),
+                        "timing_mode": timing_mode,
+                        "slowest_rank": int(slowest["rank"]),
                         "latency": elapsed,
                         "algbw": algbw,
                         "busbw": busbw,
@@ -727,6 +887,10 @@ def run_bandwidth_gate(
                 "dtype": dtype_name,
                 "iters": max(1, iters),
                 "warmup": max(0, warmup),
+                "collective_group_size": env.world_size,
+                "measurement_batches": len(round_rows),
+                "iterations_per_batch": max(1, iters),
+                "timing_mode": timing_mode,
                 "latency_p50": percentile([row["latency"] for row in round_rows], 0.50),
                 "latency_p95": percentile([row["latency"] for row in round_rows], 0.95),
                 "latency_p99": percentile([row["latency"] for row in round_rows], 0.99),
@@ -765,8 +929,7 @@ def run_bandwidth_gate(
 
     dist.barrier(device_ids=[env.local_rank])
     dist.destroy_process_group()
-    if failed:
-        raise RuntimeError("all-reduce bandwidth gate failed")
+    # Performance gates are classification inputs, not process/correctness failures.
 
 
 def _busbw_factor(op_type: str, world_size: int) -> float:
@@ -862,13 +1025,9 @@ def _prepare_collective_bandwidth_workspace(
     if op == "all_to_all":
         padded_numel = ((tensor_numel + group_size - 1) // group_size) * group_size
         input_tensor = torch.zeros(padded_numel, device=env.device, dtype=dtype)
-        split = padded_numel // group_size
-        split_sizes = [split for _ in range(group_size)]
         return _CollectiveBandwidthWorkspace(
             input_tensor=input_tensor,
             output_tensor=torch.empty_like(input_tensor),
-            input_split_sizes=split_sizes,
-            output_split_sizes=split_sizes,
         )
     if op == "all_to_allv":
         if input_split_sizes is None or output_split_sizes is None:
@@ -904,7 +1063,14 @@ def _collective_bandwidth_once(
             raise RuntimeError("all_gather workspace is incomplete")
         dist.all_gather(workspace.output_tensors, workspace.input_tensor, group=group)
         return
-    if op in {"all_to_all", "all_to_allv"}:
+    if op == "all_to_all":
+        if workspace.output_tensor is None:
+            raise RuntimeError("all_to_all workspace is incomplete")
+        # Let the backend use its native equal-split path. Passing a large
+        # explicit split vector has triggered MCCL kernel faults at 512 ranks.
+        dist.all_to_all_single(workspace.output_tensor, workspace.input_tensor, group=group)
+        return
+    if op == "all_to_allv":
         if workspace.output_tensor is None:
             raise RuntimeError(f"{op} workspace is incomplete")
         dist.all_to_all_single(
@@ -940,6 +1106,8 @@ def _collective_bandwidth_case(
     collective_group: Any | None = None,
     collective_group_rank: int | None = None,
     collective_group_size: int | None = None,
+    diagnostic_iters: int = 0,
+    source_stage: str = "collective_bandwidth",
 ) -> dict[str, Any] | None:
     collective_group_rank = env.rank if collective_group_rank is None else collective_group_rank
     collective_group_size = env.world_size if collective_group_size is None else collective_group_size
@@ -961,9 +1129,13 @@ def _collective_bandwidth_case(
             collective_group_rank,
             seed,
         )
-        gathered_counts = [None for _ in range(collective_group_size)]
-        dist.all_gather_object(gathered_counts, input_split_sizes, group=collective_group)
-        output_split_sizes = [counts[collective_group_rank] for counts in gathered_counts]
+        output_split_sizes = _routing_output_counts(
+            payload_pattern,
+            collective_group_size,
+            token_size * collective_group_size,
+            collective_group_rank,
+            seed,
+        )
         tensor_numel = sum(input_split_sizes)
         effective_message_size = tensor_numel * element_size
     else:
@@ -990,19 +1162,28 @@ def _collective_bandwidth_case(
     _synchronize(torch)
     dist.barrier(device_ids=[env.local_rank])
 
-    local_rows: list[dict[str, Any]] = []
-    for idx in range(max(1, iters)):
-        _maybe_fault_sleep(env)
-        _synchronize(torch)
-        start = time.perf_counter()
+    def collective_once() -> None:
         _collective_bandwidth_once(
             dist,
             op,
             workspace,
             group=collective_group,
         )
-        _synchronize(torch)
-        elapsed = time.perf_counter() - start
+
+    local_latencies, timing_mode = _steady_state_timings(
+        torch,
+        dist,
+        env,
+        collective_once,
+        iters,
+    )
+    diagnostic_latencies = (
+        _diagnostic_round_timings(torch, env, collective_once, diagnostic_iters)
+        if diagnostic_iters > 0
+        else []
+    )
+    local_rows: list[dict[str, Any]] = []
+    for idx, elapsed in enumerate(local_latencies):
         algbw = (effective_message_size / max(elapsed, 1e-12)) / 1e9
         busbw = algbw * _busbw_factor(op, collective_group_size)
         local_rows.append(
@@ -1026,11 +1207,15 @@ def _collective_bandwidth_case(
                 "message_bytes": effective_message_size,
                 "requested_message_bytes": message_size,
                 "round": idx,
+                "measurement_batch": idx,
+                "iterations_per_batch": max(1, iters),
+                "timing_mode": timing_mode,
                 "collective_group_rank": collective_group_rank,
                 "collective_group_size": collective_group_size,
                 "rank_latency": elapsed,
                 "rank_algbw": algbw,
                 "rank_busbw": busbw,
+                "diagnostic_rank_latencies": diagnostic_latencies,
             }
         )
 
@@ -1043,9 +1228,10 @@ def _collective_bandwidth_case(
 
     round_busbw: list[float] = []
     round_rows: list[dict[str, Any]] = []
-    for idx in range(max(1, iters)):
-        values = [row for row in flat if int(row["round"]) == idx]
-        elapsed = max(float(row["rank_latency"]) for row in values)
+    for idx in range(len(local_latencies)):
+        values = [row for row in flat if int(row["measurement_batch"]) == idx]
+        slowest = max(values, key=lambda row: float(row["rank_latency"]))
+        elapsed = float(slowest["rank_latency"])
         algbw = (effective_message_size / max(elapsed, 1e-12)) / 1e9
         busbw = algbw * _busbw_factor(op, collective_group_size)
         round_busbw.append(busbw)
@@ -1062,6 +1248,10 @@ def _collective_bandwidth_case(
                 "requested_message_bytes": message_size,
                 "dtype": dtype_name,
                 "round": idx,
+                "measurement_batch": idx,
+                "iterations_per_batch": max(1, iters),
+                "timing_mode": timing_mode,
+                "slowest_rank": int(slowest["rank"]),
                 "collective_group_size": collective_group_size,
                 "latency": elapsed,
                 "algbw": algbw,
@@ -1073,6 +1263,12 @@ def _collective_bandwidth_case(
     ordered = sorted(round_busbw)
     second_lowest = ordered[1] if len(ordered) >= 2 else ordered[0]
     avg_value = sum(round_busbw) / len(round_busbw)
+    diagnostic_group_latencies: list[float] = []
+    diagnostic_slowest_ranks: list[int] = []
+    for idx in range(diagnostic_iters):
+        slowest = max(flat, key=lambda row: float((row.get("diagnostic_rank_latencies") or [])[idx]))
+        diagnostic_group_latencies.append(float(slowest["diagnostic_rank_latencies"][idx]))
+        diagnostic_slowest_ranks.append(int(slowest["rank"]))
     passed = second_lowest > min_busbw and avg_value > avg_busbw
     summary = {
         "job_id": job_id,
@@ -1080,6 +1276,7 @@ def _collective_bandwidth_case(
         "group_id": group_id,
         "hostnames": hostnames,
         "op_type": op,
+        "source_stage": source_stage,
         "payload_pattern": payload_pattern,
         "message_size": size_to_label(message_size),
         "message_bytes": effective_message_size,
@@ -1087,6 +1284,9 @@ def _collective_bandwidth_case(
         "dtype": dtype_name,
         "iters": max(1, iters),
         "warmup": max(0, warmup),
+        "measurement_batches": len(round_rows),
+        "iterations_per_batch": max(1, iters),
+        "timing_mode": timing_mode,
         "collective_group_size": collective_group_size,
         "latency_p50": percentile([row["latency"] for row in round_rows], 0.50),
         "latency_p95": percentile([row["latency"] for row in round_rows], 0.95),
@@ -1097,6 +1297,11 @@ def _collective_bandwidth_case(
         "avg_busbw": avg_value,
         "min_busbw": min(round_busbw),
         "max_busbw": max(round_busbw),
+        "diagnostic_timing_mode": "per_round_synchronized_host" if diagnostic_group_latencies else "",
+        "diagnostic_latency_p50": percentile(diagnostic_group_latencies, 0.50) if diagnostic_group_latencies else None,
+        "diagnostic_latency_p95": percentile(diagnostic_group_latencies, 0.95) if diagnostic_group_latencies else None,
+        "diagnostic_latency_p99": percentile(diagnostic_group_latencies, 0.99) if diagnostic_group_latencies else None,
+        "diagnostic_slowest_ranks": diagnostic_slowest_ranks,
         "bandwidth_pass": passed,
         "correctness_pass": True,
         "performance_pass": passed,
@@ -1213,8 +1418,83 @@ def run_collective_bandwidth_gate(
     finally:
         dist.barrier(device_ids=[env.local_rank])
         dist.destroy_process_group()
-    if failed:
-        raise RuntimeError("collective bandwidth gate failed")
+    # Performance gates are classification inputs, not process/correctness failures.
+
+
+def run_collective_case_retest(
+    output_dir: Path,
+    dtype_name: str,
+    cases: list[dict[str, Any]],
+    ep_size: int,
+    warmup: int,
+    iters: int,
+    diagnostic_iters: int,
+    seed: int,
+    test_round: str,
+    group_id: str,
+) -> None:
+    """Retest an exact frozen case plan with one process-group initialization."""
+    torch, dist, env = init_dist()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dtype = _dtype(torch, dtype_name)
+    job_id = os.environ.get("HEALTHCHECK_JOB_ID", str(uuid.uuid4()))
+    hostnames = sorted(set(_all_gather_object(dist, env.hostname, env.world_size)))
+    env.group_id = group_id or env.group_id or f"{test_round}-" + "-".join(hostnames)
+    ep_group = None
+    ep_group_rank = env.rank
+    ep_group_size = env.world_size
+    if any(str(case.get("op_type", "")) == "all_to_allv" for case in cases):
+        ep_group, ep_group_rank, ep_group_size, _ = _make_ep_group(dist, env, ep_size)
+    summaries: list[dict[str, Any]] = []
+    try:
+        for case in cases:
+            op = str(case.get("op_type", ""))
+            size = int(case.get("message_bytes", 0) or 0)
+            pattern = str(case.get("payload_pattern", "none") or "none")
+            if not op or size <= 0:
+                raise ValueError(f"invalid retest case: {case}")
+            kwargs: dict[str, Any] = {}
+            if op == "all_to_allv":
+                kwargs = {
+                    "collective_group": ep_group,
+                    "collective_group_rank": ep_group_rank,
+                    "collective_group_size": ep_group_size,
+                }
+            summary = _collective_bandwidth_case(
+                torch,
+                dist,
+                env,
+                output_dir,
+                job_id,
+                test_round,
+                env.group_id,
+                hostnames,
+                dtype_name,
+                dtype,
+                op,
+                size,
+                warmup,
+                iters,
+                seed,
+                0.0,
+                0.0,
+                payload_pattern=pattern,
+                diagnostic_iters=diagnostic_iters,
+                source_stage=str(case.get("stage", "collective_bandwidth")),
+                **kwargs,
+            )
+            if summary is not None:
+                summary["retest"] = True
+                summaries.append(summary)
+            dist.barrier(device_ids=[env.local_rank])
+        if env.rank == 0:
+            write_json(
+                output_dir / "collective_bandwidth_gate.json",
+                {"status": "PASS", "retest": True, "summaries": summaries},
+            )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def run_dynamic_suite(
@@ -1245,6 +1525,26 @@ def run_dynamic_suite(
     output_dir.mkdir(parents=True, exist_ok=True)
     env.group_id = group_id or env.group_id or f"{test_round}-{env.hostname}"
     _write_comm_path_debug(dist, env, output_dir, "dynamic-suite")
+    if env.rank == 0:
+        collective_cases_per_size = sum(
+            len(collective_bandwidth_moe_patterns) if op == "all_to_allv" else 1
+            for op in collective_bandwidth_ops
+        )
+        write_json(
+            output_dir / "dynamic_suite_plan.json",
+            {
+                "schema_version": 1,
+                "expected_world_size": env.world_size,
+                "bandwidth_message_sizes": bandwidth_message_sizes,
+                "collective_message_sizes": collective_bandwidth_message_sizes,
+                "collective_ops": collective_bandwidth_ops,
+                "collective_moe_patterns": collective_bandwidth_moe_patterns,
+                "expected_bandwidth_case_count": len(bandwidth_message_sizes),
+                "expected_collective_case_count": len(collective_bandwidth_message_sizes) * collective_cases_per_size,
+                "expected_case_count": len(bandwidth_message_sizes)
+                + len(collective_bandwidth_message_sizes) * collective_cases_per_size,
+            },
+        )
 
     real_destroy = dist.destroy_process_group
 
@@ -1498,13 +1798,7 @@ def _run_collective(
             else:
                 inp = x
             out = torch.empty_like(inp)
-            split = inp.numel() // env.world_size
-            dist.all_to_all_single(
-                out,
-                inp,
-                output_split_sizes=[split for _ in range(env.world_size)],
-                input_split_sizes=[split for _ in range(env.world_size)],
-            )
+            dist.all_to_all_single(out, inp)
             return out
         raise ValueError(op)
 
@@ -1552,9 +1846,13 @@ def _run_all_to_allv_pattern(
     token_size = max(1, numel // max(1, env.world_size))
     send_counts = _routing_counts(pattern, env.world_size, token_size * env.world_size, env.rank, seed)
     input_split_sizes = send_counts
-    gathered_counts = [None for _ in range(env.world_size)]
-    dist.all_gather_object(gathered_counts, input_split_sizes)
-    output_split_sizes = [counts[env.rank] for counts in gathered_counts]
+    output_split_sizes = _routing_output_counts(
+        pattern,
+        env.world_size,
+        token_size * env.world_size,
+        env.rank,
+        seed,
+    )
 
     total_in = sum(input_split_sizes)
     total_out = sum(output_split_sizes)

@@ -640,13 +640,15 @@ if fault_target():
         facts["container"]["env_keys"] = [k for k in env_keys if not k.startswith(("HCCL", "ASCEND", "MASTER_"))]
         facts["container"]["ascend_visible_devices"] = "fault_injected_missing"
         set_check_fail("ascend/ascend_env", "fault injection: simulated missing communication env")
-    elif fault_type in {"ecc_single_bit", "ecc_double_bit", "ecc_isolated_page", "ecc_query_failure"}:
+    elif fault_type in {"ecc_single_bit", "ecc_double_bit", "ecc_aggregate_double_bit", "ecc_isolated_page", "ecc_query_failure"}:
         ecc = facts.setdefault("npu", {}).setdefault("ecc", {})
         totals = ecc.setdefault("totals", {})
         if fault_type == "ecc_single_bit":
             totals["hbm_single_bit_error_count"] = 1
         elif fault_type == "ecc_double_bit":
             totals["hbm_double_bit_error_count"] = 1
+        elif fault_type == "ecc_aggregate_double_bit":
+            totals["hbm_double_bit_aggregate_total_err_count"] = 1
         elif fault_type == "ecc_isolated_page":
             totals["hbm_single_bit_isolated_pages_count"] = 1
         else:

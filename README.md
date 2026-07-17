@@ -246,6 +246,8 @@ results/vcctl/<run_id>/static/
   static_compare.json
   static_compare.md
   static_outliers.jsonl
+  static_ecc_alerts.jsonl # 每条记录定位到 vendor/node/pod/GPU/NPU/Chip
+  static_ecc_alerts.md    # ECC/RAS 专项告警报告
   summary.json
   summary.md
 ```
@@ -628,7 +630,11 @@ logs | dmesg | SKIP | pod environment does not support dmesg; kernel log screeni
 results/vcctl/<run_id>/static/static_compare.json
 results/vcctl/<run_id>/static/static_compare.md
 results/vcctl/<run_id>/static/static_outliers.jsonl
+results/vcctl/<run_id>/static/static_ecc_alerts.jsonl
+results/vcctl/<run_id>/static/static_ecc_alerts.md
 ```
+
+ECC/RAS 默认使用 `STATIC_ECC_POLICY=alert`：历史累计 corrected/uncorrected 计数只记入专项 WARN，不阻断 static 准入；MetaX 关键 RAS 事件、Ascend current double-bit/隔离页、ECC 禁用、查询失败和设备覆盖不完整仍为 FAIL。需要恢复旧版严格 Gate 时设置 `STATIC_ECC_POLICY=strict`。
 
 static 比对采用每台机器独立采集后的多数投票基线，不使用二分定位。二分更适合集合通信这种“只知道某个组异常”的测试；static 结果本身已经带有 pod / node 归属，可以直接定位异常节点。
 
@@ -670,6 +676,8 @@ MODE=all         -> static/ + single_node/ + multi_node/
 | `static_compare.json` | static 横向比对机器可读报告 |
 | `static_compare.md` | static 横向比对 Markdown 报告 |
 | `static_outliers.jsonl` | static 异常节点 / 异常字段明细 |
+| `static_ecc_alerts.jsonl` | ECC/RAS 设备级明细，包含厂家、节点、Pod、设备编号、计数或事件及处置动作 |
+| `static_ecc_alerts.md` | ECC/RAS 聚合告警报告；累计计数 WARN 与当前关键状态 FAIL 分开展示 |
 | `logs/<pod>.<mode>.stdout` | 每个 pod / mode 的 stdout；static PASS pod 默认不保留 |
 | `logs/<pod>.<mode>.stderr` | 每个 pod / mode 的 stderr；static PASS pod 默认不保留 |
 | `pod_results/<pod>/<mode>/` | 注入给检测程序的 pod 结果目录；static 默认不生成共享存储 pod 级目录 |
@@ -722,12 +730,13 @@ MODE=all         -> static/ + single_node/ + multi_node/
 | `STATIC_COMPARE_STRICT` | `1` | static 比对发现异常时是否影响 overall status |
 | `STATIC_EXPECTED_GPUS` | `GPUS_PER_NODE` | static rule gate 期望 GPU 数；`0` 表示关闭 |
 | `STATIC_EXPECTED_XSCALE_PORTS` | `0` | static rule gate 期望 xscale/HCA 端口数；`0` 表示关闭 |
+| `STATIC_ECC_POLICY` | `alert` | `alert` 将历史累计 ECC 计数作为 WARN；`strict` 恢复旧版 corrected=SUSPECT、uncorrected/critical=FAIL Gate |
 | `STATIC_OUTPUT_MODE` | `compact` | static probe 输出模式；`raw` 可配合 `STATIC_COPY_RAW_OUTPUT=1` 复制原始日志到共享存储 |
 | `STATIC_TMP_ROOT` | `/tmp` | pod 内 static raw 临时文件根目录 |
 | `STATIC_KEEP_LOCAL_TMP` | `1` | 是否保留 pod 本地 `/tmp/pretrain_healthcheck_*` 临时目录 |
 | `STATIC_COPY_RAW_OUTPUT` | `0` | 是否把 raw 临时文件复制到共享结果目录 |
 | `STATIC_STDOUT_MAX_BYTES` | `1048576` | 单 pod static stdout frame 最大字节数 |
-| `STATIC_EXEC_TIMEOUT_SECONDS` | `120` | 单 pod static probe 超时时间 |
+| `STATIC_EXEC_TIMEOUT_SECONDS` | `180` | 单 pod static probe 超时时间 |
 | `STATIC_DRIVER_TMP_ROOT` | `/tmp` | 开发机侧 static stdout/stderr 临时目录 |
 | `STATIC_KEEP_POD_FILES` | `0` | static 聚合后是否保留 `pod_results/<pod>/static` |
 | `STATIC_KEEP_EXEC_LOGS` | `0` | static 是否保留 PASS pod 的 stdout/stderr |
@@ -737,7 +746,7 @@ MODE=all         -> static/ + single_node/ + multi_node/
 | `BANDWIDTH_MIN_BUSBW` | `270` | `PROFILE=bandwidth` 的次低 BusBW gate，单位 GB/s |
 | `BANDWIDTH_AVG_BUSBW` | `290` | `PROFILE=bandwidth` 的平均 BusBW gate，单位 GB/s |
 | `COLLECTIVE_BANDWIDTH_OPS` | `all_reduce,reduce_scatter,all_gather,broadcast,all_to_all,all_to_allv` | `PROFILE=collective-bandwidth` / `PROFILE=dynamic-suite` 的 op 列表 |
-| `COLLECTIVE_BANDWIDTH_MESSAGE_SIZES` | `1K,2K,4K,8K,16K,32K,64K,128K,256K,512K,1M,2M,4M,8M,16M,32M,64M,128M,256M,512M,1G,2G` | `PROFILE=collective-bandwidth` / `PROFILE=dynamic-suite` 的 payload 大小列表 |
+| `COLLECTIVE_BANDWIDTH_MESSAGE_SIZES` | `1K`～`2G` 共 22 档 | 单节点 `dynamic-suite`、独立 `collective-bandwidth` 和多节点默认 payload 列表；可显式追加 `4G,8G` 做专项测试 |
 | `COLLECTIVE_BANDWIDTH_WARMUP` | `5` | `PROFILE=collective-bandwidth` 的 warmup 轮数 |
 | `COLLECTIVE_BANDWIDTH_ITERS` | `30` | `PROFILE=collective-bandwidth` 的计时轮数 |
 | `COLLECTIVE_BANDWIDTH_MIN_BUSBW` | `0` | `PROFILE=collective-bandwidth` 的次低 BusBW gate，单位 GB/s |
@@ -745,12 +754,24 @@ MODE=all         -> static/ + single_node/ + multi_node/
 | `COLLECTIVE_BANDWIDTH_EP_SIZE` | `8` | `PROFILE=collective-bandwidth` 中 `all_to_allv` 的 EP group size |
 | `SEED` | `20260623` | 随机种子 |
 | `RESULT_ROOT` | `<project>/results/vcctl` | 共享结果根目录，默认按脚本所在项目根目录推导 |
+| `DRIVER_PYTHON` | 自动发现 | 开发机侧 Python 3.9+ 可执行文件；只控制 driver、batch 编排和本地聚合，不改变 pod 内 Python |
 | `RUN_ID` | 当前时间戳 | 本次运行 ID |
-| `EXEC_TIMEOUT_SECONDS` | `180` | 每个 pod exec 的超时时间；完整 collective 矩阵默认自动提升到 `1800` |
+| `EXEC_TIMEOUT_SECONDS` | `180` | 每个 pod exec 的超时时间；仅独立 `collective-bandwidth` 完整扫描默认自动提升到 `1800` |
 | `MAX_PARALLEL` | `0` | 最大并发 pod 数，`0` 表示全部并发 |
+| `DYNAMIC_FRAME_RECOVERY_DEADLINE_SECONDS` | `60` | dynamic frame 校验失败后，从 pod 本地 sidecar 分块恢复的总时限 |
+| `DYNAMIC_FRAME_CHUNK_SIZE` | `2048` | sidecar 恢复块大小；每块独立校验长度和 SHA256 |
 | `CONTAINER_NAME` | 空 | 强制指定 container；为空时自动选择 |
 | `DRY_RUN` | `1` | 执行前预演 / 前置检查模式；`1` 表示只解析 pod、打印命令，不真正执行 pod 内检测 |
 | `POD_JSON_FILE` | 空 | 使用本地 pod JSON 文件做解析测试，不调用 `vcctl` |
+
+开发机 Python 的选择顺序为：显式 `DRIVER_PYTHON`、当前 `python3`、当前 Conda 环境、PATH 中的 `python3.13`～`python3.9`，最后检查常见 Miniconda/Conda 安装路径。候选版本必须满足项目声明的 Python 3.9+。例如华为开发机可以显式覆盖：
+
+```bash
+DRIVER_PYTHON=/root/miniconda3/bin/python3 \
+bash scripts/ascend/run_vcctl_healthcheck.sh
+```
+
+未显式设置时会自动跳过系统 Python 3.8，并选择可用的 Python 3.9+。显式路径不存在或版本不足时脚本直接退出，不会静默换用其他解释器。该变量不会传入 pod 替换 PyTorch/NPU/GPU 运行环境中的 `python3`。
 
 故障注入变量：
 
@@ -759,8 +780,10 @@ MODE=all         -> static/ + single_node/ + multi_node/
 | 环境变量 | 含义 |
 | --- | --- |
 | `DYNAMIC_FAULT_TYPE=backend_fail` | 目标 pod 使用非法 backend，验证初始化失败路径 |
-| `DYNAMIC_FAULT_TYPE=frame_missing` | 目标 pod 不输出 dynamic compact frame，验证 `FRAME_MISSING` |
-| `DYNAMIC_FAULT_TYPE=frame_corrupt` | 目标 pod 输出非法 dynamic compact frame，验证 `FRAME_PARSE_FAIL` |
+| `DYNAMIC_FAULT_TYPE=frame_missing` | 目标 pod 不保留 frame/sidecar，验证 `RESULT_TRANSPORT_FAIL` |
+| `DYNAMIC_FAULT_TYPE=frame_corrupt` | 目标 pod 输出非法 frame 且删除 sidecar，验证不可恢复协议故障 |
+| `DYNAMIC_FAULT_TYPE=frame_transport_truncate` | 截断目标 pod 的 stdout frame，但保留完整 sidecar，验证无计算分块恢复 |
+| `DYNAMIC_FAULT_FRAME_BYTES=<bytes>` | `frame_transport_truncate` 保留的 stdout 字节数，默认 `512` |
 | `DYNAMIC_FAULT_TYPE=sleep_timeout` | 目标 pod/rank sleep，验证 `DYNAMIC_TIMEOUT` |
 | `DYNAMIC_FAULT_TYPE=nan` | 目标 pod/rank 注入 NaN，验证 correctness fail |
 | `DYNAMIC_FAULT_TYPE=corrupt` | 目标 pod/rank 修改 tensor，验证 checksum/correctness fail |
@@ -849,6 +872,25 @@ BusBW = AlgBW * 2 * (16 - 1) / 16 = AlgBW * 1.875
 
 聚合结果写入 `results/hccl_official_single_node/<RUN_ID>/`。逐 Pod 原始 stdout/stderr 保存在开发机 `/tmp/pretrain_healthcheck_hccl_official/<RUN_ID>/`，仅失败日志通过 `failed_pod_logs/` 软链接暴露。
 
+### 华为官方 HCCL 多节点集合通信扫描
+
+对一个完整 vcjob 运行官方 128-rank HCCL test 扫描：
+
+```bash
+cd <pretrain_healthcheck>/scripts/ascend
+
+JOB_NAME=<vcjob-name> \
+DRY_RUN=0 \
+EXEC_TIMEOUT_SECONDS=3600 \
+bash run_vcctl_hccl_multi_node_collective_sweep.sh
+```
+
+默认覆盖 `all_reduce,reduce_scatter,all_gather,broadcast,all_to_all,all_to_allv`，消息大小为 1K～8G 倍增的 24 档，`bfp16`、warmup 5、iters 30。每个节点默认使用 16 个 NPU rank，节点总数从 `vcctl pod get --job` 自动发现。
+
+脚本为本轮 MPI 启动临时建立 Pod 间 SSH mesh，显式绕过 Pod 自带的 SSH client config；退出、失败或超时后会清理临时私钥、授权 marker、launcher 和 master Pod 工作目录。不会写入场景特定的 AIV、超大 HCCL buffer、deterministic、Intra-RoCE 或固定 CPU affinity 调优值。
+
+结果保存在 `results/hccl_official_multi_node/<RUN_ID>/`，包括 6 个官方程序的原始 stdout/stderr、`collective_rows.csv/jsonl`、`operation_results.jsonl` 和 `summary.md/json`。官方 `alltoallv_test` 使用内置流量模型，不等同于 healthcheck 的 EP8 五种 payload pattern。
+
 ## 16. 同硬件环境 clone YAML
 
 训练 job 异常后，如果需要恢复同一批物理机器上的软件 / 硬件环境，可先在原 job 还存在时导出原始 job 配置、pod 到 node 的映射，并生成固定节点的 clone YAML。
@@ -910,7 +952,34 @@ static
 dynamic_suite
 ```
 
-`dynamic_suite` 只启动一次 `torchrun`，在同一个 distributed process group 内依次执行 `smoke`、`quick`、`bandwidth` 和 `collective-bandwidth`，避免大规模节点上反复初始化通信组。`collective-bandwidth` 默认覆盖 `1K` 到 `2G` 的 22 个包大小，以及 `all_reduce`、`reduce_scatter`、`all_gather`、`broadcast`、`all_to_all`、`all_to_allv` 六类算子。`bandwidth` 和 `collective-bandwidth` 默认关闭固定阈值 gate，主要用于同批节点横向比较。
+`dynamic_suite` 只启动一次 `torchrun`，在同一个 distributed process group 内依次执行 `smoke`、`quick`、`bandwidth` 和 `collective-bandwidth`，避免大规模节点上反复初始化通信组。单节点默认使用 `1K` 到 `2G` 的 22 档完整矩阵以及六类 collective，All-to-AllV 默认覆盖 `uniform,hot_expert,empty_expert`；默认单 pod 超时为 `180` 秒。独立 `PROFILE=collective-bandwidth` 的完整高迭代扫描默认超时仍为 `1800` 秒。固定 absolute gate 默认关闭，主要使用同批节点或 group 横向比较。
+
+带宽阶段采用稳态计时：tensor 和通信 workspace 在计时前分配并复用，warmup 在计时前完成；每个 measurement batch 只在连续 collective 循环前后同步一次，使用 CUDA/NPU device event 统计平均单次耗时，不把分配和逐轮 host synchronize 计入主性能指标。为控制千节点规模的检测时长，首轮默认采集 1 个 measurement batch；只有冻结候选 case 及相邻 case 的一次复测默认采集 3 个 measurement batch，并以多窗口统计结果确认是否持续偏离。逐轮同步 host timing 只用于定位抖动和慢 rank，不参与性能 gate。需要采集小规模稳定性基线时，可显式设置 `DYNAMIC_COMPARE_MEASUREMENT_BATCHES=3`，此时复测批次数不会低于首轮值。
+
+横向性能比对按完全相同的 `stage + op + message size + payload pattern + collective group size` 建立 cohort：
+
+- `<1G` 默认只记录 latency、BusBW 和 correctness，不做自动性能比较，不产生性能 WARN，不触发复测，也不参与节点准入；
+- `>=1G` 主要比较 `avg_busbw`；
+- correctness、NaN/Inf、超时、进程失败仍是硬失败；
+- 设置 `DYNAMIC_COMPARE_SMALL_LATENCY_WARN=1` 可在专项诊断时恢复 `<=1M` 的 latency WARN，但这些 WARN 仍不阻断 phase；
+- `>=1G` 的大消息候选才触发冻结 case 和相邻 Gate size 的一次复测；
+- 大消息在 3-batch 复测中持续偏离，才标记 `SUSPECT`。
+
+可调参数及默认值：
+
+```text
+DYNAMIC_COMPARE_MEASUREMENT_BATCHES=1
+DYNAMIC_COMPARE_RETEST_MEASUREMENT_BATCHES=3
+DYNAMIC_COMPARE_LATENCY_RATIO_THRESHOLD=1.5
+DYNAMIC_COMPARE_BUSBW_RATIO_THRESHOLD=0.7
+DYNAMIC_COMPARE_SMALL_MAX_SIZE=1M
+DYNAMIC_COMPARE_LARGE_MIN_SIZE=1G
+DYNAMIC_COMPARE_SMALL_LATENCY_WARN=0
+DYNAMIC_COMPARE_SMALL_LATENCY_ABS_DELTA_MS=0.2
+DYNAMIC_COMPARE_SMALL_LATENCY_MAD_MULTIPLIER=6
+DYNAMIC_COMPARE_MIN_COHORT=3
+DYNAMIC_COMPARE_AUTO_RETEST=1
+```
 
 结果目录：
 
@@ -940,10 +1009,17 @@ summary.json
 summary.md
 dynamic_facts.jsonl
 dynamic_failed_pods.jsonl
+dynamic_transport.json
 dynamic_compare.json
 dynamic_compare.md
 dynamic_outliers.jsonl
+dynamic_case_metrics.jsonl
+dynamic_retest.jsonl
 ```
+
+每个 pod 的 V2 compact sidecar 保存在 pod 本地 `/tmp`。正常 stdout 使用 gzip+base64 压缩，并校验 pod/run/stage、原始长度和 SHA256；截断时只通过 `vcctl pod exec` 分块重取 sidecar，不重新运行 collective。只有覆盖清单和传输校验全部通过的数据才进入 `dynamic_facts.jsonl`。
+
+发生一次性能复测时还会生成 `dynamic_retest_facts.jsonl`、`dynamic_retest_failed_pods.jsonl` 和 `dynamic_retest_transport.json`。复测 case 在开始前一次性冻结，执行完成后不会因新观察项递归追加测试。
 
 成功 pod 的共享 stdout/stderr 和 `pod_results/` 默认不保留；失败、超时、frame 解析失败时才保留 `logs/` 用于排查。
 
@@ -1003,6 +1079,16 @@ results/vcctl/<BATCH_RUN_ID>/
 
 正常 group 的共享存储明细默认会被清理，只保留 SQLite 和 batch 汇总；失败 group 会在 `failed_groups/<group_id>/summary.md` 保留摘要。pod 内原始动态测试明细仍保留在对应 pod 的 `/tmp/pretrain_healthcheck_*` 目录中。
 
+每个 round 完成后，batch runner 会对完全相同的 case 做 group 间横向比较。Pairwise 和 Final-all 默认使用 `1K-2G x 6 ops` 的 22 档完整矩阵，Pairwise 可通过 `PAIRWISE_MESSAGE_SIZES` 显式追加 `4G,8G`；`ep8/scale64/scale128/scale256` 使用 `1M,128M,1G` 快速矩阵。小消息 WARN 不触发 phase 级性能复测；大消息候选只复测同 op、同 pattern、候选 size 及相邻 size。
+
+复测 cohort 按 group 数自适应：不超过 32 个 group 时，全部 group 同期执行冻结 case；超过 32 个 group 时，将全部候选 group 分成最多 32 组的批次，每批加入最多 8 个固定种子选择的正常对照组。每个候选 group 至少执行一次 3-batch 定向复测，各批次之间串行、批内 group 并行，避免同一个对照节点同时参加多个通信组。候选达到 32 个或超过大 phase 的 5% 时记录 `SYSTEMIC_PERFORMANCE_EVENT`，该事件仅提示检查全局负载、通信配置和网络面，不再停止当前 phase 或后续规模测试。
+
+性能候选与功能失败分开处理：持续低带宽不会进入 correctness/timeout 的拆分重测队列，也不会从后续 `ep8/scale/final_all` 候选池移除。全部 phase 完成后，未恢复的候选节点写入 `suspect_nodes.txt` 和 `performance_candidate_nodes.txt`，完整 case 证据保存在 `performance_candidates.jsonl/md`；`node_map.txt` 只包含最终 PASS 节点。correctness、NaN/Inf、建联失败、进程退出、超时和结果传输失败仍按硬异常处理。
+
+batch runner 默认在最后追加 `final_all`，确保全部 PASS 节点共同完成一次完整 collective 矩阵。如果终端快速阶段只有一个 group，且其节点集合与 Final-all 完全相同，则将该快速阶段标记为 `SUPERSEDED` 并直接执行覆盖更完整的 Final-all。8、64、128、256 节点分别可跳过重叠的 `ep8/scale64/scale128/scale256`；1024 节点有 4 个 scale256 group，因此保留 scale256 后再执行 Final-all。异常注入或 `DISABLE_FINAL_SUPERSET_SKIP=1` 会禁用该优化。
+
+`BATCH_RUNTIME_WARN_SECONDS=900` 将 15 分钟作为运行时 SLA。超过后只打印 WARN 并写入 `gate_summary.*`，检测继续执行，最终健康状态不受影响。单 group hang 仍由 `GROUP_TIMEOUT_SECONDS` 控制，Final-all 使用独立的 `FINAL_ALL_TIMEOUT_SECONDS=300`。
+
 同一轮内的 group 默认并发执行：
 
 ```text
@@ -1043,7 +1129,7 @@ bash scripts/metax/run_vcctl_multi_node_batch_healthcheck.sh
 - static probe 中部分系统命令可能在 pod 内缺失，例如 `rdma`、`ip`、`numactl`；这类结果用于能力探测，不等价于训练不可用。
 - pod 内标准 `/sys/class/infiniband/.../counters` 当前未暴露有效 counter，通信路径探测只能从 MCCL debug 确认 `xscale_0..xscale_3` 被识别和启用，不能在 pod 内直接证明每条 rail 的实际流量占比。
 - 当前两节点 MetaX C550 + MCCL 的 8GB All-Reduce 基线约为 `avg_busbw 93-96 GB/s`、`second_lowest_busbw 88-92 GB/s`；该数据只作为两节点参考基线。
-- `PROFILE=collective-bandwidth` / `PROFILE=dynamic-suite` 的 collective-bandwidth 阶段默认使用 `1K,2K,4K,8K,16K,32K,64K,128K,256K,512K,1M,2M,4M,8M,16M,32M,64M,128M,256M,512M,1G,2G`；其中 `all_gather` 的 message size 表示 gathered 后的总 payload，`all_to_allv` 按 MoE payload pattern 生成非均匀 split，其余 op 表示本 rank 参与 collective 的输入 payload。当前异常节点筛查推荐以同批次多组横向对比为主，固定 absolute gate 默认关闭。
+- 单节点 `PROFILE=dynamic-suite`、Pairwise 和 Final-all 默认使用 `1K,2K,4K,8K,16K,32K,64K,128K,256K,512K,1M,2M,4M,8M,16M,32M,64M,128M,256M,512M,1G,2G`。需要专项压力测试时，可通过 `COLLECTIVE_BANDWIDTH_MESSAGE_SIZES` 或 `PAIRWISE_MESSAGE_SIZES` 显式追加 `4G,8G`。其中 `all_gather` 的 message size 表示 gathered 后的总 payload，`all_to_allv` 按 MoE payload pattern 生成非均匀 split，其余 op 表示本 rank 参与 collective 的输入 payload。当前异常节点筛查推荐以同批次多组横向对比为主，固定 absolute gate 默认关闭。
 - 当前 NPU / HCCL 完整执行路径尚未作为主流程验证。
 - 同硬件环境 clone YAML 支持 `master replicas=1` 加 PyTorch `worker replicas>=1` 的精确恢复；其他多副本 task 暂不自动展开。
 
