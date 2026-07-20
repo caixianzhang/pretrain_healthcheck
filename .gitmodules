@@ -1,0 +1,4 @@
+[submodule "third_party/CARD_SCREEN"]
+	path = third_party/CARD_SCREEN
+	url = https://github.com/ShilohYu/CARD_SCREEN.git
+	branch = main
