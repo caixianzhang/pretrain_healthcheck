@@ -1210,7 +1210,38 @@ bash scripts/metax/run_vcctl_multi_node_batch_healthcheck.sh
 
 注意：该 batch runner 的 group 临时 pod JSON 写在开发机 `/tmp/pretrain_healthcheck_batch_<BATCH_RUN_ID>/`，不写共享存储。
 
-## 19. 当前限制
+## 19. 沐曦 96/128 节点失联复现
+
+厂家专项复现入口支持在同一 Job 中显式排除已经确认的异常 hostname，并从剩余
+Running/Ready 候选池稳定选择 96 或 128 个节点：
+
+```bash
+JOB_NAME=muxi-128node-4 \
+EXCLUDED_NODES=host-10-12-144-79,host-10-12-144-168 \
+CONFIRM_NODE_LOSS_REPRO=YES \
+bash scripts/metax/run_vcctl_96node_loss_repro.sh
+
+JOB_NAME=muxi-128node-4 \
+EXCLUDED_NODES= \
+CONFIRM_NODE_LOSS_REPRO=YES \
+bash scripts/metax/run_vcctl_128node_loss_repro.sh
+```
+
+只生成分组和检查环境时设置 `PREFLIGHT_ONLY=1`，此时不启动集合通信，也不要求
+风险确认。未知 hostname、未排除的 NotReady Pod、排除后节点不足都会以预检
+失败结束，不自动降低目标规模。正式测试固定使用 TP=4、EP=32、ETP=1、PP=8、
+CP=1 的训练拓扑，TP/PP payload 为 32M、EP payload 为 64M，不执行全局
+All-to-All，也不执行 `mx-smi --kill-all-process`。
+
+结果可通过以下命令查看：
+
+```bash
+bash scripts/metax/inspect_vcctl_node_loss_repro.sh results/vcctl/<RUN_ID>
+```
+
+详细安全边界、退出码和证据文件见 [MUXI_NODE_LOSS_REPRO.md](MUXI_NODE_LOSS_REPRO.md)。
+
+## 20. 当前限制
 
 - 训练拓扑模式已在 MetaX 32 节点、256 ranks 上完成真实执行验证；TP4、dense-DP8、expert-DP1、EP32、PP8 的 42 个 case 全部通过。64/128 节点完整验收仍要求目标 Job 的全部相关 Pod 处于 Running/Ready 状态。
 - pod 内不执行 `dmesg`，宿主机内核日志筛查由运维侧提供。
@@ -1221,7 +1252,7 @@ bash scripts/metax/run_vcctl_multi_node_batch_healthcheck.sh
 - 当前 NPU / HCCL 完整执行路径尚未作为主流程验证。
 - 同硬件环境 clone YAML 支持 `master replicas=1` 加 PyTorch `worker replicas>=1` 的精确恢复；其他多副本 task 暂不自动展开。
 
-## 20. 建议使用顺序
+## 21. 建议使用顺序
 
 训练前建议按以下顺序执行：
 
