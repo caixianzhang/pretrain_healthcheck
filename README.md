@@ -715,6 +715,8 @@ MODE=all         -> static/ + single_node/ + multi_node/
 | `PROJECT_REMOTE_DIR` | `<project>` | pod 内项目路径，默认按脚本所在项目根目录推导 |
 | `PROFILE` | `quick` | `quick`、`smoke`、`bandwidth` 或 `collective-bandwidth` |
 | `PRE_CLEAN` | `1` | 每次测试前清理可能残留的健康检查进程 |
+| `PRE_CLEAN_STRICT` | `0` | `1` 表示清理命令失败时停止检测，避免带着残留进程继续建联 |
+| `DYNAMIC_CORE_DUMP_LIMIT` | `0` | 动态检测进程的 core dump block 上限；默认禁用大 core 文件 |
 | `GPUS_PER_NODE` | `8` | 每个 pod / 节点的 GPU 数 |
 | `DIST_BACKEND` | `nccl` | PyTorch distributed backend 名称 |
 | `HEALTHCHECK_MASTER_PORT` | `auto` | 健康检查 `torchrun` rendezvous 端口 |
@@ -891,6 +893,22 @@ bash run_vcctl_hccl_multi_node_collective_sweep.sh
 
 结果保存在 `results/hccl_official_multi_node/<RUN_ID>/`，包括 6 个官方程序的原始 stdout/stderr、`collective_rows.csv/jsonl`、`operation_results.jsonl` 和 `summary.md/json`。官方 `alltoallv_test` 使用内置流量模型，不等同于 healthcheck 的 EP8 五种 payload pattern。
 
+### 沐曦官方 MCCL 多节点集合通信扫描
+
+MetaX 环境可以使用镜像内置的 `mccl_perf` 对完整 vcjob 执行厂家通信栈极限扫描：
+
+```bash
+cd <pretrain_healthcheck>/scripts/metax
+
+JOB_NAME=<vcjob-name> \
+DRY_RUN=0 \
+bash run_vcctl_mccl_multi_node_collective_sweep.sh
+```
+
+默认覆盖 `all_reduce,reduce_scatter,all_gather,broadcast,all_to_all,all_to_allv` 和 1K～2G 的 22 档消息大小。每个算子独立运行；单个算子失败后继续采集后续算子。默认不会执行 `mx-smi --kill-all-process`，只有厂家专项 A/B 测试同时显式设置 `METAX_KILL_ALL_PROCESS_BEFORE_OP=1` 与 `ALLOW_KILL_ALL_PROCESS=1` 才会执行破坏性清理。
+
+结果保存在 `results/mccl_official_multi_node/<RUN_ID>/`。该入口用于通信库极限和厂家复现，不属于下面的训练拓扑准入 Gate；特别是全局 All-to-All 的 QP 压力不能等同于实际 MoE EP group。
+
 ## 16. 同硬件环境 clone YAML
 
 训练 job 异常后，如果需要恢复同一批物理机器上的软件 / 硬件环境，可先在原 job 还存在时导出原始 job 配置、pod 到 node 的映射，并生成固定节点的 clone YAML。
@@ -1032,6 +1050,8 @@ cd <pretrain_healthcheck>
 
 JOB_NAME=muxi-1024node \
 TARGET_SCALE=128 \
+GPUS_PER_NODE=8 \
+TRAINING_TOPOLOGY_MANIFEST=/shared/path/training_topology_manifest.json \
 DRY_RUN=0 \
 PRE_CLEAN=1 \
 DYNAMIC_COMPARE=1 \
@@ -1039,12 +1059,16 @@ GROUP_TIMEOUT_SECONDS=180 \
 bash scripts/metax/run_vcctl_multi_node_batch_healthcheck.sh
 ```
 
-脚本会读取当前 job 的 pod 列表，按固定 seed 生成分组，并为每个 group 生成临时 pod JSON，复用：
+脚本会读取当前 job 的 pod 列表，按固定 seed 生成分组，并为每个 group 生成临时 pod JSON。`pairwise`、`ep8` 和 `scale32_crosscheck` 复用通用动态检测；64 节点以上切换为训练拓扑检测：
 
 ```text
 MODE=multi-node
 PROFILE=dynamic-suite
 POD_JSON_FILE=<group_pods.json>
+
+MODE=multi-node
+PROFILE=training-topology
+TRAINING_TOPOLOGY_MANIFEST=<framework-exported-manifest.json>
 ```
 
 默认 phase 根据节点数和 `TARGET_SCALE` 自动选择：
@@ -1052,16 +1076,64 @@ POD_JSON_FILE=<group_pods.json>
 ```text
 pairwise
 ep8
-scale64
-scale128
-scale256
+scale32_crosscheck
+scale64_topology
+final_training_topology
 ```
 
-也可以显式指定：
+旧的 `scale64,scale128,scale256,final_all` 全局 collective phase 已禁用。它们会将两节点测试形态原样放大，尤其会把 All-to-All 扩展成 512/1024-rank 全连接，QP 规模与真实 MoE 训练不一致。
+
+### 导出真实训练拓扑
+
+64 节点以上必须从将要运行训练的 Megatron/MindSpeed 代码导出 manifest，不能由 healthcheck 自行猜测连续 rank 分组。例如 128 节点、每节点 8 卡，配置为 TP=4、EP=32、ETP=1、PP=8：
 
 ```bash
-PHASES=pairwise,ep8,scale64
+python3 tools/export_megatron_training_topology.py \
+  --megatron-path /shared/path/Megatron-LM \
+  --world-size 512 \
+  --world-size 1024 \
+  --ranks-per-node 8 \
+  --tp 4 \
+  --ep 32 \
+  --etp 1 \
+  --pp 8 \
+  --cp 1 \
+  --mbs 1 \
+  --gbs 1024 \
+  --output /shared/path/training_topology_manifest.json
 ```
+
+导出器与 Megatron 初始化逻辑一致，分别构造 dense 和 expert 两个 `RankGenerator`。以上配置在 1024 ranks 下得到 dense-DP=32、expert-DP=4；在 512 ranks 下得到 dense-DP=16、expert-DP=2，EP 均保持 32。只有目标训练本身对某个缩放 world size 使用不同并行参数时才需要 `--profile-overrides-json`。
+
+导出器直接调用目标代码中的 `RankGenerator.get_ranks()`，并记录模块 SHA256、并行配置 SHA256、rank order，以及每个 world size 的实际并行参数和 TP、dense-DP、expert-DP、EP、PP group。它还校验 dense/expert PP group 完全一致。batch 启动时校验每一类 group 对当前 world size 完整且不重叠；Pod 再次校验 manifest SHA256。若开发机路径与 Pod 内路径不同，另设 `POD_TRAINING_TOPOLOGY_MANIFEST`。
+
+可通过 `--model-json` 和 `--workload-shapes-json` 加入真实训练 shape。默认每类通信组仍执行 `1M,128M,1G` 代表性 payload：TP/dense-DP 执行 All-Reduce、Reduce-Scatter、All-Gather，expert-DP 执行 All-Reduce，EP 执行 All-to-All 及五类 All-to-AllV payload，PP 执行双向 Send/Recv。
+
+TP+DP+EP 多 communicator overlap canary 属于额外通信栈压力诊断，默认不参与健康准入。仅在专项排查时显式设置 `TOPOLOGY_OVERLAP_CANARY=1`；执行计划和 Gate 结果会记录该开关。该 canary 失败不能覆盖已经完成的真实训练拓扑 case 结论。
+
+常规拓扑 case 只在 manifest 指定的 TP、dense-DP、expert-DP、EP、PP 子组内通信，不使用默认 world process group 做 barrier 或结果 All-Gather。每个子组 leader 将摘要写入所在 Pod 的 `/tmp/training_topology_rank_summaries/`；Pod compact frame 携带分片摘要和源文件 SHA256，开发机 driver 再按同一 family/op/shape 聚合最慢子组，并校验 case 数和每类 subgroup 数。这样结果汇总不会重新引入 512/1024-rank 全局 QP 压力。
+
+### 规模 Gate 与定位
+
+- `pairwise`：两轮交错 2 节点，完整 1K～2G 矩阵，定位节点和 RDMA 基础链路。
+- `ep8`：8 节点快速矩阵。
+- `scale32_crosscheck`：两轮随机 32 节点组合，验证较大规模建联并提供 64 节点失败后的拆分基线。
+- `scale64_topology`：将节点先划成 32 节点半组；128 节点时第一轮为 `(A+B),(C+D)`，第二轮为 `(A+C),(B+D)`。每个 64 节点 group 内并发运行 manifest 的真实训练子组，并对相同 family/op/shape 做两组横向比较。只有跨两轮持续落入候选组的交集节点才进入拓扑性能嫌疑清单。
+- `final_training_topology`：在全部 PASS 候选节点上执行一次真实训练拓扑验收。它不再运行全局 All-to-All，也不复用前一阶段的快速结果。
+
+若只验证拓扑阶段、跳过同一 batch 内的 static/single-node/pairwise 准入，必须显式提供此前已经验收的 hostname 列表：
+
+```bash
+PREQUALIFIED_NODES_FILE=/shared/path/prequalified_nodes.txt \
+PHASES=scale64_topology,final_training_topology \
+bash scripts/metax/run_vcctl_multi_node_batch_healthcheck.sh
+```
+
+batch 会校验节点均属于当前 job，记录源文件 SHA256，并将副本保存为结果目录中的 `prequalified_nodes.txt`。断点续跑时文件内容必须保持一致。该模式的 summary 会明确标记为 topology-only，不能替代完整准入流程。
+
+当只执行 `final_training_topology` 时，manifest profile 的 world size 按预准入节点数乘以 `GPUS_PER_NODE` 选择，而不是按原始 Job 的全部 Pod 数选择。因此可以在一个大 Job 中对已经收敛出的 32/64 节点候选集做定向拓扑确认，但 manifest 必须包含对应 world-size profile。
+
+若一个 64 节点拓扑 group 失败，程序拆成 32 节点通用动态组定位。两个 32 节点子组都通过而父组失败时，记录 `SCALE_COMM_STACK_FAIL`，表示规模化 communicator/软件栈问题，而不是直接把 64 个节点全部归为硬件坏节点。两组规模性能有差异但缺少第三个正常基线时，记录 `DIVERGENT_SCALE64_COHORT`，通过第二轮交叉组合继续收敛。
 
 共享结果目录：
 
@@ -1074,20 +1146,23 @@ results/vcctl/<BATCH_RUN_ID>/
   suspect_nodes.txt
   fail_nodes.txt
   node_map.txt
+  training_topology_manifest.json
+  topology_plan.md
+  topology_summary.md
+  topology_failed_groups.jsonl
+  topology_suspect_nodes.txt
   failed_groups/
 ```
 
 正常 group 的共享存储明细默认会被清理，只保留 SQLite 和 batch 汇总；失败 group 会在 `failed_groups/<group_id>/summary.md` 保留摘要。pod 内原始动态测试明细仍保留在对应 pod 的 `/tmp/pretrain_healthcheck_*` 目录中。
 
-每个 round 完成后，batch runner 会对完全相同的 case 做 group 间横向比较。Pairwise 和 Final-all 默认使用 `1K-2G x 6 ops` 的 22 档完整矩阵，Pairwise 可通过 `PAIRWISE_MESSAGE_SIZES` 显式追加 `4G,8G`；`ep8/scale64/scale128/scale256` 使用 `1M,128M,1G` 快速矩阵。小消息 WARN 不触发 phase 级性能复测；大消息候选只复测同 op、同 pattern、候选 size 及相邻 size。
+每个 round 完成后，batch runner 对完全相同的 family、op、shape 和 group size 做组间横向比较。Pairwise 使用 1K～2G 的 22 档完整矩阵；`ep8/scale32_crosscheck` 使用 `1M,128M,1G` 快速矩阵；拓扑阶段使用 manifest case。小消息 WARN 不触发 phase 级性能复测；大消息候选只复测冻结的 family/op/pattern/size，而不是重跑整个拓扑矩阵。
 
 复测 cohort 按 group 数自适应：不超过 32 个 group 时，全部 group 同期执行冻结 case；超过 32 个 group 时，将全部候选 group 分成最多 32 组的批次，每批加入最多 8 个固定种子选择的正常对照组。每个候选 group 至少执行一次 3-batch 定向复测，各批次之间串行、批内 group 并行，避免同一个对照节点同时参加多个通信组。候选达到 32 个或超过大 phase 的 5% 时记录 `SYSTEMIC_PERFORMANCE_EVENT`，该事件仅提示检查全局负载、通信配置和网络面，不再停止当前 phase 或后续规模测试。
 
-性能候选与功能失败分开处理：持续低带宽不会进入 correctness/timeout 的拆分重测队列，也不会从后续 `ep8/scale/final_all` 候选池移除。全部 phase 完成后，未恢复的候选节点写入 `suspect_nodes.txt` 和 `performance_candidate_nodes.txt`，完整 case 证据保存在 `performance_candidates.jsonl/md`；`node_map.txt` 只包含最终 PASS 节点。correctness、NaN/Inf、建联失败、进程退出、超时和结果传输失败仍按硬异常处理。
+性能候选与功能失败分开处理：持续低带宽不会进入 correctness/timeout 的拆分重测队列。全部 phase 完成后，未恢复的候选写入 `suspect_nodes.txt`、`performance_candidate_nodes.txt` 和拓扑专用摘要；`node_map.txt` 只包含最终 PASS 节点。correctness、NaN/Inf、建联失败、进程退出、超时、manifest 不一致和结果传输失败仍按硬异常处理。
 
-batch runner 默认在最后追加 `final_all`，确保全部 PASS 节点共同完成一次完整 collective 矩阵。如果终端快速阶段只有一个 group，且其节点集合与 Final-all 完全相同，则将该快速阶段标记为 `SUPERSEDED` 并直接执行覆盖更完整的 Final-all。8、64、128、256 节点分别可跳过重叠的 `ep8/scale64/scale128/scale256`；1024 节点有 4 个 scale256 group，因此保留 scale256 后再执行 Final-all。异常注入或 `DISABLE_FINAL_SUPERSET_SKIP=1` 会禁用该优化。
-
-`BATCH_RUNTIME_WARN_SECONDS=900` 将 15 分钟作为运行时 SLA。超过后只打印 WARN 并写入 `gate_summary.*`，检测继续执行，最终健康状态不受影响。单 group hang 仍由 `GROUP_TIMEOUT_SECONDS` 控制，Final-all 使用独立的 `FINAL_ALL_TIMEOUT_SECONDS=300`。
+`BATCH_RUNTIME_WARN_SECONDS=900` 将 15 分钟作为运行时 SLA。超过后只打印 WARN 并写入 `gate_summary.*`，检测继续执行，最终健康状态不受影响。通用 group hang 由 `GROUP_TIMEOUT_SECONDS` 控制，拓扑阶段使用独立的 `FINAL_TRAINING_TOPOLOGY_TIMEOUT_SECONDS=300`。
 
 同一轮内的 group 默认并发执行：
 
@@ -1101,13 +1176,27 @@ PHASE_GROUP_CONCURRENCY=0
 PHASE_GROUP_CONCURRENCY=64
 ```
 
+真实 Job 的多节点 batch 默认启用成员存活监控：
+
+```bash
+JOB_LIVENESS_MONITOR=1
+JOB_LIVENESS_CHECK_INTERVAL_SECONDS=10
+```
+
+启动时保存 Pod 名称、UID、hostname、Pod IP 和 Ready 状态基线，运行期间每 10 秒重新读取一次 Job。Pod 缺失或替换、调度节点变化、非 `Running/Ready`、Pod IP 为空时，所有正在运行的 group 会停止，batch 以 `overall_status=ABORTED`、退出码 3 结束，不把基础设施失效写成通信性能嫌疑。单次 `vcctl` 查询失败仅告警，连续三次查询失败时因无法继续保证 Job 完整性而中止。
+
+告警产物包括 `job_liveness_baseline.json`、`job_liveness_events.jsonl`、`job_liveness_alert.json`、`invalid_job_nodes.txt`、中止后的最终状态快照 `job_liveness_post_abort.json` 和定向清理记录 `job_liveness_cleanup.json`。清理仅匹配本次 `BATCH_RUN_ID` 的 Healthcheck 进程，不调用全局 `mx-smi --kill-all-process`。使用 `POD_JSON_FILE` 的离线或 dry-run 不启动实时监控。
+
 断点续跑：
 
 ```bash
 JOB_NAME=muxi-1024node \
 BATCH_RUN_ID=<existing_batch_id> \
+TRAINING_TOPOLOGY_MANIFEST=/shared/path/training_topology_manifest.json \
 bash scripts/metax/run_vcctl_multi_node_batch_healthcheck.sh --resume
 ```
+
+拓扑模式断点续跑会校验 manifest SHA、Pod 路径、每节点 rank 数、phase 列表以及预准入节点文件 SHA。任何一项变化都要求新建 `BATCH_RUN_ID`，避免用新训练配置或节点集合续跑旧分组结论。
 
 本地 dry-run 可以使用保存的 pod JSON：
 
@@ -1123,13 +1212,12 @@ bash scripts/metax/run_vcctl_multi_node_batch_healthcheck.sh
 
 ## 19. 当前限制
 
-- 当前 vcctl 多节点验证只在两节点 MetaX C550 环境完成闭环。
-- 更大规模的 8 / 64 / 128 节点测试需要结合实际资源申请和分组策略继续验证。
+- 训练拓扑模式已在 MetaX 32 节点、256 ranks 上完成真实执行验证；TP4、dense-DP8、expert-DP1、EP32、PP8 的 42 个 case 全部通过。64/128 节点完整验收仍要求目标 Job 的全部相关 Pod 处于 Running/Ready 状态。
 - pod 内不执行 `dmesg`，宿主机内核日志筛查由运维侧提供。
 - static probe 中部分系统命令可能在 pod 内缺失，例如 `rdma`、`ip`、`numactl`；这类结果用于能力探测，不等价于训练不可用。
 - pod 内标准 `/sys/class/infiniband/.../counters` 当前未暴露有效 counter，通信路径探测只能从 MCCL debug 确认 `xscale_0..xscale_3` 被识别和启用，不能在 pod 内直接证明每条 rail 的实际流量占比。
 - 当前两节点 MetaX C550 + MCCL 的 8GB All-Reduce 基线约为 `avg_busbw 93-96 GB/s`、`second_lowest_busbw 88-92 GB/s`；该数据只作为两节点参考基线。
-- 单节点 `PROFILE=dynamic-suite`、Pairwise 和 Final-all 默认使用 `1K,2K,4K,8K,16K,32K,64K,128K,256K,512K,1M,2M,4M,8M,16M,32M,64M,128M,256M,512M,1G,2G`。需要专项压力测试时，可通过 `COLLECTIVE_BANDWIDTH_MESSAGE_SIZES` 或 `PAIRWISE_MESSAGE_SIZES` 显式追加 `4G,8G`。其中 `all_gather` 的 message size 表示 gathered 后的总 payload，`all_to_allv` 按 MoE payload pattern 生成非均匀 split，其余 op 表示本 rank 参与 collective 的输入 payload。当前异常节点筛查推荐以同批次多组横向对比为主，固定 absolute gate 默认关闭。
+- 单节点 `PROFILE=dynamic-suite` 和 Pairwise 默认使用 `1K,2K,4K,8K,16K,32K,64K,128K,256K,512K,1M,2M,4M,8M,16M,32M,64M,128M,256M,512M,1G,2G`。需要专项压力测试时，可显式追加 `4G,8G`。64 节点以上的训练准入由 manifest 指定的真实通信组和 shape 决定；全局 All-to-All 仅保留在厂家 MCCL 极限扫描中。
 - 当前 NPU / HCCL 完整执行路径尚未作为主流程验证。
 - 同硬件环境 clone YAML 支持 `master replicas=1` 加 PyTorch `worker replicas>=1` 的精确恢复；其他多副本 task 暂不自动展开。
 

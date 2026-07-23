@@ -638,6 +638,7 @@ def write_commands_env(path: Path, args: argparse.Namespace) -> None:
         f"DYNAMIC_FRAME_CHUNK_SIZE={args.dynamic_frame_chunk_size}",
         f"HEALTHCHECK_MASTER_PORT={args.healthcheck_master_port}",
         f"RESOLVED_HEALTHCHECK_MASTER_PORT={getattr(args, 'resolved_healthcheck_master_port', '')}",
+        f"PRE_CLEAN_STRICT={int(args.pre_clean_strict)}",
         "PRE_CLEAN_CMD=" + args.pre_clean_cmd,
         "STATIC_CMD=" + args.static_cmd,
         "SINGLE_NODE_CMD=" + args.single_node_cmd,
@@ -1514,6 +1515,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vcctl-bin", default="vcctl")
     parser.add_argument("--container-name", default="")
     parser.add_argument("--pre-clean-cmd", default="")
+    parser.add_argument("--pre-clean-strict", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--static-cmd", default="")
     parser.add_argument("--single-node-cmd", default="")
     parser.add_argument("--multi-node-cmd", default="")
@@ -1622,9 +1624,20 @@ def main() -> int:
     results: list[ExecResult] = []
     static_compare_report: dict[str, Any] | None = None
     dynamic_compare_report: dict[str, Any] | None = None
+    checks_allowed = True
     if args.pre_clean_cmd:
-        results.extend(run_mode(pods, "pre-clean", args.pre_clean_cmd, args))
-    if args.mode in {"static", "all"}:
+        pre_clean_results = run_mode(pods, "pre-clean", args.pre_clean_cmd, args)
+        results.extend(pre_clean_results)
+        failed_pre_clean = [result for result in pre_clean_results if result.status not in {"PASS", "DRY_RUN"}]
+        if args.pre_clean_strict and failed_pre_clean:
+            checks_allowed = False
+            failed_pods = ",".join(result.pod_name for result in failed_pre_clean)
+            print(
+                "[vcctl-healthcheck] strict pre-clean failed; "
+                f"skipping requested checks failed_pods={failed_pods}",
+                file=sys.stderr,
+            )
+    if checks_allowed and args.mode in {"static", "all"}:
         static_results = run_mode(pods, "static", args.static_cmd, args)
         results.extend(static_results)
         if args.static_compare and not args.dry_run:
@@ -1641,7 +1654,7 @@ def main() -> int:
             removed_static_logs = cleanup_static_exec_logs(output_dir, results)
             if removed_static_logs:
                 print(f"[vcctl-healthcheck] removed static exec logs: {removed_static_logs}")
-    if args.mode in {"single-node", "all"}:
+    if checks_allowed and args.mode in {"single-node", "all"}:
         single_node_results = run_mode(pods, "single-node", args.single_node_cmd, args)
         results.extend(single_node_results)
         if args.dynamic_compare and not args.dry_run:
@@ -1653,7 +1666,7 @@ def main() -> int:
                 removed_dynamic_logs = cleanup_dynamic_exec_logs(output_dir, results)
                 if removed_dynamic_logs:
                     print(f"[vcctl-healthcheck] removed dynamic exec logs: {removed_dynamic_logs}")
-    if args.mode in {"multi-node", "all"}:
+    if checks_allowed and args.mode in {"multi-node", "all"}:
         multi_node_results = run_mode(pods, "multi-node", args.multi_node_cmd, args)
         results.extend(multi_node_results)
         if args.dynamic_compare and not args.dry_run:
