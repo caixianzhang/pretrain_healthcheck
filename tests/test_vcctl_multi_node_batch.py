@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,6 +37,99 @@ def pod(name: str) -> object:
     )
 
 
+def numbered_pods(count: int) -> list[object]:
+    return [
+        batch.Pod(
+            pod_name=f"pod-{index:04d}",
+            namespace="default",
+            container_name="worker",
+            task_spec="worker",
+            node_name=f"node-{index:04d}",
+            host_ip=f"192.0.2.{index % 250 + 1}",
+            pod_ip=f"198.51.100.{index % 250 + 1}",
+            raw={},
+        )
+        for index in range(count)
+    ]
+
+
+def live_raw(
+    name: str,
+    node: str,
+    *,
+    uid: str = "uid-1",
+    phase: str = "Running",
+    ready: bool = True,
+    pod_ip: str = "198.51.100.10",
+    reason: str = "",
+) -> dict[str, object]:
+    return {
+        "metadata": {"name": name, "uid": uid, "namespace": "default"},
+        "spec": {"nodeName": node, "containers": [{"name": "worker"}]},
+        "status": {
+            "phase": phase,
+            "podIP": pod_ip,
+            "reason": reason,
+            "conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+        },
+    }
+
+
+class JobLivenessTests(unittest.TestCase):
+    def test_healthy_snapshot_has_no_issues(self) -> None:
+        baseline = [batch.job_liveness_record(live_raw("pod-a", "node-a"))]
+        self.assertEqual(batch.evaluate_job_liveness(baseline, list(baseline)), [])
+
+    def test_failed_pod_is_reported_immediately(self) -> None:
+        baseline = [batch.job_liveness_record(live_raw("pod-a", "node-a"))]
+        current = [
+            batch.job_liveness_record(
+                live_raw(
+                    "pod-a",
+                    "node-a",
+                    phase="Failed",
+                    ready=False,
+                    pod_ip="",
+                    reason="UnexpectedAdmissionError",
+                )
+            )
+        ]
+        issue_types = {item["type"] for item in batch.evaluate_job_liveness(baseline, current)}
+        self.assertEqual(issue_types, {"POD_NOT_RUNNING", "POD_NOT_READY", "POD_IP_MISSING"})
+
+    def test_missing_replaced_or_moved_pod_is_reported(self) -> None:
+        baseline = [batch.job_liveness_record(live_raw("pod-a", "node-a"))]
+        replaced = [batch.job_liveness_record(live_raw("pod-a", "node-b", uid="uid-2"))]
+        issue_types = {item["type"] for item in batch.evaluate_job_liveness(baseline, replaced)}
+        self.assertEqual(issue_types, {"POD_UID_CHANGED", "POD_NODE_CHANGED"})
+        self.assertEqual(
+            {item["type"] for item in batch.evaluate_job_liveness(baseline, [])},
+            {"POD_MISSING"},
+        )
+
+    def test_three_query_failures_abort_monitor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = live_raw("pod-a", "node-a")
+            target = batch.pod_from_raw(raw)
+            self.assertIsNotNone(target)
+            args = argparse.Namespace(
+                vcctl_bin="vcctl",
+                job_name="test-job",
+                namespace="default",
+                batch_run_id="test-run",
+                job_liveness_check_interval_seconds=1,
+                _job_abort_event=threading.Event(),
+                _job_abort_payload={},
+            )
+            monitor = batch.JobLivenessMonitor(args, [target], Path(tmp))
+            monitor.stop_event.wait = mock.Mock(return_value=False)
+            with mock.patch.object(batch, "query_job_liveness", side_effect=RuntimeError("api down")):
+                monitor._run()
+            self.assertTrue(args._job_abort_event.is_set())
+            self.assertEqual(args._job_abort_payload["reason"], "JOB_LIVENESS_QUERY_UNAVAILABLE")
+            self.assertTrue((Path(tmp) / "job_liveness_alert.json").is_file())
+
+
 class BatchTargetTests(unittest.TestCase):
     def test_plural_targets_are_merged_and_propagated(self) -> None:
         args = argparse.Namespace(
@@ -51,16 +146,27 @@ class BatchTargetTests(unittest.TestCase):
 
 
 class MatrixAndRetestPolicyTests(unittest.TestCase):
-    def test_pairwise_and_final_use_full_matrix(self) -> None:
+    def test_pairwise_scale32_and_topology_matrix_modes(self) -> None:
         pairwise = batch.task_matrix_env(batch.GroupTask("pairwise", "r1", "g1", []))
-        final_all = batch.task_matrix_env(batch.GroupTask("final_all", "r1", "g2", []))
-        scale = batch.task_matrix_env(batch.GroupTask("scale64", "r1", "g3", []))
+        scale = batch.task_matrix_env(batch.GroupTask("scale32_crosscheck", "r1", "g2", []))
+        topology = batch.task_matrix_env(batch.GroupTask("scale64_topology", "r1", "g3", []))
         self.assertEqual(pairwise["COLLECTIVE_BANDWIDTH_MESSAGE_SIZES"], batch.PAIRWISE_MESSAGE_SIZES)
         self.assertEqual(batch.PAIRWISE_MESSAGE_SIZES, batch.FULL_MESSAGE_SIZES)
         self.assertEqual(pairwise["COLLECTIVE_BANDWIDTH_ITERS"], "1")
-        self.assertEqual(final_all["COLLECTIVE_BANDWIDTH_MESSAGE_SIZES"], batch.FULL_MESSAGE_SIZES)
-        self.assertEqual(final_all["COLLECTIVE_BANDWIDTH_ITERS"], "3")
         self.assertEqual(scale["COLLECTIVE_BANDWIDTH_MESSAGE_SIZES"], batch.FAST_MESSAGE_SIZES)
+        self.assertEqual(
+            topology,
+            {
+                "TOPOLOGY_WARMUP": "1",
+                "TOPOLOGY_ITERS": "1",
+                "TOPOLOGY_OVERLAP_CANARY": "0",
+            },
+        )
+
+    def test_topology_overlap_canary_is_explicit_opt_in(self) -> None:
+        task = batch.GroupTask("scale64_topology", "r1", "g1", [])
+        with mock.patch.dict(os.environ, {"TOPOLOGY_OVERLAP_CANARY": "1"}):
+            self.assertEqual(batch.task_matrix_env(task)["TOPOLOGY_OVERLAP_CANARY"], "1")
 
     def test_small_cohort_retests_all_groups(self) -> None:
         tasks = [batch.GroupTask("pairwise", "r1", f"g{i}", []) for i in range(8)]
@@ -123,57 +229,246 @@ class RuntimeWarningTests(unittest.TestCase):
 
 
 class PhaseCandidateTests(unittest.TestCase):
-    def test_direct_final_all_uses_all_unknown_nodes(self) -> None:
+    def test_final_topology_validates_prequalified_world_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "manifest.json"
+            source.write_text("{}\n", encoding="utf-8")
+            group = types.SimpleNamespace(ranks=(0, 1, 2, 3))
+            profile = types.SimpleNamespace(
+                parallelism={"tp": 4},
+                groups={"tp": [group]},
+            )
+            manifest = types.SimpleNamespace(
+                sha256="a" * 64,
+                ranks_per_node=8,
+                framework={"name": "test", "rank_order": "tp-cp-ep-dp-pp"},
+                profiles={256: profile},
+            )
+            args = argparse.Namespace(
+                training_topology_manifest=str(source),
+                pod_training_topology_manifest="",
+                prequalified_node_count=32,
+                gpus_per_node=8,
+            )
+            with mock.patch.object(batch, "load_training_topology_manifest", return_value=manifest), mock.patch.object(
+                batch, "require_profile", return_value=profile
+            ) as require:
+                batch.prepare_training_topology(
+                    args,
+                    numbered_pods(128),
+                    ["final_training_topology"],
+                    root,
+                )
+
+            require.assert_called_once_with(manifest, 256, 8)
+
+    def test_prequalified_nodes_seed_topology_candidates_and_archive_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            con = batch.init_db(root / "batch.sqlite")
+            pods = [pod("A"), pod("B")]
+            batch.upsert_pods(con, pods)
+            source = root / "nodes.txt"
+            source.write_text("A\nB\n", encoding="utf-8")
+            args = argparse.Namespace(
+                prequalified_nodes_file=str(source),
+                batch_run_id="prequalified-test",
+            )
+            output = root / "result"
+            output.mkdir()
+
+            batch.prepare_prequalified_nodes(con, args, pods, output)
+            candidates, direct = batch.phase_candidates("scale64_topology", con, pods)
+
+            self.assertFalse(direct)
+            self.assertEqual([item.node_name for item in candidates], ["A", "B"])
+            self.assertEqual(args.prequalified_node_count, 2)
+            self.assertEqual((output / "prequalified_nodes.txt").read_text(), "A\nB\n")
+            self.assertEqual(
+                con.execute("select distinct last_phase from nodes").fetchone()[0],
+                "external_prequalified",
+            )
+            con.close()
+
+    def test_prequalified_nodes_reject_unknown_or_changed_resume_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            con = batch.init_db(root / "batch.sqlite")
+            pods = [pod("A"), pod("B")]
+            batch.upsert_pods(con, pods)
+            source = root / "nodes.txt"
+            source.write_text("A\nC\n", encoding="utf-8")
+            args = argparse.Namespace(prequalified_nodes_file=str(source), batch_run_id="test")
+            output = root / "result"
+            output.mkdir()
+            with self.assertRaisesRegex(ValueError, "not present"):
+                batch.prepare_prequalified_nodes(con, args, pods, output)
+            source.write_text("A\nB\n", encoding="utf-8")
+            batch.prepare_prequalified_nodes(con, args, pods, output)
+            source.write_text("A\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "differs"):
+                batch.prepare_prequalified_nodes(con, args, pods, output)
+            con.close()
+
+    def test_direct_final_topology_uses_all_unknown_nodes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             con = batch.init_db(Path(tmp) / "batch.sqlite")
             pods = [pod("A"), pod("B")]
             batch.upsert_pods(con, pods)
-            candidates, direct = batch.phase_candidates("final_all", con, pods)
+            candidates, direct = batch.phase_candidates("final_training_topology", con, pods)
             self.assertTrue(direct)
             self.assertEqual([item.node_name for item in candidates], ["A", "B"])
             con.close()
 
-    def test_direct_final_all_does_not_bypass_known_failure(self) -> None:
+    def test_direct_final_topology_does_not_bypass_known_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             con = batch.init_db(Path(tmp) / "batch.sqlite")
             pods = [pod("A"), pod("B")]
             batch.upsert_pods(con, pods)
             con.execute("update nodes set status='FAIL' where node_name='A'")
             con.commit()
-            candidates, direct = batch.phase_candidates("final_all", con, pods)
+            candidates, direct = batch.phase_candidates("final_training_topology", con, pods)
             self.assertFalse(direct)
             self.assertEqual(candidates, [])
             con.close()
 
 
-class FinalAllGateTests(unittest.TestCase):
+class FinalTopologyGateTests(unittest.TestCase):
     def test_failed_root_is_not_hidden_by_passing_splits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             con = batch.init_db(Path(tmp) / "batch.sqlite")
             pods = [pod(name) for name in "ABCD"]
-            root = batch.GroupTask("final_all", "final_all_r1", "final_all_group_0000", pods)
+            root = batch.GroupTask(
+                "final_training_topology",
+                "final_training_topology_r1",
+                "final_training_topology_group_0000",
+                pods,
+            )
             batch.table_group(con, root, "FAIL")
             for index, part in enumerate((pods[:2], pods[2:])):
                 split = batch.GroupTask(
-                    "final_all",
-                    "final_all_r1_split",
-                    f"final_all_group_0000_split_{index}",
+                    "scale32_crosscheck",
+                    "final_training_topology_r1_split",
+                    f"final_training_topology_group_0000_split_{index}",
                     part,
                     parent_group_id=root.group_id,
                     attempt=1,
                 )
                 batch.table_group(con, split, "PASS")
-            self.assertTrue(batch.final_all_root_failed(con))
+            self.assertTrue(batch.final_training_topology_root_failed(con))
             con.close()
 
     def test_passing_or_reused_root_is_healthy(self) -> None:
-        for status in ("PASS", "REUSED_PASS"):
+        for status in ("PASS",):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
                 con = batch.init_db(Path(tmp) / "batch.sqlite")
-                root = batch.GroupTask("final_all", "final_all_r1", "final_all_group_0000", [])
+                root = batch.GroupTask(
+                    "final_training_topology",
+                    "final_training_topology_r1",
+                    "final_training_topology_group_0000",
+                    [],
+                )
                 batch.table_group(con, root, status)
-                self.assertFalse(batch.final_all_root_failed(con))
+                self.assertFalse(batch.final_training_topology_root_failed(con))
                 con.close()
+
+
+class TopologyPhasePlanTests(unittest.TestCase):
+    def test_auto_phases_replace_legacy_global_scale_phases(self) -> None:
+        self.assertEqual(
+            batch.auto_phases(128, 128),
+            [
+                "pairwise",
+                "ep8",
+                "scale32_crosscheck",
+                "scale64_topology",
+                "final_training_topology",
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "legacy global scale phases"):
+            batch.parse_phases("pairwise,scale64,final_all", 128, 128)
+
+    def test_scale32_has_two_complete_deterministic_rounds(self) -> None:
+        pods = numbered_pods(128)
+        first = batch.make_phase_groups("scale32_crosscheck", pods, 17)
+        second = batch.make_phase_groups("scale32_crosscheck", pods, 17)
+        self.assertEqual(
+            [[pod.node_name for pod in task.pods] for task in first],
+            [[pod.node_name for pod in task.pods] for task in second],
+        )
+        self.assertEqual(len(first), 8)
+        for round_id in ("scale32_crosscheck_r1", "scale32_crosscheck_r2"):
+            round_tasks = [task for task in first if task.round_id == round_id]
+            self.assertEqual(len(round_tasks), 4)
+            self.assertEqual({len(task.pods) for task in round_tasks}, {32})
+            self.assertEqual(
+                sorted(pod.node_name for task in round_tasks for pod in task.pods),
+                sorted(pod.node_name for pod in pods),
+            )
+
+    def test_scale64_crosses_halves_in_two_rounds(self) -> None:
+        pods = numbered_pods(128)
+        tasks = batch.make_phase_groups("scale64_topology", pods, 19)
+        self.assertEqual(len(tasks), 4)
+        rounds = {
+            round_id: [task for task in tasks if task.round_id == round_id]
+            for round_id in ("scale64_topology_r1", "scale64_topology_r2")
+        }
+        for round_tasks in rounds.values():
+            self.assertEqual(len(round_tasks), 2)
+            self.assertEqual({len(task.pods) for task in round_tasks}, {64})
+            self.assertEqual(
+                sorted(pod.node_name for task in round_tasks for pod in task.pods),
+                sorted(pod.node_name for pod in pods),
+            )
+        round1_sets = {frozenset(pod.node_name for pod in task.pods) for task in rounds["scale64_topology_r1"]}
+        round2_sets = {frozenset(pod.node_name for pod in task.pods) for task in rounds["scale64_topology_r2"]}
+        self.assertTrue(round1_sets.isdisjoint(round2_sets))
+
+    def test_final_topology_is_one_full_candidate_group(self) -> None:
+        pods = numbered_pods(128)
+        tasks = batch.make_phase_groups("final_training_topology", pods, 23)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].phase, "final_training_topology")
+        self.assertEqual(tasks[0].pods, pods)
+
+    def test_scale64_performance_requires_cross_round_node_intersection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            con = batch.init_db(Path(tmp) / "batch.sqlite")
+            pods = numbered_pods(128)
+            batch.upsert_pods(con, pods)
+            for item in pods:
+                batch.set_node_status(con, item.node_name, "PASS", "scale32_crosscheck")
+            tasks = batch.make_phase_groups("scale64_topology", pods, 19)
+            for task in tasks:
+                batch.table_group(con, task, "PASS")
+            round1 = next(task for task in tasks if task.round_id == "scale64_topology_r1")
+            round2 = next(task for task in tasks if task.round_id == "scale64_topology_r2")
+            case = {
+                "pod_name": round1.group_id,
+                "case_id": "training_topology/ep/all_to_allv/1G/hot_expert/32",
+            }
+            batch.record_performance_candidates(
+                con, round1.phase, round1.round_id, [case], "CONFIRMED"
+            )
+            self.assertEqual(batch.apply_performance_candidate_statuses(con), [])
+
+            batch.record_performance_candidates(
+                con,
+                round2.phase,
+                round2.round_id,
+                [{**case, "pod_name": round2.group_id}],
+                "CONFIRMED",
+            )
+            suspects = batch.apply_performance_candidate_statuses(con)
+            expected = sorted(
+                {pod.node_name for pod in round1.pods}
+                & {pod.node_name for pod in round2.pods}
+            )
+            self.assertEqual(suspects, expected)
+            self.assertEqual(len(suspects), 32)
+            con.close()
 
 
 class PerformanceCandidateTests(unittest.TestCase):
@@ -378,173 +673,6 @@ class LocalizationTests(unittest.TestCase):
         self.assertEqual(suspects, ["A", "B"])
         statuses = self.statuses()
         self.assertTrue(all(statuses[name] == "PASS" for name in "CDEFGH"))
-
-
-class FinalAllReuseTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.con = batch.init_db(Path(self.tmp.name) / "batch.sqlite")
-        self.args = argparse.Namespace(
-            healthcheck_script="/tmp/run_vcctl_healthcheck.sh",
-            pod_project_dir="/tmp/pretrain_healthcheck",
-            dynamic_compare="1",
-            dynamic_compare_busbw_ratio_threshold=0.7,
-            dynamic_compare_latency_ratio_threshold=1.5,
-            dynamic_compare_small_max_size="1M",
-            dynamic_compare_large_min_size="1G",
-            dynamic_compare_small_latency_warn=False,
-            dynamic_compare_min_cohort=3,
-            dynamic_compare_auto_retest=True,
-            batch_fault_type="",
-            job_name="test-job",
-            batch_run_id="test-run",
-        )
-
-    def tearDown(self) -> None:
-        self.con.close()
-        self.tmp.cleanup()
-
-    def prepare_source(self, names: str, groups: list[str], *, signature: str | None = None) -> list[object]:
-        pods = [pod(name) for name in names]
-        batch.upsert_pods(self.con, pods)
-        by_name = {item.node_name: item for item in pods}
-        for index, group_names in enumerate(groups):
-            task = batch.GroupTask(
-                "ep8",
-                "ep8_r1",
-                f"ep8_r1_group_{index:04d}",
-                [by_name[name] for name in group_names],
-            )
-            batch.table_group(self.con, task, "PASS")
-            metrics = {
-                "execution_signature": signature or batch.execution_signature(self.args),
-                "case_metrics": [{"op_type": "all_reduce", "message_size": "1M"}],
-            }
-            self.con.execute(
-                """
-                insert into group_results(group_id,status,error_type,metrics_json,elapsed_seconds,local_workdirs_json,created_at)
-                values(?,?,?,?,?,?,?)
-                """,
-                (task.group_id, "PASS", "", json.dumps(metrics), 12.5, "{}", batch.iso_now()),
-            )
-        for item in pods:
-            batch.set_node_status(self.con, item.node_name, "PASS", "ep8")
-        self.con.commit()
-        return pods
-
-    def test_reuses_single_full_group_with_matching_signature(self) -> None:
-        pods = self.prepare_source("ABCDEFGH", ["ABCDEFGH"])
-
-        reused = batch.reuse_final_all_from_phase("ep8", pods, self.args, self.con)
-
-        self.assertTrue(reused)
-        group = self.con.execute(
-            "select status,parent_group_id,nodes_json from groups where group_id='final_all_group_0000'"
-        ).fetchone()
-        self.assertEqual(group[0], "REUSED_PASS")
-        self.assertEqual(group[1], "ep8_r1_group_0000")
-        self.assertEqual(json.loads(group[2]), list("ABCDEFGH"))
-        metrics = json.loads(
-            self.con.execute(
-                "select metrics_json from group_results where group_id='final_all_group_0000'"
-            ).fetchone()[0]
-        )
-        self.assertTrue(metrics["reused"])
-        self.assertEqual(metrics["source_elapsed_seconds"], 12.5)
-        output_dir = Path(self.tmp.name) / "summary"
-        output_dir.mkdir()
-        batch.write_batch_summary(self.con, output_dir, self.args, "PASS")
-        summary = json.loads((output_dir / "batch_summary.json").read_text())
-        self.assertEqual(summary["final_all_reuse"]["status"], "REUSED_PASS")
-        self.assertEqual(summary["final_all_reuse"]["avoided_group_executions"], 1)
-        self.assertIn(
-            "execution_continued_after_warning: `false`",
-            (output_dir / "batch_summary.md").read_text(),
-        )
-
-    def test_does_not_reuse_multiple_groups_with_same_total_size(self) -> None:
-        pods = self.prepare_source("ABCDEFGHIJKLMNOP", ["ABCDEFGH", "IJKLMNOP"])
-
-        reused = batch.reuse_final_all_from_phase("ep8", pods, self.args, self.con)
-
-        self.assertFalse(reused)
-        self.assertIsNone(
-            self.con.execute("select status from groups where group_id='final_all_group_0000'").fetchone()
-        )
-
-    def test_does_not_reuse_mismatched_execution_signature(self) -> None:
-        pods = self.prepare_source("ABCDEFGH", ["ABCDEFGH"], signature="stale-signature")
-
-        self.assertFalse(batch.reuse_final_all_from_phase("ep8", pods, self.args, self.con))
-
-    def test_fault_injection_disables_reuse(self) -> None:
-        pods = self.prepare_source("ABCDEFGH", ["ABCDEFGH"])
-        self.args.batch_fault_type = "corrupt"
-
-        self.assertFalse(batch.reuse_final_all_from_phase("ep8", pods, self.args, self.con))
-
-    def test_preserves_existing_executed_final_all_pass(self) -> None:
-        pods = self.prepare_source("ABCDEFGH", ["ABCDEFGH"])
-        final_task = batch.GroupTask(
-            "final_all",
-            "final_all_r1",
-            "final_all_group_0000",
-            pods,
-        )
-        batch.table_group(self.con, final_task, "PASS")
-        self.con.execute(
-            """
-            insert into group_results(group_id,status,error_type,metrics_json,elapsed_seconds,local_workdirs_json,created_at)
-            values(?,?,?,?,?,?,?)
-            """,
-            (final_task.group_id, "PASS", "", "{}", 21.0, "{}", batch.iso_now()),
-        )
-        self.con.commit()
-
-        self.assertFalse(batch.reuse_final_all_from_phase("ep8", pods, self.args, self.con))
-        group = self.con.execute(
-            "select status,parent_group_id from groups where group_id='final_all_group_0000'"
-        ).fetchone()
-        self.assertEqual(group[0], "PASS")
-        self.assertEqual(group[1], "")
-
-
-class FinalAllSupersetTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.con = batch.init_db(Path(self.tmp.name) / "batch.sqlite")
-        self.args = argparse.Namespace(
-            disable_final_superset_skip=False,
-            batch_fault_type="",
-            group_seed=20260706,
-        )
-
-    def tearDown(self) -> None:
-        self.con.close()
-        self.tmp.cleanup()
-
-    def prepare(self, names: str) -> list[object]:
-        pods = [pod(name) for name in names]
-        batch.upsert_pods(self.con, pods)
-        for item in pods:
-            batch.set_node_status(self.con, item.node_name, "PASS", "pairwise")
-        self.con.commit()
-        return pods
-
-    def test_ep8_is_superseded_for_exactly_eight_pass_nodes(self) -> None:
-        pods = self.prepare("ABCDEFGH")
-        self.assertTrue(batch.supersede_phase_with_final_all("ep8", pods, self.args, self.con))
-        status = self.con.execute("select status from groups where phase='ep8'").fetchone()[0]
-        self.assertEqual(status, "SUPERSEDED")
-
-    def test_ep8_is_not_superseded_when_it_has_multiple_groups(self) -> None:
-        pods = self.prepare("ABCDEFGHIJKLMNOP")
-        self.assertFalse(batch.supersede_phase_with_final_all("ep8", pods, self.args, self.con))
-
-    def test_fault_injection_disables_superset_skip(self) -> None:
-        pods = self.prepare("ABCDEFGH")
-        self.args.batch_fault_type = "corrupt"
-        self.assertFalse(batch.supersede_phase_with_final_all("ep8", pods, self.args, self.con))
 
 
 if __name__ == "__main__":

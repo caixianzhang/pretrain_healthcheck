@@ -29,6 +29,30 @@ def source_file_record(root: Path, relative: str) -> dict[str, Any]:
     return record
 
 
+def source_glob_record(root: Path, relative_pattern: str) -> dict[str, Any]:
+    paths = sorted(root.glob(relative_pattern))
+    digest = hashlib.sha256()
+    total_bytes = 0
+    total_rows = 0
+    for path in paths:
+        data = path.read_bytes()
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+        total_bytes += len(data)
+        total_rows += sum(1 for line in data.splitlines() if line.strip())
+    return {
+        "path": relative_pattern,
+        "exists": bool(paths),
+        "files": len(paths),
+        "bytes": total_bytes,
+        "sha256": digest.hexdigest() if paths else "",
+        "rows": total_rows,
+    }
+
+
 def source_manifest(input_dir: Path, kind: str) -> list[dict[str, Any]]:
     by_kind = {
         "smoke": ["ping_summary.json"],
@@ -43,8 +67,15 @@ def source_manifest(input_dir: Path, kind: str) -> list[dict[str, Any]]:
             "bandwidth/bandwidth_summary.jsonl",
             "collective_bandwidth/collective_bandwidth_summary.jsonl",
         ],
+        "training-topology": [
+            "training_topology_plan.json",
+            "training_topology_gate.json",
+        ],
     }
-    return [source_file_record(input_dir, relative) for relative in by_kind[kind]]
+    records = [source_file_record(input_dir, relative) for relative in by_kind[kind]]
+    if kind == "training-topology":
+        records.append(source_glob_record(input_dir, "training_topology_rank_summaries/rank_*.jsonl"))
+    return records
 
 
 def coverage_manifest(args: argparse.Namespace, compact: dict[str, Any], sources: list[dict[str, Any]]) -> dict[str, Any]:
@@ -54,12 +85,15 @@ def coverage_manifest(args: argparse.Namespace, compact: dict[str, Any], sources
     expected_bandwidth_sizes = csv_values(args.expected_bandwidth_message_sizes)
     expected_ranks = args.expected_ranks
     suite_plan = read_json(args.input_dir / "dynamic_suite_plan.json") if args.kind == "dynamic-suite" else {}
+    topology_plan = read_json(args.input_dir / "training_topology_plan.json") if args.kind == "training-topology" else {}
     if suite_plan:
         expected_ranks = int(suite_plan.get("expected_world_size", expected_ranks) or 0)
         expected_bandwidth_sizes = [str(value) for value in suite_plan.get("bandwidth_message_sizes", [])]
         expected_sizes = [str(value) for value in suite_plan.get("collective_message_sizes", [])]
         expected_ops = [str(value) for value in suite_plan.get("collective_ops", [])]
         expected_patterns = [str(value) for value in suite_plan.get("collective_moe_patterns", [])]
+    elif topology_plan:
+        expected_ranks = int(topology_plan.get("world_size", expected_ranks) or 0)
     actual_cases = compact.get("case_metrics", []) if isinstance(compact.get("case_metrics"), list) else []
     summary_owner = compact.get("summary_owner") is not False
     errors: list[str] = []
@@ -70,6 +104,8 @@ def coverage_manifest(args: argparse.Namespace, compact: dict[str, Any], sources
     expected_case_count = 0
     if args.kind == "dynamic-suite" and suite_plan:
         expected_case_count = int(suite_plan.get("expected_case_count", 0) or 0)
+    elif args.kind == "training-topology" and topology_plan:
+        expected_case_count = int(topology_plan.get("case_count", 0) or 0)
     elif args.kind == "dynamic-suite" and expected_sizes and expected_ops:
         collective_per_size = sum(len(expected_patterns) if op == "all_to_allv" else 1 for op in expected_ops)
         expected_case_count = len(expected_bandwidth_sizes) + len(expected_sizes) * collective_per_size
@@ -79,11 +115,14 @@ def coverage_manifest(args: argparse.Namespace, compact: dict[str, Any], sources
     elif args.kind == "bandwidth" and expected_bandwidth_sizes:
         expected_case_count = len(expected_bandwidth_sizes)
 
-    if summary_owner and expected_case_count and len(actual_cases) != expected_case_count:
+    if summary_owner and args.kind != "training-topology" and expected_case_count and len(actual_cases) != expected_case_count:
         errors.append(f"case count mismatch: expected={expected_case_count} actual={len(actual_cases)}")
-    if summary_owner and expected_ranks > 0 and args.kind in {"smoke", "dynamic-suite"}:
-        smoke = compact.get("sub_summaries", {}).get("smoke", {}) if args.kind == "dynamic-suite" else compact
-        actual_ranks = int(smoke.get("rank_count", 0) or 0) if isinstance(smoke, dict) else 0
+    if summary_owner and expected_ranks > 0 and args.kind in {"smoke", "dynamic-suite", "training-topology"}:
+        if args.kind == "training-topology":
+            actual_ranks = int(compact.get("rank_count", 0) or 0)
+        else:
+            smoke = compact.get("sub_summaries", {}).get("smoke", {}) if args.kind == "dynamic-suite" else compact
+            actual_ranks = int(smoke.get("rank_count", 0) or 0) if isinstance(smoke, dict) else 0
         if actual_ranks != expected_ranks:
             errors.append(f"rank count mismatch: expected={expected_ranks} actual={actual_ranks}")
 
@@ -91,6 +130,8 @@ def coverage_manifest(args: argparse.Namespace, compact: dict[str, Any], sources
         "/".join(
             [
                 str(row.get("stage", "")),
+                str(row.get("topology_family", "")),
+                str(row.get("topology_group_id", "")),
                 str(row.get("op_type", "")),
                 str(row.get("requested_message_bytes", row.get("message_bytes", ""))),
                 str(row.get("payload_pattern", "none")),
@@ -193,6 +234,11 @@ def compact_case_metrics(rows: list[dict[str, Any]], stage: str) -> list[dict[st
         "diagnostic_latency_p95",
         "diagnostic_latency_p99",
         "diagnostic_slowest_ranks",
+        "topology_family",
+        "topology_group_id",
+        "subgroup_count",
+        "aggregation",
+        "case_source",
     ]
     compact: list[dict[str, Any]] = []
     for row in rows:
@@ -345,6 +391,27 @@ def summarize_dynamic_suite(input_dir: Path) -> dict[str, Any]:
     }
 
 
+def summarize_training_topology(input_dir: Path) -> dict[str, Any]:
+    plan = read_json(input_dir / "training_topology_plan.json")
+    gate = read_json(input_dir / "training_topology_gate.json")
+    rows: list[dict[str, Any]] = []
+    for path in sorted((input_dir / "training_topology_rank_summaries").glob("rank_*.jsonl")):
+        rows.extend(read_jsonl(path))
+    correctness_pass = gate.get("status") == "PASS" and all(row.get("correctness_pass", False) for row in rows)
+    return {
+        "kind": "training-topology",
+        "rank_count": int(plan.get("world_size", 0) or 0),
+        "summary_count": len(rows),
+        "correctness_pass": correctness_pass,
+        "performance_pass": all(row.get("performance_pass", True) for row in rows),
+        "error_type": "" if correctness_pass else "TOPOLOGY_CORRECTNESS_FAIL",
+        "manifest_sha256": str(plan.get("manifest_sha256", "")),
+        "topology_group_counts": plan.get("group_counts", {}),
+        "case_metrics": compact_case_metrics(rows, "training_topology"),
+        "summary_owner": bool(rows),
+    }
+
+
 def summarize_comm_path(input_dir: Path) -> dict[str, Any]:
     rows = read_jsonl(input_dir / "comm_path_summary.jsonl")
     if not rows:
@@ -382,6 +449,8 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         compact = summarize_collective_bandwidth(input_dir)
     elif args.kind == "dynamic-suite":
         compact = summarize_dynamic_suite(input_dir)
+    elif args.kind == "training-topology":
+        compact = summarize_training_topology(input_dir)
     else:
         raise ValueError(f"unsupported kind: {args.kind}")
 
@@ -433,7 +502,7 @@ def main() -> None:
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument(
         "--kind",
-        choices=["smoke", "quick", "bandwidth", "collective-bandwidth", "dynamic-suite"],
+        choices=["smoke", "quick", "bandwidth", "collective-bandwidth", "dynamic-suite", "training-topology"],
         required=True,
     )
     parser.add_argument("--stage", required=True)

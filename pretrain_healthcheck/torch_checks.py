@@ -423,7 +423,12 @@ def _object_from_packet(packet: bytes) -> Any:
     return pickle.loads(packet[4 : 4 + payload_size])
 
 
-def _all_gather_object(dist: Any, obj: Any, world_size: int) -> list[Any]:
+def _all_gather_object(
+    dist: Any,
+    obj: Any,
+    world_size: int,
+    group: Any | None = None,
+) -> list[Any]:
     """Gather bounded metadata through fixed-size accelerator tensors.
 
     PyTorch's variable-length object collective has produced corrupted object
@@ -442,7 +447,7 @@ def _all_gather_object(dist: Any, obj: Any, world_size: int) -> list[Any]:
         raise ValueError(f"healthcheck metadata packet is {len(packet)} bytes; limit is {max_bytes}")
 
     packet_size = torch.tensor([len(packet)], dtype=torch.int32, device=device)
-    dist.all_reduce(packet_size, op=dist.ReduceOp.MAX)
+    dist.all_reduce(packet_size, op=dist.ReduceOp.MAX, group=group)
     padded_size = int(packet_size.item())
     if padded_size <= 0 or padded_size > max_bytes:
         raise RuntimeError(f"invalid gathered healthcheck metadata size: {padded_size}")
@@ -450,8 +455,8 @@ def _all_gather_object(dist: Any, obj: Any, world_size: int) -> list[Any]:
     send = torch.zeros(padded_size, dtype=torch.uint8, device=device)
     send[: len(packet)].copy_(torch.tensor(list(packet), dtype=torch.uint8, device=device))
     received = [torch.empty_like(send) for _ in range(world_size)]
-    dist.all_gather(received, send)
-    if int(dist.get_rank()) != 0:
+    dist.all_gather(received, send, group=group)
+    if int(dist.get_rank(group=group)) != 0:
         return []
     return [_object_from_packet(bytes(tensor.cpu().tolist())) for tensor in received]
 

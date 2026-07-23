@@ -26,7 +26,13 @@ COLLECTIVE_ACCEPTANCE_OPS="all_reduce,reduce_scatter,all_gather,broadcast,all_to
 SINGLE_NODE_GATE_MESSAGE_SIZES="${COLLECTIVE_ACCEPTANCE_MESSAGE_SIZES}"
 SINGLE_NODE_GATE_MOE_PATTERNS="uniform,hot_expert,empty_expert"
 COLLECTIVE_BANDWIDTH_OPS="${COLLECTIVE_BANDWIDTH_OPS:-${COLLECTIVE_ACCEPTANCE_OPS}}"
-if [[ "${PROFILE}" == "dynamic-suite" ]]; then
+TRAINING_TOPOLOGY_MANIFEST="${TRAINING_TOPOLOGY_MANIFEST:-}"
+POD_TRAINING_TOPOLOGY_MANIFEST="${POD_TRAINING_TOPOLOGY_MANIFEST:-${TRAINING_TOPOLOGY_MANIFEST}}"
+TOPOLOGY_MANIFEST_SHA256="${TOPOLOGY_MANIFEST_SHA256:-}"
+TOPOLOGY_WARMUP="${TOPOLOGY_WARMUP:-1}"
+TOPOLOGY_ITERS="${TOPOLOGY_ITERS:-1}"
+TOPOLOGY_OVERLAP_CANARY="${TOPOLOGY_OVERLAP_CANARY:-0}"
+if [[ "${PROFILE}" == "dynamic-suite" || "${PROFILE}" == "training-topology" ]]; then
   MESSAGE_SIZES="${MESSAGE_SIZES:-1M}"
   WARMUP="${WARMUP:-1}"
   ITERS="${ITERS:-1}"
@@ -141,6 +147,13 @@ STATIC_FAULT_RANK="${STATIC_FAULT_RANK:-}"
 STATIC_FAULT_NODE="${STATIC_FAULT_NODE:-}"
 STATIC_FAULT_SLEEP_SECONDS="${STATIC_FAULT_SLEEP_SECONDS:-600}"
 PRE_CLEAN_CMD="${PRE_CLEAN_CMD:-ps -eo pid=,args= | awk '/[p]retrain_healthcheck.cli|[t]orchrun/ {print \$1}' | xargs -r kill -TERM || true}"
+PRE_CLEAN_STRICT="${PRE_CLEAN_STRICT:-0}"
+DYNAMIC_CORE_DUMP_LIMIT="${DYNAMIC_CORE_DUMP_LIMIT:-0}"
+if [[ ! "${DYNAMIC_CORE_DUMP_LIMIT}" =~ ^([0-9]+|unlimited)$ ]]; then
+  echo "[vcctl-healthcheck] DYNAMIC_CORE_DUMP_LIMIT must be a non-negative integer or unlimited, got: ${DYNAMIC_CORE_DUMP_LIMIT}" >&2
+  exit 2
+fi
+DYNAMIC_SHELL_SETUP="ulimit -c ${DYNAMIC_CORE_DUMP_LIMIT}"
 STATIC_OUTPUT_MODE="${STATIC_OUTPUT_MODE:-compact}"
 STATIC_TMP_ROOT="${STATIC_TMP_ROOT:-/tmp}"
 STATIC_KEEP_LOCAL_TMP="${STATIC_KEEP_LOCAL_TMP:-1}"
@@ -151,6 +164,7 @@ STATIC_CMD="${STATIC_CMD:-cd ${PROJECT_REMOTE_DIR} && export PYTHONPATH=\"${PROJ
 FAULT_ENV="FAULT_BACKEND=\"${FAULT_BACKEND}\" FAULT_SLEEP_RANK=\"${FAULT_SLEEP_RANK}\" FAULT_SLEEP_POD=\"${FAULT_SLEEP_POD}\" FAULT_SLEEP_NODE=\"${FAULT_SLEEP_NODE}\" FAULT_SLEEP_SECONDS=\"${FAULT_SLEEP_SECONDS}\" FAULT_NAN_RANK=\"${FAULT_NAN_RANK}\" FAULT_NAN_POD=\"${FAULT_NAN_POD}\" FAULT_NAN_NODE=\"${FAULT_NAN_NODE}\" FAULT_CORRUPT_RANK=\"${FAULT_CORRUPT_RANK}\" FAULT_CORRUPT_POD=\"${FAULT_CORRUPT_POD}\" FAULT_CORRUPT_NODE=\"${FAULT_CORRUPT_NODE}\" FAULT_JOIN_TIMEOUT_RANK=\"${FAULT_JOIN_TIMEOUT_RANK}\" FAULT_JOIN_TIMEOUT_POD=\"${FAULT_JOIN_TIMEOUT_POD}\" FAULT_JOIN_TIMEOUT_NODE=\"${FAULT_JOIN_TIMEOUT_NODE}\" FAULT_JOIN_TIMEOUT_SECONDS=\"${FAULT_JOIN_TIMEOUT_SECONDS}\" FAULT_NET_SLOW_RANK=\"${FAULT_NET_SLOW_RANK}\" FAULT_NET_SLOW_POD=\"${FAULT_NET_SLOW_POD}\" FAULT_NET_SLOW_NODE=\"${FAULT_NET_SLOW_NODE}\" FAULT_NET_SLOW_SECONDS=\"${FAULT_NET_SLOW_SECONDS}\" FAULT_RANK_EXIT_RANK=\"${FAULT_RANK_EXIT_RANK}\" FAULT_RANK_EXIT_POD=\"${FAULT_RANK_EXIT_POD}\" FAULT_RANK_EXIT_NODE=\"${FAULT_RANK_EXIT_NODE}\" FAULT_RANK_EXIT_CODE=\"${FAULT_RANK_EXIT_CODE}\" FAULT_COMM_ENV_BAD_RANK=\"${FAULT_COMM_ENV_BAD_RANK}\" FAULT_COMM_ENV_BAD_POD=\"${FAULT_COMM_ENV_BAD_POD}\" FAULT_COMM_ENV_BAD_NODE=\"${FAULT_COMM_ENV_BAD_NODE}\" FAULT_ETH_FALLBACK_RANK=\"${FAULT_ETH_FALLBACK_RANK}\" FAULT_ETH_FALLBACK_POD=\"${FAULT_ETH_FALLBACK_POD}\" FAULT_ETH_FALLBACK_NODE=\"${FAULT_ETH_FALLBACK_NODE}\" DYNAMIC_FAULT_TYPE=\"${DYNAMIC_FAULT_TYPE}\" DYNAMIC_FAULT_POD=\"${DYNAMIC_FAULT_POD}\" DYNAMIC_FAULT_NODE=\"${DYNAMIC_FAULT_NODE}\" DYNAMIC_FAULT_LOCAL_RANK=\"${DYNAMIC_FAULT_LOCAL_RANK}\" DYNAMIC_FAULT_SLEEP_SECONDS=\"${DYNAMIC_FAULT_SLEEP_SECONDS}\" DYNAMIC_FAULT_FRAME_BYTES=\"${DYNAMIC_FAULT_FRAME_BYTES}\" COMM_PATH_DEBUG=\"${COMM_PATH_DEBUG}\""
 FAULT_ENV+=" FAULT_SLEEP_PODS=\"${FAULT_SLEEP_PODS}\" FAULT_SLEEP_NODES=\"${FAULT_SLEEP_NODES}\" FAULT_NAN_PODS=\"${FAULT_NAN_PODS}\" FAULT_NAN_NODES=\"${FAULT_NAN_NODES}\" FAULT_CORRUPT_PODS=\"${FAULT_CORRUPT_PODS}\" FAULT_CORRUPT_NODES=\"${FAULT_CORRUPT_NODES}\" FAULT_JOIN_TIMEOUT_PODS=\"${FAULT_JOIN_TIMEOUT_PODS}\" FAULT_JOIN_TIMEOUT_NODES=\"${FAULT_JOIN_TIMEOUT_NODES}\" FAULT_NET_SLOW_PODS=\"${FAULT_NET_SLOW_PODS}\" FAULT_NET_SLOW_NODES=\"${FAULT_NET_SLOW_NODES}\" FAULT_RANK_EXIT_PODS=\"${FAULT_RANK_EXIT_PODS}\" FAULT_RANK_EXIT_NODES=\"${FAULT_RANK_EXIT_NODES}\" FAULT_COMM_ENV_BAD_PODS=\"${FAULT_COMM_ENV_BAD_PODS}\" FAULT_COMM_ENV_BAD_NODES=\"${FAULT_COMM_ENV_BAD_NODES}\" FAULT_ETH_FALLBACK_PODS=\"${FAULT_ETH_FALLBACK_PODS}\" FAULT_ETH_FALLBACK_NODES=\"${FAULT_ETH_FALLBACK_NODES}\""
 FAULT_ENV+=" DYNAMIC_COMPARE_MEASUREMENT_BATCHES=\"${DYNAMIC_COMPARE_MEASUREMENT_BATCHES}\""
+FAULT_ENV+=" TOPOLOGY_OVERLAP_CANARY=\"${TOPOLOGY_OVERLAP_CANARY}\""
 if [[ -z "${SINGLE_NODE_CMD:-}" ]]; then
   if [[ "${PROFILE}" =~ ^(smoke|quick|bandwidth|collective-bandwidth|dynamic-suite)$ ]]; then
     SINGLE_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && export PROJECT_REMOTE_DIR=\"${PROJECT_REMOTE_DIR}\" PYTHONPATH=\"${PROJECT_REMOTE_DIR}:\${PYTHONPATH:-}\" && STAGE_KIND=\"${PROFILE}\" GPUS_PER_NODE=\"${GPUS_PER_NODE}\" DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" DTYPE=\"${DTYPE}\" MESSAGE_SIZES=\"${MESSAGE_SIZES}\" MOE_PATTERNS=\"${MOE_PATTERNS}\" WARMUP=\"${WARMUP}\" ITERS=\"${ITERS}\" BANDWIDTH_MESSAGE_SIZES=\"${BANDWIDTH_MESSAGE_SIZES}\" BANDWIDTH_WARMUP=\"${BANDWIDTH_WARMUP}\" BANDWIDTH_ITERS=\"${BANDWIDTH_ITERS}\" BANDWIDTH_MIN_BUSBW=\"${BANDWIDTH_MIN_BUSBW}\" BANDWIDTH_AVG_BUSBW=\"${BANDWIDTH_AVG_BUSBW}\" COLLECTIVE_BANDWIDTH_OPS=\"${COLLECTIVE_BANDWIDTH_OPS}\" COLLECTIVE_BANDWIDTH_MESSAGE_SIZES=\"${COLLECTIVE_BANDWIDTH_MESSAGE_SIZES}\" COLLECTIVE_BANDWIDTH_MOE_PATTERNS=\"${COLLECTIVE_BANDWIDTH_MOE_PATTERNS}\" COLLECTIVE_BANDWIDTH_EP_SIZE=\"${COLLECTIVE_BANDWIDTH_EP_SIZE}\" COLLECTIVE_BANDWIDTH_WARMUP=\"${COLLECTIVE_BANDWIDTH_WARMUP}\" COLLECTIVE_BANDWIDTH_ITERS=\"${COLLECTIVE_BANDWIDTH_ITERS}\" COLLECTIVE_BANDWIDTH_MIN_BUSBW=\"${COLLECTIVE_BANDWIDTH_MIN_BUSBW}\" COLLECTIVE_BANDWIDTH_AVG_BUSBW=\"${COLLECTIVE_BANDWIDTH_AVG_BUSBW}\" ${FAULT_ENV} bash scripts/metax/run_single_node_dynamic_stage.sh"
@@ -168,6 +182,13 @@ if [[ -z "${MULTI_NODE_CMD:-}" ]]; then
     MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && export PYTHONPATH=\"${PROJECT_REMOTE_DIR}\" && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"${GPUS_PER_NODE}\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli run-bandwidth --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${BANDWIDTH_MESSAGE_SIZES}\" --warmup \"${BANDWIDTH_WARMUP}\" --iters \"${BANDWIDTH_ITERS}\" --seed \"${SEED}\" --min-busbw \"${BANDWIDTH_MIN_BUSBW}\" --avg-busbw \"${BANDWIDTH_AVG_BUSBW}\" --test-round bandwidth --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\"; ${BANDWIDTH_COMPACT}"
   elif [[ "${PROFILE}" == "collective-bandwidth" ]]; then
     MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && export PYTHONPATH=\"${PROJECT_REMOTE_DIR}\" && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"${GPUS_PER_NODE}\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli run-collective-bandwidth --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${COLLECTIVE_BANDWIDTH_MESSAGE_SIZES}\" --ops \"${COLLECTIVE_BANDWIDTH_OPS}\" --moe-patterns \"${COLLECTIVE_BANDWIDTH_MOE_PATTERNS}\" --ep-size \"${COLLECTIVE_BANDWIDTH_EP_SIZE}\" --warmup \"${COLLECTIVE_BANDWIDTH_WARMUP}\" --iters \"${COLLECTIVE_BANDWIDTH_ITERS}\" --seed \"${SEED}\" --min-busbw \"${COLLECTIVE_BANDWIDTH_MIN_BUSBW}\" --avg-busbw \"${COLLECTIVE_BANDWIDTH_AVG_BUSBW}\" --test-round collective_bandwidth --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\"; ${COLLECTIVE_COMPACT}"
+  elif [[ "${PROFILE}" == "training-topology" ]]; then
+    if [[ -z "${POD_TRAINING_TOPOLOGY_MANIFEST}" ]]; then
+      echo "[vcctl-healthcheck] training-topology requires POD_TRAINING_TOPOLOGY_MANIFEST" >&2
+      exit 2
+    fi
+    TOPOLOGY_COMPACT='rc=$?; python3 tools/dynamic_compact.py --input-dir "$HC_POD_RESULT_DIR" --kind training-topology --stage "$HC_RUN_STAGE" --returncode "$rc" --run-id "$HC_RUN_ID" --pod-name "$HC_POD_NAME" --node-name "$HC_NODE_NAME" --pod-ip "$HC_POD_IP" --host-ip "$HC_HOST_IP" --frame-output "$HC_POD_RESULT_DIR/.hc_dynamic_result.v2"; exit "$rc"'
+    MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && export PYTHONPATH=\"${PROJECT_REMOTE_DIR}\" && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" TOPOLOGY_DTYPE=\"${DTYPE}\" TOPOLOGY_MANIFEST_SHA256=\"${TOPOLOGY_MANIFEST_SHA256}\" TOPOLOGY_RETEST_PLAN_B64=\"${TOPOLOGY_RETEST_PLAN_B64:-}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"${GPUS_PER_NODE}\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli run-training-topology --output-dir \"\$HC_POD_RESULT_DIR\" --manifest \"${POD_TRAINING_TOPOLOGY_MANIFEST}\" --ranks-per-node \"${GPUS_PER_NODE}\" --dtype \"${DTYPE}\" --warmup \"${TOPOLOGY_WARMUP}\" --iters \"${TOPOLOGY_ITERS}\" --seed \"${SEED}\" --test-round training_topology --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\"; ${TOPOLOGY_COMPACT}"
   elif [[ "${PROFILE}" == "dynamic-suite" ]]; then
     MULTI_NODE_CMD="cd ${PROJECT_REMOTE_DIR} && export PYTHONPATH=\"${PROJECT_REMOTE_DIR}\" && DIST_BACKEND=\"${DIST_BACKEND}\" DEVICE_VENDOR=\"${DEVICE_VENDOR}\" COMM_RUNTIME=\"${COMM_RUNTIME}\" ${FAULT_ENV} HEALTHCHECK_GROUP_ID=\"\$HC_JOB_NAME-\$HC_RUN_ID\" torchrun --nnodes=\"\$WORLD_SIZE\" --nproc-per-node=\"${GPUS_PER_NODE}\" --node-rank=\"\$RANK\" --master-addr=\"\$MASTER_ADDR\" --master-port=\"__HC_MASTER_PORT__\" -m pretrain_healthcheck.cli run-dynamic-suite --output-dir \"\$HC_POD_RESULT_DIR\" --dtype \"${DTYPE}\" --message-sizes \"${MESSAGE_SIZES}\" --moe-patterns \"${MOE_PATTERNS}\" --warmup \"${WARMUP}\" --iters \"${ITERS}\" --bandwidth-message-sizes \"${BANDWIDTH_MESSAGE_SIZES}\" --bandwidth-warmup \"${BANDWIDTH_WARMUP}\" --bandwidth-iters \"${BANDWIDTH_ITERS}\" --bandwidth-min-busbw \"${BANDWIDTH_MIN_BUSBW}\" --bandwidth-avg-busbw \"${BANDWIDTH_AVG_BUSBW}\" --collective-bandwidth-message-sizes \"${COLLECTIVE_BANDWIDTH_MESSAGE_SIZES}\" --collective-bandwidth-ops \"${COLLECTIVE_BANDWIDTH_OPS}\" --collective-bandwidth-moe-patterns \"${COLLECTIVE_BANDWIDTH_MOE_PATTERNS}\" --collective-bandwidth-ep-size \"${COLLECTIVE_BANDWIDTH_EP_SIZE}\" --collective-bandwidth-warmup \"${COLLECTIVE_BANDWIDTH_WARMUP}\" --collective-bandwidth-iters \"${COLLECTIVE_BANDWIDTH_ITERS}\" --collective-bandwidth-min-busbw \"${COLLECTIVE_BANDWIDTH_MIN_BUSBW}\" --collective-bandwidth-avg-busbw \"${COLLECTIVE_BANDWIDTH_AVG_BUSBW}\" --seed \"${SEED}\" --test-round dynamic_suite --group-id \"\$HC_JOB_NAME-\$HC_RUN_ID\"; ${DYNAMIC_SUITE_COMPACT}"
   else
@@ -182,6 +203,10 @@ if [[ -n "${DYNAMIC_RETEST_ONLY_PLAN_B64:-}" ]]; then
   MULTI_NODE_CMD="${DYNAMIC_RETEST_MULTI_NODE_CMD}"
   DYNAMIC_COMPARE_AUTO_RETEST=0
 fi
+SINGLE_NODE_CMD="${DYNAMIC_SHELL_SETUP} && ${SINGLE_NODE_CMD}"
+MULTI_NODE_CMD="${DYNAMIC_SHELL_SETUP} && ${MULTI_NODE_CMD}"
+DYNAMIC_RETEST_SINGLE_NODE_CMD="${DYNAMIC_SHELL_SETUP} && ${DYNAMIC_RETEST_SINGLE_NODE_CMD}"
+DYNAMIC_RETEST_MULTI_NODE_CMD="${DYNAMIC_SHELL_SETUP} && ${DYNAMIC_RETEST_MULTI_NODE_CMD}"
 if [[ -z "${EXEC_TIMEOUT_SECONDS:-}" && "${PROFILE}" == "collective-bandwidth" && "${COLLECTIVE_BANDWIDTH_MESSAGE_SIZES}" == "${COLLECTIVE_ACCEPTANCE_MESSAGE_SIZES}" ]]; then
   EXEC_TIMEOUT_SECONDS="1800"
 fi
@@ -232,9 +257,11 @@ Common env:
   MODE                     static|single-node|multi-node|all. Default: all
   DEVICE_TYPE              Metadata only, for example gpu, npu, metax. Default: metax
   PROJECT_REMOTE_DIR       Project path inside target pods. Default: <project>.
-  PROFILE                  quick|smoke|bandwidth|collective-bandwidth|dynamic-suite. smoke only checks torchrun connectivity. Default: quick
+  PROFILE                  quick|smoke|bandwidth|collective-bandwidth|dynamic-suite|training-topology. Default: quick
   PRE_CLEAN                1 runs cleanup before checks; 0 disables it. Default: 1
   PRE_CLEAN_CMD            Command used for cleanup. Default: pkill healthcheck torchrun/python.
+  PRE_CLEAN_STRICT         1 stops before checks if cleanup fails. Default: 0
+  DYNAMIC_CORE_DUMP_LIMIT  Core dump block limit for dynamic commands. Default: 0
   GPUS_PER_NODE            Local device count per pod. Default: 8
   DIST_BACKEND             PyTorch distributed backend name. Default: nccl
   HEALTHCHECK_MASTER_PORT  auto or explicit rendezvous port. Default: auto
@@ -440,6 +467,12 @@ run_driver_for_mode() {
     --dynamic-frame-recovery-deadline-seconds "${DYNAMIC_FRAME_RECOVERY_DEADLINE_SECONDS}"
     --dynamic-frame-chunk-size "${DYNAMIC_FRAME_CHUNK_SIZE}"
   )
+
+  if [[ "${PRE_CLEAN_STRICT}" == "1" || "${PRE_CLEAN_STRICT}" == "true" ]]; then
+    args+=(--pre-clean-strict)
+  else
+    args+=(--no-pre-clean-strict)
+  fi
 
   if [[ "${STATIC_KEEP_POD_FILES}" == "1" || "${STATIC_KEEP_POD_FILES}" == "true" ]]; then
     args+=(--static-keep-pod-files)

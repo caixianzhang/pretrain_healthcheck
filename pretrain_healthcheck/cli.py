@@ -123,6 +123,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_suite.add_argument("--collective-bandwidth-min-busbw", type=float, default=0.0)
     p_suite.add_argument("--collective-bandwidth-avg-busbw", type=float, default=0.0)
     p_suite.add_argument("--seed", type=int, default=20260623)
+
+    p_topology = sub.add_parser(
+        "run-training-topology",
+        help="run collectives in framework-exported TP/DP/EP/PP process groups",
+    )
+    p_topology.add_argument("--output-dir", type=Path, required=True)
+    p_topology.add_argument("--manifest", type=Path, required=True)
+    p_topology.add_argument("--ranks-per-node", type=int, required=True)
+    p_topology.add_argument("--dtype", default="bf16", choices=["fp32", "bf16", "fp16"])
+    p_topology.add_argument("--warmup", type=int, default=1)
+    p_topology.add_argument("--iters", type=int, default=1)
+    p_topology.add_argument("--seed", type=int, default=20260623)
+    p_topology.add_argument("--test-round", default="training_topology")
+    p_topology.add_argument("--group-id", default="")
     p_suite.add_argument("--test-round", default="dynamic_suite")
     p_suite.add_argument("--group-id", default="")
 
@@ -272,6 +286,25 @@ def main() -> None:
             collective_bandwidth_iters=args.collective_bandwidth_iters,
             collective_bandwidth_min_busbw=args.collective_bandwidth_min_busbw,
             collective_bandwidth_avg_busbw=args.collective_bandwidth_avg_busbw,
+            test_round=args.test_round,
+            group_id=args.group_id,
+        )
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"wrote {args.output_dir}")
+        return
+    if args.cmd == "run-training-topology":
+        import os
+
+        from .topology_checks import run_training_topology_suite
+
+        run_training_topology_suite(
+            output_dir=args.output_dir,
+            manifest_path=args.manifest,
+            ranks_per_node=args.ranks_per_node,
+            dtype_name=args.dtype,
+            warmup=args.warmup,
+            iters=args.iters,
+            seed=args.seed,
             test_round=args.test_round,
             group_id=args.group_id,
         )
