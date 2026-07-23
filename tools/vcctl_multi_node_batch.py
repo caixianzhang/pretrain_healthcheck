@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import random
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -27,6 +28,11 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from pretrain_healthcheck.common import parse_size
+from pretrain_healthcheck.training_topology import (
+    TrainingTopologyManifest,
+    load_training_topology_manifest,
+    require_profile,
+)
 from dynamic_compare import (
     build_retest_plan,
     candidate_performance_issues,
@@ -64,14 +70,24 @@ class GroupTask:
     fault_env: dict[str, str] = field(default_factory=dict)
     performance_retest_plan: list[dict[str, Any]] = field(default_factory=list)
 
+    @property
+    def topology_mode(self) -> bool:
+        return self.phase in {"scale64_topology", "final_training_topology"}
+
 
 def task_matrix_env(task: GroupTask) -> dict[str, str]:
+    if task.topology_mode:
+        return {
+            "TOPOLOGY_WARMUP": "1",
+            "TOPOLOGY_ITERS": "1",
+            "TOPOLOGY_OVERLAP_CANARY": os.environ.get("TOPOLOGY_OVERLAP_CANARY", "0"),
+        }
     if task.performance_retest_plan:
         return {}
     if task.phase == "pairwise":
         sizes, iters = PAIRWISE_MESSAGE_SIZES, "1"
-    elif task.phase == "final_all":
-        sizes, iters = FULL_MESSAGE_SIZES, "3"
+    elif task.phase == "scale32_crosscheck":
+        sizes, iters = FAST_MESSAGE_SIZES, "1"
     else:
         sizes, iters = FAST_MESSAGE_SIZES, "1"
     return {
@@ -175,6 +191,213 @@ def load_pods(args: argparse.Namespace) -> tuple[str, list[Pod]]:
     pods = [pod for pod in (pod_from_raw(obj) for obj in parse_json_stream(proc.stdout)) if pod is not None]
     pods.sort(key=pod_sort_key)
     return proc.stdout, pods
+
+
+def _pod_ready(raw: dict[str, Any]) -> bool:
+    status = raw.get("status", {}) if isinstance(raw.get("status"), dict) else {}
+    conditions = status.get("conditions", []) if isinstance(status.get("conditions"), list) else []
+    return any(
+        isinstance(item, dict)
+        and item.get("type") == "Ready"
+        and item.get("status") == "True"
+        for item in conditions
+    )
+
+
+def job_liveness_record(raw: dict[str, Any]) -> dict[str, Any]:
+    metadata = raw.get("metadata", {}) if isinstance(raw.get("metadata"), dict) else {}
+    spec = raw.get("spec", {}) if isinstance(raw.get("spec"), dict) else {}
+    status = raw.get("status", {}) if isinstance(raw.get("status"), dict) else {}
+    return {
+        "pod_name": str(metadata.get("name", "")),
+        "uid": str(metadata.get("uid", "")),
+        "node_name": str(spec.get("nodeName", "")),
+        "pod_ip": str(status.get("podIP", "")),
+        "phase": str(status.get("phase", "")),
+        "ready": _pod_ready(raw),
+        "reason": str(status.get("reason", "")),
+        "message": str(status.get("message", "")),
+    }
+
+
+def evaluate_job_liveness(
+    baseline: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    expected = {str(row.get("pod_name", "")): row for row in baseline if row.get("pod_name")}
+    observed = {str(row.get("pod_name", "")): row for row in current if row.get("pod_name")}
+    issues: list[dict[str, Any]] = []
+    for pod_name in sorted(set(expected) - set(observed)):
+        issues.append({"type": "POD_MISSING", "pod_name": pod_name, "baseline": expected[pod_name]})
+    for pod_name in sorted(set(observed) - set(expected)):
+        issues.append({"type": "UNEXPECTED_POD", "pod_name": pod_name, "current": observed[pod_name]})
+    for pod_name in sorted(set(expected) & set(observed)):
+        before = expected[pod_name]
+        now = observed[pod_name]
+        if before.get("uid") and now.get("uid") != before.get("uid"):
+            issues.append({"type": "POD_UID_CHANGED", "pod_name": pod_name, "baseline": before, "current": now})
+        if now.get("node_name") != before.get("node_name"):
+            issues.append({"type": "POD_NODE_CHANGED", "pod_name": pod_name, "baseline": before, "current": now})
+        if now.get("phase") != "Running":
+            issues.append({"type": "POD_NOT_RUNNING", "pod_name": pod_name, "current": now})
+        if not now.get("ready"):
+            issues.append({"type": "POD_NOT_READY", "pod_name": pod_name, "current": now})
+        if not now.get("pod_ip"):
+            issues.append({"type": "POD_IP_MISSING", "pod_name": pod_name, "current": now})
+    node_names = [str(row.get("node_name", "")) for row in current if row.get("node_name")]
+    duplicates = sorted({node for node in node_names if node_names.count(node) > 1})
+    for node_name in duplicates:
+        issues.append({"type": "DUPLICATE_NODE", "node_name": node_name})
+    return issues
+
+
+def query_job_liveness(args: argparse.Namespace) -> list[dict[str, Any]]:
+    cmd = [args.vcctl_bin, "pod", "get", "--job", args.job_name, "-n", args.namespace, "-o", "json"]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+    if proc.returncode != 0:
+        raise RuntimeError(f"vcctl pod get failed rc={proc.returncode}: {proc.stderr.strip()}")
+    return [job_liveness_record(raw) for raw in parse_json_stream(proc.stdout)]
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any] | list[dict[str, Any]]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+class JobLivenessMonitor:
+    def __init__(self, args: argparse.Namespace, pods: list[Pod], batch_dir: Path):
+        self.args = args
+        self.batch_dir = batch_dir
+        self.baseline = [job_liveness_record(pod.raw) for pod in pods]
+        self.args._job_liveness_baseline = self.baseline
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.query_failures = 0
+
+    def _append_event(self, event: dict[str, Any]) -> None:
+        with (self.batch_dir / "job_liveness_events.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _abort(self, reason: str, issues: list[dict[str, Any]]) -> None:
+        if self.args._job_abort_event.is_set():
+            return
+        payload = {
+            "timestamp": iso_now(),
+            "job_name": self.args.job_name,
+            "batch_run_id": self.args.batch_run_id,
+            "reason": reason,
+            "issues": issues,
+        }
+        self.args._job_abort_payload = payload
+        _write_json_atomic(self.batch_dir / "job_liveness_alert.json", payload)
+        invalid = sorted(
+            {
+                (
+                    str(item.get("current", {}).get("node_name") or item.get("baseline", {}).get("node_name") or item.get("node_name") or ""),
+                    str(item.get("pod_name") or item.get("current", {}).get("pod_name") or ""),
+                    str(item.get("type", "")),
+                )
+                for item in issues
+            }
+        )
+        (self.batch_dir / "invalid_job_nodes.txt").write_text(
+            "".join(f"{node_name}\t{pod_name}\t{issue_type}\n" for node_name, pod_name, issue_type in invalid),
+            encoding="utf-8",
+        )
+        self._append_event({"event": "abort", **payload})
+        print(
+            f"[batch-healthcheck] ALERT job_liveness_abort reason={reason} "
+            f"issues={len(issues)} alert={self.batch_dir / 'job_liveness_alert.json'}",
+            flush=True,
+        )
+        self.args._job_abort_event.set()
+
+    def validate_baseline(self) -> bool:
+        issues = evaluate_job_liveness(self.baseline, self.baseline)
+        _write_json_atomic(self.batch_dir / "job_liveness_baseline.json", self.baseline)
+        self._append_event(
+            {
+                "event": "monitor_start",
+                "timestamp": iso_now(),
+                "pod_count": len(self.baseline),
+                "interval_seconds": self.args.job_liveness_check_interval_seconds,
+            }
+        )
+        if issues:
+            self._abort("JOB_BASELINE_INVALID", issues)
+            return False
+        try:
+            current = query_job_liveness(self.args)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            self._abort(
+                "JOB_LIVENESS_QUERY_UNAVAILABLE",
+                [{"type": "QUERY_FAILED", "error": f"{type(exc).__name__}: {exc}"}],
+            )
+            return False
+        issues = evaluate_job_liveness(self.baseline, current)
+        if issues:
+            self._abort("JOB_BASELINE_INVALID", issues)
+            return False
+        return True
+
+    def start(self) -> None:
+        if not self.validate_baseline():
+            return
+        self.thread = threading.Thread(target=self._run, name="job-liveness-monitor", daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        interval = self.args.job_liveness_check_interval_seconds
+        while not self.stop_event.wait(interval):
+            try:
+                current = query_job_liveness(self.args)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                self.query_failures += 1
+                event = {
+                    "event": "query_failed",
+                    "timestamp": iso_now(),
+                    "consecutive_failures": self.query_failures,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                self._append_event(event)
+                print(
+                    f"[batch-healthcheck] WARNING job_liveness_query_failed "
+                    f"consecutive={self.query_failures}/3 error={exc}",
+                    flush=True,
+                )
+                if self.query_failures >= 3:
+                    self._abort("JOB_LIVENESS_QUERY_UNAVAILABLE", [event])
+                    return
+                continue
+            self.query_failures = 0
+            issues = evaluate_job_liveness(self.baseline, current)
+            if issues:
+                self._abort("JOB_NODE_LOSS", issues)
+                return
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=max(1, self.args.job_liveness_check_interval_seconds + 1))
+        self._append_event({"event": "monitor_stop", "timestamp": iso_now()})
+
+
+def terminate_process_group(proc: subprocess.Popen[Any], grace_seconds: int = 10) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=grace_seconds)
 
 
 def init_db(db_path: Path) -> sqlite3.Connection:
@@ -337,8 +560,12 @@ def phase_scale(phase: str) -> int:
         return 2
     if phase == "ep8":
         return 8
-    if phase == "final_all":
+    if phase == "final_training_topology":
         return 0
+    if phase == "scale32_crosscheck":
+        return 32
+    if phase == "scale64_topology":
+        return 64
     if phase.startswith("scale"):
         return int(phase.removeprefix("scale"))
     raise ValueError(f"unsupported phase: {phase}")
@@ -349,12 +576,16 @@ def phase_order_key(phase: str) -> tuple[int, str]:
         return (10, phase)
     if phase == "ep8":
         return (20, phase)
+    if phase == "scale32_crosscheck":
+        return (132, phase)
+    if phase == "scale64_topology":
+        return (164, phase)
     if phase.startswith("scale"):
         try:
             return (100 + int(phase.removeprefix("scale")), phase)
         except ValueError:
             return (500, phase)
-    if phase == "final_all":
+    if phase == "final_training_topology":
         return (10_000, phase)
     return (500, phase)
 
@@ -366,18 +597,24 @@ def auto_phases(node_count: int, target_scale: int) -> list[str]:
     phases = ["pairwise"]
     if node_count >= 8 and max_scale >= 8:
         phases.append("ep8")
+    if node_count >= 32 and max_scale >= 32:
+        phases.append("scale32_crosscheck")
     if node_count >= 64 and max_scale >= 64:
-        phases.append("scale64")
-    if node_count >= 128 and max_scale >= 128:
-        phases.append("scale128")
-    if node_count >= 256 and max_scale >= 256:
-        phases.append("scale256")
+        phases.append("scale64_topology")
+        phases.append("final_training_topology")
     return phases
 
 
 def parse_phases(value: str, node_count: int, target_scale: int) -> list[str]:
     if value.strip():
-        return [item.strip() for item in value.split(",") if item.strip()]
+        phases = [item.strip() for item in value.split(",") if item.strip()]
+        legacy = sorted(set(phases) & {"scale64", "scale128", "scale256", "final_all"})
+        if legacy:
+            raise ValueError(
+                "legacy global scale phases are disabled; use scale64_topology/final_training_topology: "
+                + ",".join(legacy)
+            )
+        return phases
     return auto_phases(node_count, target_scale)
 
 
@@ -424,8 +661,51 @@ def make_pairwise_rounds(pods: list[Pod], seed: int) -> list[GroupTask]:
 def make_phase_groups(phase: str, pods: list[Pod], seed: int) -> list[GroupTask]:
     if phase == "pairwise":
         return make_pairwise_rounds(pods, seed)
-    if phase == "final_all":
-        return [GroupTask("final_all", "final_all_r1", "final_all_group_0000", pods[:])]
+    if phase == "final_training_topology":
+        return [
+            GroupTask(
+                "final_training_topology",
+                "final_training_topology_r1",
+                "final_training_topology_group_0000",
+                pods[:],
+            )
+        ]
+    if phase == "scale32_crosscheck":
+        tasks: list[GroupTask] = []
+        for round_number in (1, 2):
+            shuffled = pods[:]
+            random.Random(f"{seed}:{phase}:r{round_number}").shuffle(shuffled)
+            round_id = f"scale32_crosscheck_r{round_number}"
+            tasks.extend(
+                GroupTask(phase, round_id, f"{round_id}_group_{index:04d}", group)
+                for index, group in enumerate(chunks(shuffled, 32))
+            )
+        return tasks
+    if phase == "scale64_topology":
+        shuffled = pods[:]
+        random.Random(f"{seed}:{phase}").shuffle(shuffled)
+        halves = chunks(shuffled, 32)
+        tasks = []
+        for block_start in range(0, len(halves), 4):
+            block = halves[block_start : block_start + 4]
+            if len(block) < 2:
+                continue
+            pairings = [(0, 1)] if len(block) == 2 else [(0, 1), (2, 3), (0, 2), (1, 3)]
+            for pairing_index, (left, right) in enumerate(pairings):
+                if right >= len(block):
+                    continue
+                round_number = 1 if pairing_index < 2 else 2
+                round_id = f"scale64_topology_r{round_number}"
+                group_index = len([task for task in tasks if task.round_id == round_id])
+                tasks.append(
+                    GroupTask(
+                        phase,
+                        round_id,
+                        f"{round_id}_group_{group_index:04d}",
+                        block[left] + block[right],
+                    )
+                )
+        return tasks
     size = phase_scale(phase)
     shuffled = pods[:]
     random.Random(f"{seed}:{phase}").shuffle(shuffled)
@@ -475,7 +755,14 @@ def table_group(con: sqlite3.Connection, task: GroupTask, status: str) -> None:
         """
         insert into groups(group_id,phase,round_id,group_size,nodes_json,status,parent_group_id,attempt)
         values(?,?,?,?,?,?,?,?)
-        on conflict(group_id) do update set status=excluded.status
+        on conflict(group_id) do update set
+          phase=excluded.phase,
+          round_id=excluded.round_id,
+          group_size=excluded.group_size,
+          nodes_json=excluded.nodes_json,
+          status=excluded.status,
+          parent_group_id=excluded.parent_group_id,
+          attempt=excluded.attempt
         """,
         (
             task.group_id,
@@ -637,6 +924,8 @@ def execution_signature(args: argparse.Namespace) -> str:
         "dynamic_compare_small_latency_warn": bool(args.dynamic_compare_small_latency_warn),
         "dynamic_compare_min_cohort": args.dynamic_compare_min_cohort,
         "dynamic_compare_auto_retest": bool(args.dynamic_compare_auto_retest),
+        "training_topology_manifest_sha256": str(args.training_topology_manifest_sha256),
+        "gpus_per_node": int(args.gpus_per_node),
         "environment": environment,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -772,8 +1061,8 @@ def comm_path_rows_from_facts(task: GroupTask, status: str, facts: list[dict[str
 
 
 def task_timeout_seconds(task: GroupTask, args: argparse.Namespace) -> int:
-    if task.phase == "final_all":
-        return args.final_all_timeout_seconds
+    if task.topology_mode:
+        return args.final_training_topology_timeout_seconds
     if task.performance_retest_plan:
         return min(args.group_timeout_seconds, args.dynamic_compare_retest_time_budget_seconds)
     return args.group_timeout_seconds
@@ -806,7 +1095,10 @@ def maybe_emit_runtime_warning(args: argparse.Namespace, con: sqlite3.Connection
 def run_group(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection, batch_dir: Path) -> str:
     table_group(con, task, "RUNNING")
     group_json = write_group_json(task, args)
-    stage_suffix = "multi_node_performance_retest" if task.performance_retest_plan else "multi_node_dynamic_suite"
+    if task.topology_mode:
+        stage_suffix = "multi_node_training_topology_retest" if task.performance_retest_plan else "multi_node_training_topology"
+    else:
+        stage_suffix = "multi_node_performance_retest" if task.performance_retest_plan else "multi_node_dynamic_suite"
     run_stage = f"{task.phase}/{task.group_id}/{stage_suffix}"
     run_result_root = group_result_root(args)
     output_dir = Path(run_result_root) / args.batch_run_id / run_stage
@@ -823,7 +1115,7 @@ def run_group(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection
             "RUN_STAGE": run_stage,
             "POD_JSON_FILE": str(group_json),
             "MODE": "multi-node",
-            "PROFILE": "dynamic-suite",
+            "PROFILE": "training-topology" if task.topology_mode else "dynamic-suite",
             "DRY_RUN": args.dry_run,
             "PRE_CLEAN": args.pre_clean,
             "DYNAMIC_COMPARE": args.dynamic_compare,
@@ -840,8 +1132,16 @@ def run_group(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection
     env.update(task_matrix_env(task))
     if task.performance_retest_plan:
         plan_json = json.dumps(task.performance_retest_plan, ensure_ascii=False, separators=(",", ":"))
-        env["DYNAMIC_RETEST_ONLY_PLAN_B64"] = base64.b64encode(plan_json.encode("utf-8")).decode("ascii")
+        if task.topology_mode:
+            env["TOPOLOGY_RETEST_PLAN_B64"] = base64.b64encode(plan_json.encode("utf-8")).decode("ascii")
+            env["DYNAMIC_COMPARE_MEASUREMENT_BATCHES"] = "3"
+        else:
+            env["DYNAMIC_RETEST_ONLY_PLAN_B64"] = base64.b64encode(plan_json.encode("utf-8")).decode("ascii")
         env["DYNAMIC_COMPARE_AUTO_RETEST"] = "0"
+    if task.topology_mode:
+        env["TRAINING_TOPOLOGY_MANIFEST"] = args.training_topology_manifest
+        env["POD_TRAINING_TOPOLOGY_MANIFEST"] = args.pod_training_topology_manifest
+        env["TOPOLOGY_MANIFEST_SHA256"] = args.training_topology_manifest_sha256
     if args.pod_project_dir:
         env["PROJECT_REMOTE_DIR"] = args.pod_project_dir
     if _truthy(args.comm_path_debug):
@@ -856,22 +1156,31 @@ def run_group(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection
         f"nodes={','.join(pod.node_name for pod in task.pods)}",
         flush=True,
     )
-    record_event(con, "group_start", task.group_id, {"nodes": [pod.node_name for pod in task.pods]})
-    proc = subprocess.Popen(cmd, cwd=args.project_dir, env=env)
+    record_event(
+        con,
+        "group_start",
+        task.group_id,
+        {
+            "nodes": [pod.node_name for pod in task.pods],
+            "topology_mode": task.topology_mode,
+            "topology_manifest_sha256": args.training_topology_manifest_sha256 if task.topology_mode else "",
+        },
+    )
+    proc = subprocess.Popen(cmd, cwd=args.project_dir, env=env, start_new_session=True)
     next_progress = time.monotonic() + max(1, args.progress_interval_seconds)
     timeout_seconds = task_timeout_seconds(task, args)
     driver_deadline = started + max(1, timeout_seconds) + 120
     batch_timeout = False
+    job_aborted = False
     while proc.poll() is None:
         now = time.monotonic()
+        if getattr(args, "_job_abort_event", threading.Event()).is_set():
+            job_aborted = True
+            terminate_process_group(proc)
+            break
         if now >= driver_deadline:
             batch_timeout = True
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=10)
+            terminate_process_group(proc)
             break
         if now >= next_progress:
             elapsed = int(now - started)
@@ -886,7 +1195,11 @@ def run_group(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection
     returncode = proc.returncode
     elapsed = round(time.monotonic() - started, 3)
     summary = read_summary(output_dir / "summary.json")
-    if batch_timeout:
+    if job_aborted:
+        status, reason = "ABORTED", str(
+            getattr(args, "_job_abort_payload", {}).get("reason", "JOB_NODE_LOSS")
+        )
+    elif batch_timeout:
         status, reason = "TIMEOUT", f"BATCH_GROUP_TIMEOUT>{timeout_seconds + 120}s"
     else:
         status, reason = status_from_summary(summary, returncode)
@@ -905,6 +1218,8 @@ def run_group(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection
         "case_metrics": read_jsonl(output_dir / "dynamic_case_metrics.jsonl"),
         "performance_retest": bool(task.performance_retest_plan),
         "execution_signature": execution_signature(args),
+        "topology_mode": task.topology_mode,
+        "topology_manifest_sha256": args.training_topology_manifest_sha256 if task.topology_mode else "",
     }
     if task.fault_env:
         metrics["batch_fault"] = {
@@ -938,6 +1253,8 @@ def run_group(task: GroupTask, args: argparse.Namespace, con: sqlite3.Connection
             set_node_status(con, pod.node_name, "PASS", task.phase)
         con.commit()
         cleanup_pass_output(output_dir, args)
+    elif status == "ABORTED":
+        copy_failed_summary(task, output_dir, batch_dir, reason)
     else:
         for pod in task.pods:
             add_suspect(con, pod.node_name, task.phase, f"{task.group_id}:{reason}")
@@ -1008,7 +1325,7 @@ def split_retests(task: GroupTask) -> list[GroupTask]:
     parts = [task.pods[:mid], task.pods[mid:]]
     return [
         GroupTask(
-            phase=task.phase,
+            phase="scale32_crosscheck" if task.topology_mode and len(part) < 64 else task.phase,
             round_id=f"{task.round_id}_split",
             group_id=f"{task.group_id}_split_{idx}",
             pods=part,
@@ -1218,11 +1535,65 @@ def phase_candidates(phase: str, con: sqlite3.Connection, pods: list[Pod]) -> tu
     candidates = phase_pass_nodes(con, pods)
     if phase == "pairwise":
         return [pod for pod in pods if node_status(con, pod.node_name) not in {"FAIL", "EXCLUDED"}], False
-    if phase == "final_all" and not candidates:
+    if phase == "final_training_topology" and not candidates:
         statuses = [node_status(con, pod.node_name) for pod in pods]
         if statuses and all(status == "UNKNOWN" for status in statuses):
             return list(pods), True
     return candidates, False
+
+
+def prepare_prequalified_nodes(
+    con: sqlite3.Connection,
+    args: argparse.Namespace,
+    pods: list[Pod],
+    batch_dir: Path,
+) -> None:
+    args.prequalified_nodes_sha256 = ""
+    args.prequalified_node_count = 0
+    if not args.prequalified_nodes_file:
+        return
+    source = Path(args.prequalified_nodes_file).expanduser().resolve()
+    if not source.is_file():
+        raise ValueError(f"prequalified nodes file not found: {source}")
+    raw = source.read_text(encoding="utf-8")
+    nodes = [line.strip() for line in raw.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if len(nodes) != len(set(nodes)):
+        raise ValueError("prequalified nodes file contains duplicate node names")
+    available = {pod.node_name for pod in pods}
+    unknown = sorted(set(nodes) - available)
+    if unknown:
+        raise ValueError(f"prequalified nodes are not present in current job: {','.join(unknown)}")
+    if not nodes:
+        raise ValueError("prequalified nodes file is empty")
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    policy = {
+        "source_sha256": digest,
+        "node_count": len(nodes),
+        "nodes": sorted(nodes),
+    }
+    row = con.execute(
+        "select payload_json from events where event_type='prequalified_nodes_loaded' order by id limit 1"
+    ).fetchone()
+    if row:
+        if json.loads(row[0] or "{}") != policy:
+            raise ValueError("prequalified node policy differs from existing batch; use a new BATCH_RUN_ID")
+    else:
+        con.executemany(
+            """
+            update nodes
+            set status='PASS',last_phase='external_prequalified',fail_reason=''
+            where node_name=? and status='UNKNOWN'
+            """,
+            [(node_name,) for node_name in nodes],
+        )
+        con.commit()
+        record_event(con, "prequalified_nodes_loaded", args.batch_run_id, policy)
+    archived = batch_dir / "prequalified_nodes.txt"
+    if source != archived.resolve():
+        archived.write_text(raw, encoding="utf-8")
+    args.prequalified_nodes_file = str(source)
+    args.prequalified_nodes_sha256 = digest
+    args.prequalified_node_count = len(nodes)
 
 
 def record_performance_candidates(
@@ -1369,11 +1740,12 @@ def compare_round_performance(
 ) -> tuple[list[GroupTask], bool]:
     """Return confirmed slow groups and whether performance produced an advisory."""
     case_rows = _task_case_metrics(con, tasks)
+    min_cohort = 2 if tasks and tasks[0].phase == "scale64_topology" else args.dynamic_compare_min_cohort
     candidates, _cohorts = candidate_performance_issues(
         case_rows,
         latency_ratio_threshold=args.dynamic_compare_latency_ratio_threshold,
         busbw_ratio_threshold=args.dynamic_compare_busbw_ratio_threshold,
-        min_cohort=args.dynamic_compare_min_cohort,
+        min_cohort=min_cohort,
         small_max_bytes=args.dynamic_compare_small_max_bytes,
         large_min_bytes=args.dynamic_compare_large_min_bytes,
         small_latency_warn=args.dynamic_compare_small_latency_warn,
@@ -1396,6 +1768,17 @@ def compare_round_performance(
     phase = tasks[0].phase
     round_id = tasks[0].round_id
     record_performance_candidates(con, phase, round_id, large_candidates)
+    if phase == "scale64_topology" and len(tasks) == 2:
+        record_event(
+            con,
+            "DIVERGENT_SCALE64_COHORT",
+            round_id,
+            {
+                "candidate_groups": sorted({str(item.get("pod_name", "")) for item in large_candidates}),
+                "comparison_groups": sorted(task.group_id for task in tasks),
+                "reason": "two_group_cohort_has_no_known_good_baseline",
+            },
+        )
     confirmed_ids: set[str] = set()
     candidate_group_ids = {str(item.get("pod_name", "")) for item in large_candidates}
     advisory = False
@@ -1454,7 +1837,7 @@ def compare_round_performance(
                 retest_rows,
                 latency_ratio_threshold=args.dynamic_compare_latency_ratio_threshold,
                 busbw_ratio_threshold=args.dynamic_compare_busbw_ratio_threshold,
-                min_cohort=args.dynamic_compare_min_cohort,
+                min_cohort=min_cohort,
                 small_max_bytes=args.dynamic_compare_small_max_bytes,
                 large_min_bytes=args.dynamic_compare_large_min_bytes,
                 small_latency_warn=args.dynamic_compare_small_latency_warn,
@@ -1523,169 +1906,6 @@ def compare_round_performance(
     return confirmed_tasks, advisory
 
 
-def reuse_final_all_from_phase(
-    source_phase: str,
-    pods: list[Pod],
-    args: argparse.Namespace,
-    con: sqlite3.Connection,
-) -> bool:
-    candidates = phase_pass_nodes(con, pods)
-    if len(candidates) <= 2 or not source_phase or args.batch_fault_type:
-        return False
-    existing_final = con.execute(
-        "select status from groups where group_id='final_all_group_0000'"
-    ).fetchone()
-    if existing_final and str(existing_final[0]) in PASS_STATUSES:
-        return False
-    source_rows = con.execute(
-        """
-        select group_id,round_id,nodes_json,status
-        from groups
-        where phase=? and parent_group_id=''
-        order by group_id
-        """,
-        (source_phase,),
-    ).fetchall()
-    if len(source_rows) != 1:
-        return False
-    source_group_id, source_round_id, source_nodes_json, source_status = source_rows[0]
-    if str(source_status) != "PASS":
-        return False
-    try:
-        source_nodes = [str(node) for node in json.loads(source_nodes_json or "[]")]
-    except (json.JSONDecodeError, TypeError):
-        return False
-    candidate_nodes = [pod.node_name for pod in candidates]
-    if len(source_nodes) != len(candidate_nodes) or set(source_nodes) != set(candidate_nodes):
-        return False
-    result_row = con.execute(
-        """
-        select metrics_json,elapsed_seconds,local_workdirs_json,status
-        from group_results
-        where group_id=?
-        order by id desc
-        limit 1
-        """,
-        (source_group_id,),
-    ).fetchone()
-    if not result_row or str(result_row[3]) != "PASS":
-        return False
-    try:
-        source_metrics = json.loads(result_row[0] or "{}")
-    except json.JSONDecodeError:
-        return False
-    if source_metrics.get("execution_signature") != execution_signature(args):
-        return False
-
-    pods_by_node = {pod.node_name: pod for pod in candidates}
-    source_pods = [pods_by_node[node] for node in source_nodes]
-    task = GroupTask(
-        phase="final_all",
-        round_id="final_all_r1",
-        group_id="final_all_group_0000",
-        pods=source_pods,
-        parent_group_id=str(source_group_id),
-    )
-    table_group(con, task, "REUSED_PASS")
-    con.execute(
-        """
-        update groups
-        set phase=?,round_id=?,group_size=?,nodes_json=?,status=?,parent_group_id=?,attempt=?
-        where group_id=?
-        """,
-        (
-            task.phase,
-            task.round_id,
-            len(task.pods),
-            json.dumps(source_nodes, ensure_ascii=False),
-            "REUSED_PASS",
-            str(source_group_id),
-            task.attempt,
-            task.group_id,
-        ),
-    )
-    source_elapsed = float(result_row[1] or 0.0)
-    reused_metrics = dict(source_metrics)
-    reused_metrics.update(
-        {
-            "reused": True,
-            "reused_from_group_id": str(source_group_id),
-            "source_phase": source_phase,
-            "source_round": str(source_round_id),
-            "source_elapsed_seconds": source_elapsed,
-            "saved_execution": True,
-        }
-    )
-    con.execute(
-        """
-        insert into group_results(group_id,status,error_type,metrics_json,elapsed_seconds,local_workdirs_json,created_at)
-        values(?,?,?,?,?,?,?)
-        """,
-        (
-            task.group_id,
-            "REUSED_PASS",
-            "",
-            json.dumps(reused_metrics, ensure_ascii=False, sort_keys=True),
-            0.0,
-            str(result_row[2] or "{}"),
-            iso_now(),
-        ),
-    )
-    for pod in source_pods:
-        set_node_status(con, pod.node_name, "PASS", "final_all")
-    payload = {
-        "source_phase": source_phase,
-        "source_group_id": str(source_group_id),
-        "node_count": len(source_pods),
-        "source_elapsed_seconds": source_elapsed,
-    }
-    record_event(con, "phase_reused", "final_all", payload)
-    record_event(con, "phase_done", "final_all", {"pass": 1, "fail": 0, "counts": {"REUSED_PASS": 1}})
-    con.commit()
-    print(
-        f"[batch-healthcheck] phase_reused phase=final_all source_phase={source_phase} "
-        f"source_group={source_group_id} nodes={len(source_pods)} "
-        f"saved_estimate={source_elapsed}s",
-        flush=True,
-    )
-    return True
-
-
-def supersede_phase_with_final_all(
-    phase: str,
-    pods: list[Pod],
-    args: argparse.Namespace,
-    con: sqlite3.Connection,
-) -> bool:
-    if phase not in {"ep8", "scale64", "scale128", "scale256"}:
-        return False
-    if args.disable_final_superset_skip or args.batch_fault_type:
-        return False
-    candidates = phase_pass_nodes(con, pods)
-    if len(candidates) != phase_scale(phase):
-        return False
-    tasks = make_phase_groups(phase, candidates, args.group_seed)
-    if len(tasks) != 1 or {pod.node_name for pod in tasks[0].pods} != {pod.node_name for pod in candidates}:
-        return False
-    task = tasks[0]
-    table_group(con, task, "SUPERSEDED")
-    payload = {
-        "phase": phase,
-        "group_id": task.group_id,
-        "node_count": len(candidates),
-        "reason": "final_all_matrix_superset",
-        "superseded_by": "final_all",
-    }
-    record_event(con, "phase_superseded", phase, payload)
-    con.commit()
-    print(
-        f"[batch-healthcheck] phase_superseded phase={phase} group={task.group_id} "
-        f"nodes={len(candidates)} superseded_by=final_all reason=final_all_matrix_superset",
-        flush=True,
-    )
-    return True
-
-
 def run_phase(
     phase: str,
     pods: list[Pod],
@@ -1693,10 +1913,13 @@ def run_phase(
     con: sqlite3.Connection,
     batch_dir: Path,
 ) -> bool:
-    candidates, direct_final_all = phase_candidates(phase, con, pods)
-    if direct_final_all:
+    if args._job_abort_event.is_set():
+        print(f"[batch-healthcheck] phase_abort phase={phase} reason=job_liveness_abort", flush=True)
+        return False
+    candidates, direct_final = phase_candidates(phase, con, pods)
+    if direct_final:
         print(
-            f"[batch-healthcheck] phase_direct phase=final_all candidates={len(candidates)} "
+            f"[batch-healthcheck] phase_direct phase=final_training_topology candidates={len(candidates)} "
             "reason=no_prior_node_status",
             flush=True,
         )
@@ -1706,11 +1929,11 @@ def run_phase(
             phase,
             {"reason": "no_prior_node_status", "candidates": len(candidates)},
         )
-    if phase == "final_all" and not candidates:
-        print("[batch-healthcheck] phase_skip phase=final_all reason=no_pass_nodes", flush=True)
+    if phase == "final_training_topology" and not candidates:
+        print("[batch-healthcheck] phase_skip phase=final_training_topology reason=no_pass_nodes", flush=True)
         record_event(con, "phase_skip", phase, {"reason": "no_pass_nodes", "candidates": 0})
         return False
-    if phase != "final_all":
+    if phase != "final_training_topology":
         size = phase_scale(phase)
         if len(candidates) < size:
             print(
@@ -1777,6 +2000,13 @@ def run_phase(
             f"elapsed={round(time.monotonic() - round_started, 3)}s",
             flush=True,
         )
+        if args._job_abort_event.is_set():
+            print(
+                f"[batch-healthcheck] phase_abort phase={phase} round={round_id} "
+                "reason=job_liveness_abort",
+                flush=True,
+            )
+            return False
         if _truthy(args.dynamic_compare):
             performance_suspects, round_advisory = compare_round_performance(
                 round_tasks, args, con, batch_dir
@@ -1806,6 +2036,29 @@ def run_phase(
     if failed:
         print(f"[batch-healthcheck] phase_retest phase={phase} failed_groups={len(failed)}", flush=True)
         run_retests(failed, pods, args, con, batch_dir)
+        if phase == "scale64_topology":
+            for parent in failed:
+                descendants = con.execute(
+                    "select group_id,status,group_size from groups where parent_group_id=? order by group_id",
+                    (parent.group_id,),
+                ).fetchall()
+                if descendants and all(str(row[1]) in PASS_STATUSES for row in descendants):
+                    record_event(
+                        con,
+                        "SCALE_COMM_STACK_FAIL",
+                        parent.group_id,
+                        {
+                            "parent_group": parent.group_id,
+                            "parent_size": len(parent.pods),
+                            "passing_split_groups": [str(row[0]) for row in descendants],
+                            "reason": "scale64_failed_while_all_32_node_splits_passed",
+                        },
+                    )
+                    print(
+                        f"[batch-healthcheck] SCALE_COMM_STACK_FAIL group={parent.group_id} "
+                        "reason=scale64_failed_while_all_32_node_splits_passed",
+                        flush=True,
+                    )
     if phase == "pairwise":
         finalize_pairwise_localization(con, phase)
     if failed:
@@ -1920,11 +2173,33 @@ def performance_candidate_rows(con: sqlite3.Connection) -> list[dict[str, Any]]:
 def apply_performance_candidate_statuses(con: sqlite3.Connection) -> list[str]:
     unresolved = {"DETECTED", "CONFIRMED", "UNCONFIRMED", "RETEST_ONLY"}
     evidence: dict[str, set[str]] = {}
+    scale64_rounds: dict[str, set[str]] = {}
     for row in performance_candidate_rows(con):
         if row["status"] not in unresolved:
             continue
         for node_name in row["nodes"]:
-            evidence.setdefault(node_name, set()).add(f"{row['round_id']}:{row['group_id']}:{row['case_id']}")
+            reason = f"{row['round_id']}:{row['group_id']}:{row['case_id']}"
+            if row["phase"] == "scale64_topology":
+                scale64_rounds.setdefault(node_name, set()).add(row["round_id"])
+                evidence.setdefault(node_name, set()).add(reason)
+            else:
+                evidence.setdefault(node_name, set()).add(reason)
+    for node_name in list(evidence):
+        if node_name in scale64_rounds and len(scale64_rounds[node_name]) < 2:
+            only_scale64 = all(reason.startswith("scale64_topology_") for reason in evidence[node_name])
+            if only_scale64:
+                evidence.pop(node_name)
+    persistent_scale64 = sorted(node for node, rounds in scale64_rounds.items() if len(rounds) >= 2)
+    if scale64_rounds:
+        record_event(
+            con,
+            "scale64_performance_localization",
+            "scale64_topology",
+            {
+                "persistent_nodes": persistent_scale64,
+                "rounds_by_node": {node: sorted(rounds) for node, rounds in sorted(scale64_rounds.items())},
+            },
+        )
     for node_name, reasons in evidence.items():
         if node_status(con, node_name) == "FAIL":
             continue
@@ -2181,6 +2456,7 @@ def write_gate_files(con: sqlite3.Connection, batch_dir: Path, args: argparse.Na
     warnings: list[dict[str, Any]] = []
     retests: list[dict[str, Any]] = []
     systemic: list[dict[str, Any]] = []
+    scale_stack_failures: list[dict[str, Any]] = []
     for timestamp, event_type, message, payload_json in rows:
         try:
             payload = json.loads(payload_json or "{}")
@@ -2194,6 +2470,8 @@ def write_gate_files(con: sqlite3.Connection, batch_dir: Path, args: argparse.Na
             retests.append({**base, **payload})
         elif event_type == "systemic_performance_event":
             systemic.append({**base, **payload})
+        elif event_type == "SCALE_COMM_STACK_FAIL":
+            scale_stack_failures.append({**base, **payload})
     (batch_dir / "performance_warnings.jsonl").write_text(
         "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in warnings),
         encoding="utf-8",
@@ -2209,12 +2487,14 @@ def write_gate_files(con: sqlite3.Connection, batch_dir: Path, args: argparse.Na
         "performance_warning_count": len(warnings),
         "performance_retest_count": len(retests),
         "systemic_performance_event_count": len(systemic),
+        "scale_comm_stack_failure_count": len(scale_stack_failures),
         "runtime_sla_status": "WARN" if runtime_exceeded else "PASS",
         "runtime_target_seconds": runtime_target,
         "elapsed_seconds": elapsed,
         "runtime_target_exceeded": runtime_exceeded,
         "runtime_exceeded_seconds": max(0.0, elapsed - runtime_target) if runtime_target > 0 else 0.0,
         "systemic_performance_events": systemic,
+        "scale_comm_stack_failures": scale_stack_failures,
     }
     (batch_dir / "gate_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -2226,6 +2506,7 @@ def write_gate_files(con: sqlite3.Connection, batch_dir: Path, args: argparse.Na
         f"- performance_warning_count: `{len(warnings)}`",
         f"- performance_retest_count: `{len(retests)}`",
         f"- systemic_performance_event_count: `{len(systemic)}`",
+        f"- scale_comm_stack_failure_count: `{len(scale_stack_failures)}`",
         f"- runtime_sla_status: `{summary['runtime_sla_status']}`",
         f"- runtime_target_seconds: `{runtime_target}`",
         f"- elapsed_seconds: `{elapsed}`",
@@ -2246,42 +2527,24 @@ def write_batch_summary(con: sqlite3.Connection, batch_dir: Path, args: argparse
     ).fetchall()
     phase_rows = sorted(phase_rows, key=lambda row: (*phase_order_key(str(row[0])), str(row[1])))
     node_rows = con.execute("select status,count(*) from nodes group by status order by status").fetchall()
-    reuse_row = con.execute(
-        """
-        select g.group_id,g.parent_group_id,r.metrics_json
-        from groups g
-        left join group_results r on r.id=(
-          select max(r2.id) from group_results r2 where r2.group_id=g.group_id
-        )
-        where g.phase='final_all' and g.status='REUSED_PASS'
-        limit 1
-        """
-    ).fetchone()
-    final_all_reuse: dict[str, Any] | None = None
-    if reuse_row:
-        try:
-            reuse_metrics = json.loads(reuse_row[2] or "{}")
-        except json.JSONDecodeError:
-            reuse_metrics = {}
-        final_all_reuse = {
-            "status": "REUSED_PASS",
-            "group_id": str(reuse_row[0]),
-            "reused_from_group_id": str(reuse_row[1]),
-            "source_phase": str(reuse_metrics.get("source_phase", "")),
-            "source_elapsed_seconds": float(reuse_metrics.get("source_elapsed_seconds", 0.0) or 0.0),
-            "avoided_group_executions": 1,
-        }
+    scale_stack_failure_count = int(
+        con.execute("select count(*) from events where event_type='SCALE_COMM_STACK_FAIL'").fetchone()[0]
+    )
     summary = {
         "overall_status": overall,
         "job_name": args.job_name,
         "batch_run_id": args.batch_run_id,
         "phase_status_counts": [{"phase": p, "status": s, "count": c} for p, s, c in phase_rows],
         "node_status_counts": [{"status": s, "count": c} for s, c in node_rows],
-        "final_all_reuse": final_all_reuse,
+        "training_topology_manifest_sha256": args.training_topology_manifest_sha256,
+        "prequalified_nodes_sha256": args.prequalified_nodes_sha256,
+        "prequalified_node_count": args.prequalified_node_count,
+        "scale_comm_stack_failure_count": scale_stack_failure_count,
         "runtime_sla_status": "WARN" if runtime_warning_emitted else "PASS",
         "runtime_target_seconds": runtime_target_seconds,
         "elapsed_seconds": batch_elapsed_seconds,
         "runtime_target_exceeded": runtime_warning_emitted,
+        "job_liveness_abort": getattr(args, "_job_abort_payload", {}),
     }
     (batch_dir / "batch_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     lines = [
@@ -2291,6 +2554,11 @@ def write_batch_summary(con: sqlite3.Connection, batch_dir: Path, args: argparse
         f"- job_name: `{args.job_name}`",
         f"- batch_run_id: `{args.batch_run_id}`",
         f"- elapsed_seconds: `{batch_elapsed_seconds}`",
+        f"- scale_comm_stack_failure_count: `{scale_stack_failure_count}`",
+        f"- prequalified_node_count: `{args.prequalified_node_count}`",
+        f"- prequalified_nodes_sha256: `{args.prequalified_nodes_sha256 or '-'}`",
+        f"- job_liveness_monitor: `{str(getattr(args, 'job_liveness_monitor', False)).lower()}`",
+        f"- abort_reason: `{getattr(args, '_job_abort_payload', {}).get('reason', '-')}`",
         "",
         "## Phase Status",
         "",
@@ -2313,19 +2581,6 @@ def write_batch_summary(con: sqlite3.Connection, batch_dir: Path, args: argparse
             f"- execution_continued_after_warning: `{str(runtime_warning_emitted).lower()}`",
         ]
     )
-    if final_all_reuse:
-        lines.extend(
-            [
-                "",
-                "## Final-All Reuse",
-                "",
-                "- final_all_status: `REUSED_PASS`",
-                f"- reused_from_group_id: `{final_all_reuse['reused_from_group_id']}`",
-                f"- source_phase: `{final_all_reuse['source_phase']}`",
-                f"- avoided_group_executions: `{final_all_reuse['avoided_group_executions']}`",
-                f"- estimated_saved_seconds: `{final_all_reuse['source_elapsed_seconds']}`",
-            ]
-        )
     lines.extend(
         [
             "",
@@ -2339,18 +2594,20 @@ def write_batch_summary(con: sqlite3.Connection, batch_dir: Path, args: argparse
             "- `node_map.txt`",
             "- `localization_summary.md`",
             "- `localization_summary.json`",
+            "- `topology_plan.md` when topology mode is enabled",
+            "- `topology_summary.md` when topology mode is enabled",
             "- `comm_path_summary.md` when COMM_PATH_DEBUG=1 produced data",
         ]
     )
     (batch_dir / "batch_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def final_all_root_failed(con: sqlite3.Connection) -> bool:
+def final_training_topology_root_failed(con: sqlite3.Connection) -> bool:
     rows = con.execute(
         """
         select status
         from groups
-        where phase='final_all' and coalesce(parent_group_id, '')=''
+        where phase='final_training_topology' and coalesce(parent_group_id, '')=''
         """
     ).fetchall()
     return any(str(row[0]) not in PASS_STATUSES for row in rows)
@@ -2396,14 +2653,251 @@ def cleanup_empty_group_output_root(args: argparse.Namespace) -> None:
         pass
 
 
+def cleanup_aborted_remote_processes(
+    args: argparse.Namespace,
+    pods: list[Pod],
+    batch_dir: Path,
+) -> None:
+    if args.dry_run in {"1", "true"}:
+        return
+    marker = json.dumps(args.batch_run_id)
+    command = (
+        f"marker={marker}; "
+        "ps -eo pid=,args= | "
+        "awk -v marker=\"$marker\" 'index($0,marker) && "
+        "($0 ~ /[p]retrain_healthcheck[.]cli/ || $0 ~ /[t]orchrun/) {print $1}' | "
+        "xargs -r kill -TERM"
+    )
+
+    def clean(pod: Pod) -> dict[str, Any]:
+        cmd = [
+            args.vcctl_bin,
+            "pod",
+            "exec",
+            pod.pod_name,
+            "-n",
+            pod.namespace,
+            "-c",
+            pod.container_name,
+            "--",
+            "bash",
+            "-lc",
+            command,
+        ]
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=20)
+            return {
+                "pod_name": pod.pod_name,
+                "node_name": pod.node_name,
+                "returncode": proc.returncode,
+                "stderr": proc.stderr.strip()[:500],
+            }
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {
+                "pod_name": pod.pod_name,
+                "node_name": pod.node_name,
+                "returncode": None,
+                "stderr": f"{type(exc).__name__}: {exc}",
+            }
+
+    workers = min(32, max(1, len(pods)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        rows = list(executor.map(clean, pods))
+    payload = {
+        "timestamp": iso_now(),
+        "batch_run_id": args.batch_run_id,
+        "attempted": len(rows),
+        "succeeded": sum(row["returncode"] == 0 for row in rows),
+        "failed": sum(row["returncode"] != 0 for row in rows),
+        "results": rows,
+    }
+    _write_json_atomic(batch_dir / "job_liveness_cleanup.json", payload)
+    try:
+        post_abort = query_job_liveness(args)
+        post_payload = {
+            "timestamp": iso_now(),
+            "job_name": args.job_name,
+            "batch_run_id": args.batch_run_id,
+            "pods": post_abort,
+            "issues": evaluate_job_liveness(
+                getattr(args, "_job_liveness_baseline", []),
+                post_abort,
+            ),
+        }
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        post_payload = {
+            "timestamp": iso_now(),
+            "job_name": args.job_name,
+            "batch_run_id": args.batch_run_id,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    _write_json_atomic(batch_dir / "job_liveness_post_abort.json", post_payload)
+    print(
+        f"[batch-healthcheck] aborted_cleanup attempted={payload['attempted']} "
+        f"succeeded={payload['succeeded']} failed={payload['failed']}",
+        flush=True,
+    )
+
+
+def prepare_training_topology(
+    args: argparse.Namespace,
+    pods: list[Pod],
+    phases: list[str],
+    batch_dir: Path,
+) -> TrainingTopologyManifest | None:
+    topology_phases = [phase for phase in phases if phase in {"scale64_topology", "final_training_topology"}]
+    if not topology_phases:
+        return None
+    if not args.training_topology_manifest:
+        raise ValueError("scale64_topology/final_training_topology requires TRAINING_TOPOLOGY_MANIFEST")
+    source = Path(args.training_topology_manifest).expanduser().resolve()
+    if not source.is_file():
+        raise ValueError(f"training topology manifest not found: {source}")
+    manifest = load_training_topology_manifest(source)
+    required_world_sizes = set()
+    if "scale64_topology" in topology_phases:
+        required_world_sizes.add(64 * args.gpus_per_node)
+    if "final_training_topology" in topology_phases:
+        final_node_count = int(getattr(args, "prequalified_node_count", 0) or len(pods))
+        required_world_sizes.add(final_node_count * args.gpus_per_node)
+    for world_size in sorted(required_world_sizes):
+        require_profile(manifest, world_size, args.gpus_per_node)
+    args.training_topology_manifest = str(source)
+    args.pod_training_topology_manifest = args.pod_training_topology_manifest or str(source)
+    args.training_topology_manifest_sha256 = manifest.sha256
+    archived_manifest = batch_dir / "training_topology_manifest.json"
+    if source != archived_manifest.resolve():
+        shutil.copyfile(source, archived_manifest)
+    lines = [
+        "# Training Topology Plan",
+        "",
+        f"- manifest_sha256: `{manifest.sha256}`",
+        f"- ranks_per_node: `{manifest.ranks_per_node}`",
+        f"- framework: `{manifest.framework.get('name', '')}`",
+        f"- rank_order: `{manifest.framework.get('rank_order', '')}`",
+        f"- phases: `{','.join(topology_phases)}`",
+        "",
+        "| world size | family | groups | group size | profile parallelism |",
+        "| ---: | --- | ---: | ---: | --- |",
+    ]
+    for world_size in sorted(required_world_sizes):
+        profile = manifest.profiles[world_size]
+        parallelism = ",".join(
+            f"{key}={value}" for key, value in sorted(profile.parallelism.items())
+        ) or "-"
+        for family, groups in profile.groups.items():
+            sizes = sorted({len(group.ranks) for group in groups})
+            lines.append(
+                f"| {world_size} | {family} | {len(groups)} | {','.join(map(str, sizes))} | {parallelism} |"
+            )
+    (batch_dir / "topology_plan.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return manifest
+
+
+def ensure_topology_resume_policy(
+    con: sqlite3.Connection,
+    args: argparse.Namespace,
+    phases: list[str],
+) -> None:
+    policy = {
+        "manifest_sha256": args.training_topology_manifest_sha256,
+        "pod_manifest_path": args.pod_training_topology_manifest,
+        "gpus_per_node": args.gpus_per_node,
+        "phases": phases,
+    }
+    row = con.execute(
+        "select payload_json from events where event_type='training_topology_policy' order by id limit 1"
+    ).fetchone()
+    if row:
+        stored = json.loads(row[0] or "{}")
+        if stored != policy:
+            raise ValueError("training topology policy differs from existing batch; use a new BATCH_RUN_ID")
+        return
+    existing = int(con.execute("select count(*) from groups").fetchone()[0])
+    if args.resume and existing and any(phase in {"scale64_topology", "final_training_topology"} for phase in phases):
+        raise ValueError("legacy unfinished batch cannot resume in topology mode; use a new BATCH_RUN_ID")
+    record_event(con, "training_topology_policy", args.batch_run_id, policy)
+
+
+def seed_group_plan(
+    con: sqlite3.Connection,
+    phases: list[str],
+    pods: list[Pod],
+    seed: int,
+    resume: bool,
+) -> None:
+    for phase in phases:
+        for task in make_phase_groups(phase, pods, seed):
+            existing = con.execute("select status from groups where group_id=?", (task.group_id,)).fetchone()
+            if resume and existing:
+                continue
+            table_group(con, task, "PENDING")
+    record_event(con, "group_plan_created", "batch_start", {"phases": phases})
+
+
+def write_topology_summary(con: sqlite3.Connection, batch_dir: Path) -> None:
+    rows = con.execute(
+        """
+        select g.phase,g.round_id,g.group_id,g.status,g.nodes_json,r.error_type,r.elapsed_seconds
+        from groups g
+        left join group_results r on r.id=(
+          select max(r2.id) from group_results r2 where r2.group_id=g.group_id
+        )
+        where g.phase in ('scale64_topology','final_training_topology')
+        order by g.phase,g.round_id,g.group_id
+        """
+    ).fetchall()
+    json_rows = []
+    lines = [
+        "# Training Topology Summary",
+        "",
+        "| phase | round | group | status | elapsed seconds | error | nodes |",
+        "| --- | --- | --- | --- | ---: | --- | --- |",
+    ]
+    failed_rows = []
+    for phase, round_id, group_id, status, nodes_json, error_type, elapsed_seconds in rows:
+        try:
+            nodes = json.loads(nodes_json or "[]")
+        except json.JSONDecodeError:
+            nodes = []
+        item = {
+            "phase": phase,
+            "round_id": round_id,
+            "group_id": group_id,
+            "status": status,
+            "elapsed_seconds": float(elapsed_seconds or 0.0),
+            "error_type": error_type or "",
+            "nodes": nodes,
+        }
+        json_rows.append(item)
+        if str(status) not in PASS_STATUSES:
+            failed_rows.append(item)
+        lines.append(
+            f"| {phase} | {round_id} | {group_id} | {status} | {float(elapsed_seconds or 0.0):.3f} | "
+            f"{error_type or '-'} | {', '.join(nodes)} |"
+        )
+    (batch_dir / "topology_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (batch_dir / "topology_failed_groups.jsonl").write_text(
+        "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in failed_rows),
+        encoding="utf-8",
+    )
+    suspect_rows = con.execute(
+        "select node_name from nodes where status='SUSPECT' and last_phase in ('scale64_topology','performance_gate') order by node_name"
+    ).fetchall()
+    (batch_dir / "topology_suspect_nodes.txt").write_text(
+        "".join(f"{row[0]}\n" for row in suspect_rows), encoding="utf-8"
+    )
+
+
 def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     if not args.batch_run_id:
         args.batch_run_id = time.strftime("%Y%m%d_%H%M%S")
     args.target_scale = int(args.target_scale or 0)
     args.group_seed = int(args.group_seed)
     args.group_timeout_seconds = int(args.group_timeout_seconds)
-    args.final_all_timeout_seconds = int(args.final_all_timeout_seconds)
+    args.final_training_topology_timeout_seconds = int(args.final_training_topology_timeout_seconds)
     args.progress_interval_seconds = int(args.progress_interval_seconds)
+    args.job_liveness_check_interval_seconds = int(args.job_liveness_check_interval_seconds)
     args.phase_group_concurrency = int(args.phase_group_concurrency)
     args.batch_fault_type = str(args.batch_fault_type or "").strip().lower()
     args.batch_fault_phase = str(args.batch_fault_phase or "all").strip()
@@ -2422,10 +2916,17 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     args.dynamic_compare_retest_time_budget_seconds = int(args.dynamic_compare_retest_time_budget_seconds)
     args.dynamic_compare_systemic_candidate_fraction = float(args.dynamic_compare_systemic_candidate_fraction)
     args.batch_runtime_warn_seconds = int(args.batch_runtime_warn_seconds)
+    args.gpus_per_node = int(args.gpus_per_node)
+    args.training_topology_manifest = str(args.training_topology_manifest or "").strip()
+    args.pod_training_topology_manifest = str(args.pod_training_topology_manifest or "").strip()
+    args.prequalified_nodes_file = str(args.prequalified_nodes_file or "").strip()
+    args.training_topology_manifest_sha256 = ""
+    args.prequalified_nodes_sha256 = ""
+    args.prequalified_node_count = 0
     if args.group_timeout_seconds <= 0:
         raise ValueError("group_timeout_seconds must be positive")
-    if args.final_all_timeout_seconds <= 0:
-        raise ValueError("final_all_timeout_seconds must be positive")
+    if args.final_training_topology_timeout_seconds <= 0:
+        raise ValueError("final_training_topology_timeout_seconds must be positive")
     if args.dynamic_compare_small_latency_abs_delta_seconds < 0:
         raise ValueError("dynamic_compare_small_latency_abs_delta_ms must be non-negative")
     if args.dynamic_compare_small_latency_mad_multiplier < 0:
@@ -2438,7 +2939,15 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("dynamic_compare_systemic_candidate_fraction must be in (0, 1]")
     if args.batch_runtime_warn_seconds < 0:
         raise ValueError("batch_runtime_warn_seconds must be non-negative")
+    if args.gpus_per_node <= 0:
+        raise ValueError("gpus_per_node must be positive")
+    if args.job_liveness_check_interval_seconds <= 0:
+        raise ValueError("job_liveness_check_interval_seconds must be positive")
+    if args.target_scale >= 64 and not args.training_topology_manifest:
+        raise ValueError("TARGET_SCALE>=64 requires TRAINING_TOPOLOGY_MANIFEST")
     args._batch_fault_hit_count = 0
+    args._job_abort_event = threading.Event()
+    args._job_abort_payload = {}
     args.failed_group_output_mode = str(args.failed_group_output_mode or "local-link").strip()
     if args.failed_group_output_mode not in {"local-link", "shared"}:
         raise ValueError("failed_group_output_mode must be local-link or shared")
@@ -2462,11 +2971,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--result-root", required=True)
     parser.add_argument("--batch-run-id", default="")
     parser.add_argument("--target-scale", default="0")
+    parser.add_argument("--gpus-per-node", default="8")
+    parser.add_argument("--training-topology-manifest", default="")
+    parser.add_argument("--pod-training-topology-manifest", default="")
+    parser.add_argument("--prequalified-nodes-file", default="")
     parser.add_argument("--phases", default="")
     parser.add_argument("--group-seed", default="20260706")
     parser.add_argument("--group-timeout-seconds", default="180")
-    parser.add_argument("--final-all-timeout-seconds", default="300")
+    parser.add_argument("--final-training-topology-timeout-seconds", default="300")
     parser.add_argument("--progress-interval-seconds", default="10")
+    parser.add_argument(
+        "--job-liveness-monitor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Abort a real batch when live Job Pod membership or readiness changes.",
+    )
+    parser.add_argument("--job-liveness-check-interval-seconds", default="10")
     parser.add_argument("--phase-group-concurrency", default="0")
     parser.add_argument("--dry-run", default="1")
     parser.add_argument("--pre-clean", default="1")
@@ -2484,7 +3004,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dynamic-compare-retest-time-budget-seconds", default="120")
     parser.add_argument("--dynamic-compare-systemic-candidate-fraction", type=float, default=0.05)
     parser.add_argument("--batch-runtime-warn-seconds", default="900")
-    parser.add_argument("--disable-final-superset-skip", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--keep-group-outputs", default="0")
     parser.add_argument("--pod-project-dir", default="")
     parser.add_argument("--group-output-root", default="/tmp/pretrain_healthcheck_group_outputs/vcctl")
@@ -2520,10 +3039,15 @@ def main() -> int:
     args.db_path = str(db_path)
 
     _raw, pods = load_pods(args)
+    phases = parse_phases(args.phases, len(pods), args.target_scale)
+    run_phases = phases[:]
     con = init_db(db_path)
     upsert_pods(con, pods)
-    phases = parse_phases(args.phases, len(pods), args.target_scale)
-    run_phases = phases[:] if "final_all" in phases else phases + ["final_all"]
+    prepare_prequalified_nodes(con, args, pods, batch_dir)
+    prepare_training_topology(args, pods, phases, batch_dir)
+    ensure_topology_resume_policy(con, args, run_phases)
+    seed_group_plan(con, run_phases, pods, args.group_seed, args.resume)
+    write_group_plan_files(con, batch_dir)
 
     print(f"[batch-healthcheck] job          : {args.job_name}")
     print(f"[batch-healthcheck] batch_run_id : {args.batch_run_id}")
@@ -2531,10 +3055,23 @@ def main() -> int:
     print(f"[batch-healthcheck] phases       : {','.join(run_phases)}")
     print(f"[batch-healthcheck] target_scale : {args.target_scale or 'auto'}")
     print(f"[batch-healthcheck] group_timeout: {args.group_timeout_seconds}s")
-    print(f"[batch-healthcheck] final_timeout: {args.final_all_timeout_seconds}s")
+    print(f"[batch-healthcheck] topology_timeout: {args.final_training_topology_timeout_seconds}s")
     print(f"[batch-healthcheck] runtime_warn : {args.batch_runtime_warn_seconds}s")
+    print(
+        f"[batch-healthcheck] liveness     : {'enabled' if args.job_liveness_monitor else 'disabled'} "
+        f"interval={args.job_liveness_check_interval_seconds}s"
+    )
     print(f"[batch-healthcheck] concurrency  : {args.phase_group_concurrency or 'all groups per round'}")
     print(f"[batch-healthcheck] group outputs: {args.failed_group_output_mode}")
+    if args.training_topology_manifest_sha256:
+        print(f"[batch-healthcheck] topology sha : {args.training_topology_manifest_sha256}")
+        print(f"[batch-healthcheck] pod manifest : {args.pod_training_topology_manifest}")
+    if args.prequalified_nodes_sha256:
+        print(
+            f"[batch-healthcheck] prequalified : {args.prequalified_node_count} nodes "
+            f"sha256={args.prequalified_nodes_sha256}"
+        )
+        print("[batch-healthcheck] admission scope: topology-only; prior static/single-node admission is assumed")
     if args.failed_group_output_mode == "local-link":
         print(f"[batch-healthcheck] group output root: {Path(args.group_output_root) / args.batch_run_id}")
     if args.batch_fault_type:
@@ -2549,27 +3086,44 @@ def main() -> int:
     print(f"[batch-healthcheck] sqlite       : {db_path}")
     record_event(con, "batch_start", args.batch_run_id, {"phases": run_phases, "node_count": len(pods)})
 
+    liveness_monitor: JobLivenessMonitor | None = None
+    if args.job_liveness_monitor and args.dry_run not in {"1", "true"} and not args.pod_json_file:
+        liveness_monitor = JobLivenessMonitor(args, pods, batch_dir)
+        liveness_monitor.start()
+    elif args.job_liveness_monitor and args.pod_json_file:
+        print("[batch-healthcheck] liveness disabled reason=POD_JSON_FILE_is_not_live", flush=True)
+
     overall = "PASS"
     last_completed_phase = ""
     for phase in run_phases:
         maybe_emit_runtime_warning(args, con)
-        if phase != "final_all" and supersede_phase_with_final_all(phase, pods, args, con):
-            continue
         if not run_phase(phase, pods, args, con, batch_dir):
             overall = "SUSPECT"
             break
         last_completed_phase = phase
 
+    if liveness_monitor is not None:
+        liveness_monitor.stop()
+    if args._job_abort_event.is_set():
+        overall = "ABORTED"
+        record_event(con, "job_liveness_abort", args.batch_run_id, args._job_abort_payload)
+        cleanup_aborted_remote_processes(args, pods, batch_dir)
+
     apply_performance_candidate_statuses(con)
     fail_count = con.execute("select count(*) from nodes where status='FAIL'").fetchone()[0]
     suspect_count = con.execute("select count(*) from nodes where status='SUSPECT'").fetchone()[0]
-    if fail_count or final_all_root_failed(con):
-        overall = "FAIL"
-    elif suspect_count and overall == "PASS":
-        overall = "SUSPECT"
+    scale_stack_failure_count = int(
+        con.execute("select count(*) from events where event_type='SCALE_COMM_STACK_FAIL'").fetchone()[0]
+    )
+    if overall != "ABORTED":
+        if fail_count or final_training_topology_root_failed(con):
+            overall = "FAIL"
+        elif (suspect_count or scale_stack_failure_count) and overall == "PASS":
+            overall = "SUSPECT"
     write_node_files(con, batch_dir)
     write_performance_candidate_files(con, batch_dir)
     write_localization_files(con, batch_dir)
+    write_topology_summary(con, batch_dir)
     write_group_plan_files(con, batch_dir)
     write_comm_path_summary_files(con, batch_dir)
     args.batch_elapsed_seconds = round(time.monotonic() - args.batch_started_monotonic, 3)
@@ -2585,6 +3139,8 @@ def main() -> int:
     print(f"[batch-healthcheck] fail_nodes={batch_dir / 'fail_nodes.txt'}")
     print(f"[batch-healthcheck] node_map={batch_dir / 'node_map.txt'}")
     print(f"[batch-healthcheck] sqlite={db_path}")
+    if overall == "ABORTED":
+        return 3
     return 0 if overall == "PASS" or args.dry_run == "1" else 1
 
 

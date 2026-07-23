@@ -30,7 +30,14 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 def _case_id(row: dict[str, Any]) -> str:
     return "/".join(
         str(row.get(key, ""))
-        for key in ["stage", "op_type", "message_bytes", "payload_pattern", "collective_group_size"]
+        for key in [
+            "stage",
+            "topology_family",
+            "op_type",
+            "message_bytes",
+            "payload_pattern",
+            "collective_group_size",
+        ]
     )
 
 
@@ -52,7 +59,104 @@ def extract_case_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             row.setdefault("collective_group_size", int(summary.get("rank_count", 0) or 0))
             row["case_id"] = _case_id(row)
             rows.append(row)
+    if any(row.get("stage") == "training_topology" for row in rows):
+        return aggregate_training_topology_metrics(rows)
     return rows
+
+
+def aggregate_training_topology_metrics(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse subgroup-leader rows into one outer-group metric per topology case."""
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    passthrough: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("stage") != "training_topology":
+            passthrough.append(row)
+            continue
+        key = (
+            row.get("stage", ""),
+            row.get("topology_family", ""),
+            row.get("op_type", ""),
+            int(row.get("requested_message_bytes", row.get("message_bytes", 0)) or 0),
+            row.get("payload_pattern", "none"),
+            int(row.get("collective_group_size", 0) or 0),
+        )
+        grouped[key].append(row)
+
+    aggregated: list[dict[str, Any]] = []
+    for key, case_rows in sorted(grouped.items(), key=lambda item: tuple(map(str, item[0]))):
+        item = dict(case_rows[0])
+        item["pod_name"] = "training_topology_cohort"
+        item["node_name"] = "training_topology_cohort"
+        item["topology_group_id"] = "cohort"
+        item["subgroup_count"] = len(case_rows)
+        item["aggregation"] = "worst_subgroup"
+        for field in ("latency_p50", "latency_p95", "latency_p99"):
+            values = [float(row[field]) for row in case_rows if isinstance(row.get(field), (int, float))]
+            if values:
+                item[field] = max(values)
+        for field in ("avg_busbw", "second_lowest_busbw"):
+            values = [float(row[field]) for row in case_rows if isinstance(row.get(field), (int, float))]
+            if values:
+                item[field] = min(values)
+        item["correctness_pass"] = all(bool(row.get("correctness_pass", False)) for row in case_rows)
+        item["performance_pass"] = all(bool(row.get("performance_pass", True)) for row in case_rows)
+        item["error_type"] = "" if item["correctness_pass"] else "TOPOLOGY_CORRECTNESS_FAIL"
+        item["case_id"] = _case_id(item)
+        aggregated.append(item)
+    return passthrough + aggregated
+
+
+def topology_coverage_issues(
+    facts: list[dict[str, Any]],
+    case_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    topology_rows = [row for row in case_rows if row.get("stage") == "training_topology"]
+    if not topology_rows:
+        return []
+    expected_cases = 0
+    expected_groups: dict[str, int] = {}
+    for fact in facts:
+        coverage = fact.get("coverage") if isinstance(fact.get("coverage"), dict) else {}
+        expected = coverage.get("expected") if isinstance(coverage.get("expected"), dict) else {}
+        expected_cases = max(expected_cases, int(expected.get("case_count", 0) or 0))
+        summary = fact.get("summary") if isinstance(fact.get("summary"), dict) else {}
+        counts = summary.get("topology_group_counts") if isinstance(summary.get("topology_group_counts"), dict) else {}
+        for family, count in counts.items():
+            expected_groups[str(family)] = max(expected_groups.get(str(family), 0), int(count or 0))
+
+    issues: list[dict[str, Any]] = []
+    if expected_cases and len(topology_rows) != expected_cases:
+        issues.append(
+            {
+                "severity": "FAIL",
+                "classification": "TOPOLOGY_DATA_INCOMPLETE",
+                "pod_name": "",
+                "node_name": "",
+                "check": "topology_case_count",
+                "reason": f"expected {expected_cases} topology cases, received {len(topology_rows)}",
+                "actual": len(topology_rows),
+                "expected": expected_cases,
+            }
+        )
+    for row in topology_rows:
+        family = str(row.get("topology_family", ""))
+        expected = expected_groups.get(family, 0)
+        actual = int(row.get("subgroup_count", 0) or 0)
+        if expected and actual != expected:
+            issues.append(
+                {
+                    "severity": "FAIL",
+                    "classification": "TOPOLOGY_DATA_INCOMPLETE",
+                    "pod_name": "",
+                    "node_name": "",
+                    "check": "topology_subgroup_count",
+                    "case_id": row.get("case_id", ""),
+                    "reason": f"expected {expected} {family} subgroup summaries, received {actual}",
+                    "actual": actual,
+                    "expected": expected,
+                }
+            )
+    return issues
 
 
 def hard_failure_issues(facts: list[dict[str, Any]], failed: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -198,6 +302,7 @@ def _family_key(issue: dict[str, Any]) -> tuple[Any, ...]:
     return (
         issue.get("pod_name", ""),
         issue.get("stage", ""),
+        issue.get("topology_family", ""),
         issue.get("op_type", ""),
         issue.get("payload_pattern", "none"),
         issue.get("collective_group_size", 0),
@@ -260,7 +365,7 @@ def build_retest_plan(
         family_rows = [
             row for row in case_rows
             if (
-                row.get("pod_name", ""), row.get("stage", ""), row.get("op_type", ""),
+                row.get("pod_name", ""), row.get("stage", ""), row.get("topology_family", ""), row.get("op_type", ""),
                 row.get("payload_pattern", "none"), row.get("collective_group_size", 0), issue.get("check", ""),
             ) == family
         ]
@@ -280,9 +385,10 @@ def build_retest_plan(
             if index + 1 < len(sizes):
                 selected.add(sizes[index + 1])
         for size in selected:
-            key = "/".join(map(str, [issue.get("stage", ""), issue.get("op_type", ""), size, issue.get("payload_pattern", "none"), issue.get("collective_group_size", 0)]))
+            key = "/".join(map(str, [issue.get("stage", ""), issue.get("topology_family", ""), issue.get("op_type", ""), size, issue.get("payload_pattern", "none"), issue.get("collective_group_size", 0)]))
             plan[key] = {
                 "stage": issue.get("stage", ""),
+                "topology_family": issue.get("topology_family", ""),
                 "op_type": issue.get("op_type", ""),
                 "message_bytes": size,
                 "payload_pattern": issue.get("payload_pattern", "none"),
@@ -310,7 +416,7 @@ def compare_dynamic_results(
         failed.extend(read_jsonl(result_dir / "dynamic_retest_failed_pods.jsonl"))
     case_rows = extract_case_metrics(facts)
     write_jsonl(result_dir / "dynamic_case_metrics.jsonl", case_rows)
-    hard = hard_failure_issues(facts, failed)
+    hard = hard_failure_issues(facts, failed) + topology_coverage_issues(facts, case_rows)
     candidates, cohorts = candidate_performance_issues(
         case_rows,
         latency_ratio_threshold=latency_ratio_threshold,

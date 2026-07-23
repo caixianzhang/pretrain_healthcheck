@@ -9,14 +9,21 @@ JOB_NAME="${JOB_NAME:-}"
 NAMESPACE="${NAMESPACE:-default}"
 VCCTL_BIN="${VCCTL_BIN:-vcctl}"
 POD_JSON_FILE="${POD_JSON_FILE:-}"
+PRESERVE_POD_JSON_ORDER="${PRESERVE_POD_JSON_ORDER:-0}"
 RESULT_ROOT="${RESULT_ROOT:-${PROJECT_DIR}/results/vcctl}"
 BATCH_RUN_ID="${BATCH_RUN_ID:-}"
 TARGET_SCALE="${TARGET_SCALE:-0}"
 PHASES="${PHASES:-}"
 GROUP_SEED="${GROUP_SEED:-20260706}"
 GROUP_TIMEOUT_SECONDS="${GROUP_TIMEOUT_SECONDS:-180}"
-FINAL_ALL_TIMEOUT_SECONDS="${FINAL_ALL_TIMEOUT_SECONDS:-300}"
+FINAL_TRAINING_TOPOLOGY_TIMEOUT_SECONDS="${FINAL_TRAINING_TOPOLOGY_TIMEOUT_SECONDS:-300}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-16}"
+TRAINING_TOPOLOGY_MANIFEST="${TRAINING_TOPOLOGY_MANIFEST:-}"
+POD_TRAINING_TOPOLOGY_MANIFEST="${POD_TRAINING_TOPOLOGY_MANIFEST:-}"
+PREQUALIFIED_NODES_FILE="${PREQUALIFIED_NODES_FILE:-}"
 PROGRESS_INTERVAL_SECONDS="${PROGRESS_INTERVAL_SECONDS:-10}"
+JOB_LIVENESS_MONITOR="${JOB_LIVENESS_MONITOR:-1}"
+JOB_LIVENESS_CHECK_INTERVAL_SECONDS="${JOB_LIVENESS_CHECK_INTERVAL_SECONDS:-10}"
 PHASE_GROUP_CONCURRENCY="${PHASE_GROUP_CONCURRENCY:-0}"
 DRY_RUN="${DRY_RUN:-1}"
 PRE_CLEAN="${PRE_CLEAN:-1}"
@@ -34,7 +41,6 @@ DYNAMIC_COMPARE_RETEST_MAX_GROUPS="${DYNAMIC_COMPARE_RETEST_MAX_GROUPS:-32}"
 DYNAMIC_COMPARE_RETEST_TIME_BUDGET_SECONDS="${DYNAMIC_COMPARE_RETEST_TIME_BUDGET_SECONDS:-120}"
 DYNAMIC_COMPARE_SYSTEMIC_CANDIDATE_FRACTION="${DYNAMIC_COMPARE_SYSTEMIC_CANDIDATE_FRACTION:-0.05}"
 BATCH_RUNTIME_WARN_SECONDS="${BATCH_RUNTIME_WARN_SECONDS:-900}"
-DISABLE_FINAL_SUPERSET_SKIP="${DISABLE_FINAL_SUPERSET_SKIP:-0}"
 KEEP_GROUP_OUTPUTS="${KEEP_GROUP_OUTPUTS:-0}"
 POD_PROJECT_DIR="${POD_PROJECT_DIR:-}"
 GROUP_OUTPUT_ROOT="${GROUP_OUTPUT_ROOT:-/tmp/pretrain_healthcheck_group_outputs/vcctl}"
@@ -63,15 +69,26 @@ Common env:
   NAMESPACE                  Kubernetes namespace. Default: default
   DRIVER_PYTHON              Developer-machine Python >=3.9. Default: auto-discover
   POD_JSON_FILE              Optional saved vcctl pod JSON for dry-run/local tests.
+  PRESERVE_POD_JSON_ORDER    1 preserves POD_JSON_FILE order for fixed-rank diagnosis. Default: 0
   RESULT_ROOT                Shared result root. Default: <project>/results/vcctl
   BATCH_RUN_ID               Batch id. Default: current timestamp
   TARGET_SCALE               Max phase scale, for example 128 or 256. Default: auto
   PHASES                     Comma-separated phases. Default: auto by node count
   GROUP_SEED                 Deterministic grouping seed. Default: 20260706
   GROUP_TIMEOUT_SECONDS      Per-group timeout passed to run_vcctl_healthcheck. Default: 180
-  FINAL_ALL_TIMEOUT_SECONDS  Final-all group timeout. Default: 300
+  FINAL_TRAINING_TOPOLOGY_TIMEOUT_SECONDS
+                             Final training-topology timeout. Default: 300
+  GPUS_PER_NODE              Accelerator ranks per node. Default: 16
+  TRAINING_TOPOLOGY_MANIFEST Framework-exported manifest; required for TARGET_SCALE>=64
+  POD_TRAINING_TOPOLOGY_MANIFEST
+                             Manifest path visible inside Pods. Default: same as developer path
+  PREQUALIFIED_NODES_FILE    Optional hostname list already admitted by prior static/single-node checks.
+                             Required when topology phases are run without earlier batch phases.
   BATCH_RUNTIME_WARN_SECONDS Warn when total runtime exceeds this target; execution continues. Default: 900
   PROGRESS_INTERVAL_SECONDS  Progress print interval while one group is running. Default: 10
+  JOB_LIVENESS_MONITOR       1 aborts when live Job Pod membership/readiness changes. Default: 1
+  JOB_LIVENESS_CHECK_INTERVAL_SECONDS
+                             Live Job check interval. Default: 10
   PHASE_GROUP_CONCURRENCY    Max groups to run concurrently within one round. 0 means all. Default: 0
   DRY_RUN                    1 previews commands. Default: 1
   PRE_CLEAN                  1 cleans residual healthcheck processes before each group. Default: 1
@@ -85,7 +102,7 @@ Common env:
   BATCH_FAULT_POD            Pod name to inject into. Optional for backend/global tests.
   BATCH_FAULT_NODES          Comma-separated node names. Combined with BATCH_FAULT_NODE.
   BATCH_FAULT_PODS           Comma-separated pod names. Combined with BATCH_FAULT_POD.
-  BATCH_FAULT_PHASE          pairwise|ep8|scale64|scale128|scale256|final_all|all. Default: all
+  BATCH_FAULT_PHASE          pairwise|ep8|scale32_crosscheck|scale64_topology|final_training_topology|all. Default: all
   BATCH_FAULT_MAX_HITS       0 means all matching groups; N limits injected groups. Default: 0
   BATCH_FAULT_SLEEP_SECONDS  Sleep/join-timeout seconds. Default: 300
   BATCH_FAULT_DELAY_MS       net_slow delay in milliseconds. Default: 200
@@ -117,14 +134,21 @@ exec "${DRIVER_PYTHON}" "${PROJECT_DIR}/tools/vcctl_multi_node_batch.py" "$@" \
   --namespace "${NAMESPACE}" \
   --vcctl-bin "${VCCTL_BIN}" \
   --pod-json-file "${POD_JSON_FILE}" \
+  $([[ "${PRESERVE_POD_JSON_ORDER}" == "1" || "${PRESERVE_POD_JSON_ORDER}" == "true" ]] && printf '%s' '--preserve-pod-json-order' || printf '%s' '--no-preserve-pod-json-order') \
   --result-root "${RESULT_ROOT}" \
   --batch-run-id "${BATCH_RUN_ID}" \
   --target-scale "${TARGET_SCALE}" \
+  --gpus-per-node "${GPUS_PER_NODE}" \
+  --training-topology-manifest "${TRAINING_TOPOLOGY_MANIFEST}" \
+  --pod-training-topology-manifest "${POD_TRAINING_TOPOLOGY_MANIFEST}" \
+  --prequalified-nodes-file "${PREQUALIFIED_NODES_FILE}" \
   --phases "${PHASES}" \
   --group-seed "${GROUP_SEED}" \
   --group-timeout-seconds "${GROUP_TIMEOUT_SECONDS}" \
-  --final-all-timeout-seconds "${FINAL_ALL_TIMEOUT_SECONDS}" \
+  --final-training-topology-timeout-seconds "${FINAL_TRAINING_TOPOLOGY_TIMEOUT_SECONDS}" \
   --progress-interval-seconds "${PROGRESS_INTERVAL_SECONDS}" \
+  $([[ "${JOB_LIVENESS_MONITOR}" == "0" || "${JOB_LIVENESS_MONITOR}" == "false" ]] && printf '%s' '--no-job-liveness-monitor' || printf '%s' '--job-liveness-monitor') \
+  --job-liveness-check-interval-seconds "${JOB_LIVENESS_CHECK_INTERVAL_SECONDS}" \
   --phase-group-concurrency "${PHASE_GROUP_CONCURRENCY}" \
   --dry-run "${DRY_RUN}" \
   --pre-clean "${PRE_CLEAN}" \
@@ -141,7 +165,6 @@ exec "${DRIVER_PYTHON}" "${PROJECT_DIR}/tools/vcctl_multi_node_batch.py" "$@" \
   --dynamic-compare-retest-time-budget-seconds "${DYNAMIC_COMPARE_RETEST_TIME_BUDGET_SECONDS}" \
   --dynamic-compare-systemic-candidate-fraction "${DYNAMIC_COMPARE_SYSTEMIC_CANDIDATE_FRACTION}" \
   --batch-runtime-warn-seconds "${BATCH_RUNTIME_WARN_SECONDS}" \
-  $([[ "${DISABLE_FINAL_SUPERSET_SKIP}" == "1" || "${DISABLE_FINAL_SUPERSET_SKIP}" == "true" ]] && printf '%s' '--disable-final-superset-skip' || printf '%s' '--no-disable-final-superset-skip') \
   $([[ "${DYNAMIC_COMPARE_AUTO_RETEST}" == "0" || "${DYNAMIC_COMPARE_AUTO_RETEST}" == "false" ]] && printf '%s' '--no-dynamic-compare-auto-retest' || printf '%s' '--dynamic-compare-auto-retest') \
   --keep-group-outputs "${KEEP_GROUP_OUTPUTS}" \
   --pod-project-dir "${POD_PROJECT_DIR}" \
